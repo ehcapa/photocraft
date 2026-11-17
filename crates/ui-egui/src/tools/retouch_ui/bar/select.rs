@@ -9,11 +9,15 @@ use serde_json::json;
 use super::heal::check;
 use crate::PhotocraftApp;
 use crate::option_cells::hint;
+use crate::state::Tool;
 
-/// The Select Subject button both selection tools carry; `empty` is the message when nothing is found.
-fn select_subject(ui: &mut egui::Ui, app: &mut PhotocraftApp, empty: &str) {
+/// The Select Subject button both selection tools carry; `empty` is the message when nothing is
+/// found. The click dispatches with the tool's own mode over the bar state and the modifiers held
+/// at the click, as a gesture's would.
+fn select_subject(ui: &mut egui::Ui, app: &mut PhotocraftApp, tool: Tool, empty: &str) {
     if clicked(&Button::new(tl!("Select Subject")).show(ui)) {
-        let r = app.run("select.subject", json!({}));
+        let mode = crate::tool_feedback::click_mode(app, tool, app.ui.selection_mode, ui.ctx().input(|i| i.modifiers));
+        let r = app.run("select.subject", json!({ "mode": mode }));
         crate::retouch_ui::report_smart_result(app, r, empty);
     }
 }
@@ -25,7 +29,7 @@ pub(super) fn quick_selection(ui: &mut egui::Ui, app: &mut PhotocraftApp) -> Opt
     check(ui, tl!("Enhance Edge"), &mut o.enhance_edge, true, None);
     hint(ui, crate::i18n::fmt(tl!("{key} to subtract"), &[("key", &crate::shortcuts::pretty("Alt"))]));
     Divider::vertical().show(ui);
-    select_subject(ui, app, tl!("No subject found — try Object Selection or the Lasso"));
+    select_subject(ui, app, Tool::QuickSelection, tl!("No subject found — try Object Selection or the Lasso"));
     None
 }
 
@@ -40,6 +44,6 @@ pub(super) fn object_selection(ui: &mut egui::Ui, app: &mut PhotocraftApp) -> Op
     check(ui, tl!("Hard Edge"), &mut o.object_hard_edge, true, None);
     hint(ui, tl!("Drag a rectangle around the object"));
     Divider::vertical().show(ui);
-    select_subject(ui, app, tl!("No subject found — try a rectangle around the object"));
+    select_subject(ui, app, Tool::ObjectSelection, tl!("No subject found — try a rectangle around the object"));
     None
 }

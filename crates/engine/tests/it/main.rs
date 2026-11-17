@@ -78,6 +78,7 @@ mod live_line_transform;
 mod mask_lock_all;
 mod merge_transparent_bounds;
 mod missing_layer_error;
+mod ml_subject;
 mod nonfinite_style;
 mod open_identity;
 mod path_blur_speed_clamp;

@@ -233,19 +233,21 @@ fn mask_all_objects(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = d.doc.clone();
     crate::commands::check_all_unlocked(&doc, id)?;
     let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
-    let region: Option<Region> = match layer.surface() {
-        Some(surf) if matches!(layer.content, LayerContent::Raster(_)) => {
-            photocraft_algo::segment::subject::select_subject(&photocraft_algo::segment::SurfaceSampler(surf), doc.bounds())
-        }
-        _ => {
-            struct Composite<'a>(&'a Document);
-            impl photocraft_algo::segment::Sampler for Composite<'_> {
-                fn rgba(&self, r: Rect) -> Vec<[f32; 4]> {
-                    photocraft_compose::render(self.0, r).into_px()
+    let region: Option<Region> = {
+        let smp: &dyn photocraft_algo::segment::Sampler = match layer.surface() {
+            Some(surf) if matches!(layer.content, LayerContent::Raster(_)) => &photocraft_algo::segment::SurfaceSampler(surf),
+            _ => {
+                struct Composite<'a>(&'a Document);
+                impl photocraft_algo::segment::Sampler for Composite<'_> {
+                    fn rgba(&self, r: Rect) -> Vec<[f32; 4]> {
+                        photocraft_compose::render(self.0, r).into_px()
+                    }
                 }
+                &Composite(&doc)
             }
-            photocraft_algo::segment::subject::select_subject(&Composite(&doc), doc.bounds())
-        }
+        };
+        let seed = crate::smartselect_cmds::subject_seed(smp, doc.bounds());
+        photocraft_algo::segment::subject::select_subject_seeded_with(smp, doc.bounds(), seed.as_ref(), &photocraft_raster::Interrupt::NONE).unwrap_or_default()
     };
     let region = region.ok_or_else(|| other("no objects were found"))?;
     let bbox = region.bbox;

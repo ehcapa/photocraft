@@ -61,6 +61,14 @@ pub fn mode_name(op: SelectionOperation) -> &'static str {
     }
 }
 
+/// The mode word a non-gesture click — the options bar's Select Subject button — dispatches with:
+/// [`selection_op`]'s rule over the bar state and the modifiers held at the click, as a gesture's
+/// would be (Photoshop's Select Subject follows the options bar's +/− state too).
+pub fn click_mode(app: &PhotocraftApp, tool: Tool, bar: u8, m: egui::Modifiers) -> &'static str {
+    let mods = Mods { shift: m.shift, alt: m.alt, ..Mods::NONE };
+    mode_name(selection_op(tool, bar, mods, has_selection(app)))
+}
+
 /// Whether the active document has a non-empty selection. Reads the bounds the selection outline
 /// caches (same key), since the canvas asks every frame while a Patch lasso is drawn or hovered
 /// with ⌥.

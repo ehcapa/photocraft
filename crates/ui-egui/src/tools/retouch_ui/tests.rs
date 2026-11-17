@@ -405,6 +405,24 @@ fn clone_marker_shows_only_while_painting() {
 }
 
 #[test]
+fn select_subject_button_follows_the_bar_mode_and_modifiers() {
+    // The options bar's Select Subject button dispatches with the tool's own selection rule
+    // (`tool_feedback::click_mode`), so the Object Selection bar's Subtract state subtracts the
+    // found subject instead of replacing it, and held modifiers override, as Photoshop's
+    // Select Subject follows the options bar's +/− state.
+    let mut app = app();
+    app.ui.selection_mode = 2; // Subtract on the Object Selection bar.
+    let probe = |app: &PhotocraftApp, tool: Tool, m: egui::Modifiers| crate::tool_feedback::click_mode(app, tool, app.ui.selection_mode, m);
+    let shift_alt = egui::Modifiers { shift: true, alt: true, ..egui::Modifiers::default() };
+    assert_eq!(probe(&app, Tool::ObjectSelection, egui::Modifiers::NONE), "subtract");
+    assert_eq!(probe(&app, Tool::ObjectSelection, egui::Modifiers::SHIFT), "add");
+    assert_eq!(probe(&app, Tool::ObjectSelection, shift_alt), "intersect");
+    // Quick Selection's rule: always add, Alt subtracts (the bar's mode does not apply).
+    assert_eq!(probe(&app, Tool::QuickSelection, egui::Modifiers::NONE), "add");
+    assert_eq!(probe(&app, Tool::QuickSelection, egui::Modifiers::ALT), "subtract");
+}
+
+#[test]
 fn patch_tool_lassoes_then_drags_the_patch() {
     let mut app = app();
     app.run("paint.pencil", json!({"points": [[68, 30], [74, 30]], "size": 6, "color": "#ff0000"})).unwrap();

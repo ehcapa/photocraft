@@ -71,6 +71,33 @@ pub(crate) fn with_doc_sampler<R>(doc: &Document, layer: Option<LayerId>, all_la
     }
 }
 
+/// Whether Select Subject uses the learned model (`photocraft-ml`): `PHOTOCRAFT_SUBJECT_ML=0`
+/// switches it off. Read once, so the switch cannot race a run. Unit tests (this crate built
+/// with `cfg(test)`) default to the classical path — the model is slow and its mask of a
+/// synthetic scene is not something to assert against — while `panic_hunt` and the integration
+/// tests build without it and exercise the model.
+static SUBJECT_ML: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn subject_ml() -> bool {
+    *SUBJECT_ML.get_or_init(|| match std::env::var_os("PHOTOCRAFT_SUBJECT_ML") {
+        Some(v) => v != "0",
+        None => !cfg!(test),
+    })
+}
+
+/// The learned model's coarse subject mask over `area`, as algo's seed. `None` when this build
+/// has no model (the browser), the switch is off, or inference failed — callers pass `None` on
+/// and algo seeds classically. Sampled at about the model's input size: finer sampling cannot
+/// reach the network, and coarser would blur the boundary band the cut refines.
+pub(crate) fn subject_seed(smp: &dyn Sampler, area: Rect) -> Option<subject::SubjectSeed> {
+    if !subject_ml() || !photocraft_ml::AVAILABLE {
+        return None;
+    }
+    let step = photocraft_algo::segment::scale_for(area, photocraft_ml::MODEL_PX);
+    let img = smp.rgb_scaled(area, step);
+    photocraft_ml::subject_mask(&img.px, img.w, img.h).map(|m| subject::SubjectSeed { px: m.px, w: m.w, h: m.h })
+}
+
 /// A flat, opaque image: what Quick Selection reads with a group active and Sample All Layers off.
 struct FlatSampler;
 
@@ -462,7 +489,11 @@ fn select_subject(s: &mut Session, p: &Value) -> Result<Value> {
         c.region.clone()
     } else {
         let doc = std::sync::Arc::clone(&d.doc);
-        let region = with_doc_sampler(&doc, d.active_layer, all_layers, |smp, doc| subject::select_subject(smp, doc.bounds())).map(std::sync::Arc::new);
+        let region = with_doc_sampler(&doc, d.active_layer, all_layers, |smp, doc| {
+            let seed = subject_seed(smp, doc.bounds());
+            subject::select_subject_seeded_with(smp, doc.bounds(), seed.as_ref(), &photocraft_raster::Interrupt::NONE).unwrap_or_default()
+        })
+        .map(std::sync::Arc::new);
         s.subject_cache = SubjectCache { doc: std::sync::Arc::downgrade(&doc), doc_id: Some(doc.id), target, region: region.clone() };
         region
     };

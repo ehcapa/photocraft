@@ -68,6 +68,22 @@ fn keeps_box_drag(id: &str) -> bool {
     VIEW.contains(&id) || ["window.panel.", "window.toggle.", "type.panels."].iter().any(|prefix| id.starts_with(prefix))
 }
 
+/// Photoshop's Select › Subject and Select › Sky honour the modifiers held when the item runs:
+/// Shift adds what is found to the existing selection, Alt subtracts it, Shift+Alt intersects.
+/// The options-bar Subject buttons resolve their own mode (`retouch_ui::subject_mode`); an
+/// explicit `mode` param (palette, automation) always wins.
+fn smart_selection_mode(m: egui::Modifiers) -> Option<&'static str> {
+    if m.shift && m.alt {
+        Some("intersect")
+    } else if m.shift {
+        Some("add")
+    } else if m.alt {
+        Some("subtract")
+    } else {
+        None
+    }
+}
+
 /// Run a command id from any source (menu, shortcut, palette, automation).
 pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     // The regions that ran before it in this pass show its change in the next one.
@@ -85,6 +101,19 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
     }
     if crate::discard_ui::intercept(app, id, &params) {
         return Ok(Value::Null);
+    }
+    // Select › Subject / Sky with Shift or Alt held: the modifiers become the selection mode.
+    let mut params = params;
+    if matches!(id, "select.subject" | "select.sky")
+        && params.get("mode").is_none()
+        && let Some(mode) = smart_selection_mode(ctx.input(|i| i.modifiers))
+    {
+        match params.as_object_mut() {
+            Some(obj) => {
+                obj.insert("mode".into(), json!(mode));
+            }
+            None => params = json!({ "mode": mode }),
+        }
     }
     let revealed = crate::layer_reveal::mark(app);
     let history = crate::panels::history::mark(app);

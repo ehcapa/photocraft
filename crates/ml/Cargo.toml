@@ -1,0 +1,19 @@
+[package]
+name = "photocraft-ml"
+description = "On-device subject detection for Select Subject: U2-Netp through tract (native only), no workspace dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Inference is native only: the web build stays under its size gate and falls back to the
+# classical saliency pipeline in photocraft-algo.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tract-onnx = { workspace = true }
+
+[dev-dependencies]
+# The rembg parity test reads the reference PNGs (test-only; the library itself has no decoder).
+image = { workspace = true, features = ["png"] }
+
+[lints]
+workspace = true

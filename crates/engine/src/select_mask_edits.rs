@@ -282,7 +282,10 @@ pub fn apply_one(doc: &Document, layer: Option<LayerId>, base: Option<Surface>, 
             combine(region, mode(*add))
         }
         SelectionEdit::Subject { mode, sample_all_layers } => {
-            let region = with_doc_sampler(doc, layer, *sample_all_layers, |smp, doc| subject::select_subject(smp, doc.bounds()));
+            let region = with_doc_sampler(doc, layer, *sample_all_layers, |smp, doc| {
+                let seed = crate::smartselect_cmds::subject_seed(smp, doc.bounds());
+                subject::select_subject_seeded_with(smp, doc.bounds(), seed.as_ref(), &photocraft_raster::Interrupt::NONE).unwrap_or_default()
+            });
             combine(region, *mode)
         }
         SelectionEdit::Clear => None,

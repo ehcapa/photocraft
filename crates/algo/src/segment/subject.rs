@@ -32,6 +32,15 @@
 //! Works well for a distinct object on a comparatively plain background; it is not a semantic
 //! segmenter. Nearby clutter and detached subject parts with the same geometry cannot be
 //! distinguished by the component filter.
+//!
+//! A learned model's coarse mask ([`SubjectSeed`], produced by `photocraft-ml` and passed in by
+//! the engine) replaces the seeding instead: its probabilities become the trimap (steps 1–3; no
+//! border-as-background prior, which a semantic seed does not need), the cut, the hole fill and
+//! the full-resolution re-cut (steps 4's cut, 6) are the same, the component filter keeps every
+//! non-speck (the classical size and distance vetoes would drop a second subject the model
+//! found), and the backdrop pass is skipped (it exists to recover low-contrast parts the
+//! saliency stage lost, which is not the seed's failure mode). A seed that marks no foreground,
+//! or a malformed one, falls back to the classical path.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -51,19 +60,57 @@ const SIGMA_SPA: f32 = 0.25;
 
 /// Selects the most salient object on the canvas.
 pub fn select_subject(sampler: &dyn Sampler, canvas: Rect) -> Option<Region> {
-    select_subject_with(sampler, canvas, &Interrupt::NONE).unwrap_or_default()
+    select_subject_seeded_with(sampler, canvas, None, &Interrupt::NONE).unwrap_or_default()
 }
 
 /// [`select_subject`] that stops with `Err(Cancelled)` once `ctl` is cancelled, asked between
 /// stages and inside every min cut (the GrabCut iterations and the full-resolution re-cut).
 pub fn select_subject_with(sampler: &dyn Sampler, canvas: Rect, ctl: &Interrupt) -> Result<Option<Region>, Cancelled> {
+    select_subject_seeded_with(sampler, canvas, None, ctl)
+}
+
+/// A learned model's coarse subject-probability map over `canvas`: row-major `0..=1`, sampled at
+/// whatever resolution suits the model (nearest-neighbour sampling brings it to the working
+/// resolution). GrabCut and the full-resolution re-cut still refine the boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubjectSeed {
+    pub px: Vec<f32>,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// Above this a seed pixel is probable foreground (probable, so the cut can still move it);
+/// below [`SEED_BG`] it is definite background, whose colours must not teach the foreground
+/// model. The band between is left to the cut.
+const SEED_FG: f32 = 0.65;
+const SEED_BG: f32 = 0.35;
+
+/// [`select_subject_with`] with an optional learned seed for the trimap: with one, the saliency,
+/// Otsu, border-prior, component-filter and backdrop stages give way to it (see the module
+/// docs); without, the classical pass runs. `Ok(None)` when nothing is found either way.
+pub fn select_subject_seeded_with(sampler: &dyn Sampler, canvas: Rect, seed: Option<&SubjectSeed>, ctl: &Interrupt) -> Result<Option<Region>, Cancelled> {
     if canvas.width() < 4 || canvas.height() < 4 {
         return Ok(None);
     }
     let step = super::scale_for(canvas, WORK_PX);
     let img = sampler.rgb_scaled(canvas, step);
     let (w, h) = (img.w, img.h);
-    let sal = saliency(&img);
+    let found = match seed.and_then(|s| trimap_from_seed(s, w, h)) {
+        Some(trimap) => seeded_pass(&img, trimap, ctl)?,
+        None => classical_pass(&img, ctl)?,
+    };
+    let Some((low, fg, bg)) = found else {
+        return Ok(None);
+    };
+    ctl.check()?;
+    let low = super::fill_holes_by_model(&low, &img, &fg, &bg, 0.002, 0.05);
+    super::finish_region_with(sampler, canvas, step, &low, w, h, Some((&fg, &bg)), ctl)
+}
+
+/// Steps 1–5 of the module docs on a working-resolution image.
+fn classical_pass(img: &super::RgbImage, ctl: &Interrupt) -> Result<Option<(Vec<bool>, Gmm, Gmm)>, Cancelled> {
+    let (w, h) = (img.w, img.h);
+    let sal = saliency(img);
     ctl.check()?;
     let t = otsu(&sal).clamp(0.15, 0.85);
     let mut trimap = vec![PR_BG; w * h];
@@ -85,16 +132,101 @@ pub fn select_subject_with(sampler: &dyn Sampler, canvas: Rect, ctl: &Interrupt)
     if !any_fg {
         return Ok(None);
     }
-    let Some((fg, bg)) = grabcut::grabcut_with(&img, &mut trimap, 6, ctl)? else { return Ok(None) };
+    let Some((fg, bg)) = grabcut::grabcut_with(img, &mut trimap, 6, ctl)? else { return Ok(None) };
     let low: Vec<bool> = trimap.iter().map(|v| *v == PR_FG || *v == grabcut::FG).collect();
     let low = keep_main_and_nearby(&low, w, h);
     if !low.iter().any(|v| *v) {
         return Ok(None);
     }
-    let (low, fg, bg) = backdrop_pass(&img, &low, ctl)?.unwrap_or((low, fg, bg));
-    ctl.check()?;
-    let low = super::fill_holes_by_model(&low, &img, &fg, &bg, 0.002, 0.05);
-    super::finish_region_with(sampler, canvas, step, &low, w, h, Some((&fg, &bg)), ctl)
+    let (low, fg, bg) = backdrop_pass(img, &low, ctl)?.unwrap_or((low, fg, bg));
+    Ok(Some((low, fg, bg)))
+}
+
+/// The seeded path: the model's trimap, the same cut and hole handling, specks dropped. No
+/// `keep_main_and_nearby` — its size and distance vetoes separate a saliency map's subject from
+/// clutter and would drop a second subject the model found — and no `backdrop_pass`, whose
+/// keep-seeded filter has the same problem. The cut's background model trains on the certain
+/// background only: the band around the seed can carry subject-coloured slivers, and a
+/// background model that learned them explains the subject away.
+fn seeded_pass(img: &super::RgbImage, trimap: Vec<u8>, ctl: &Interrupt) -> Result<Option<(Vec<bool>, Gmm, Gmm)>, Cancelled> {
+    let (w, h) = (img.w, img.h);
+    let mut trimap = trimap;
+    let Some((fg, bg)) = grabcut::grabcut_with_certain_bg(img, &mut trimap, 6, ctl)? else { return Ok(None) };
+    let low: Vec<bool> = trimap.iter().map(|v| *v == PR_FG || *v == grabcut::FG).collect();
+    let low = drop_specks(&low, w, h);
+    Ok(low.iter().any(|v| *v).then_some((low, fg, bg)))
+}
+
+/// Every component at least half a percent of the largest (four pixels at the very least):
+/// speck removal without the classical path's subject-shape vetoes.
+fn drop_specks(mask: &[bool], w: usize, h: usize) -> Vec<bool> {
+    let (lab, sizes) = super::components(mask, w, h);
+    let Some(largest) = sizes.iter().copied().skip(1).max() else { return vec![false; w * h] };
+    let min = (((largest as f32) * 0.005).ceil() as usize).max(4);
+    lab.iter().map(|l| *l != 0 && sizes.get(*l as usize).copied().unwrap_or(0) >= min).collect()
+}
+
+/// The working-resolution trimap a seed gives, nearest-neighbour sampled (`x * seed.w / w`): the
+/// seed is coarse and the cut refines the edge, so the sampling only has to land in the right
+/// band. `None` when the seed is malformed or marks no foreground — the caller falls back to
+/// the classical pass, since a model that finds nothing is not evidence of no subject.
+fn trimap_from_seed(seed: &SubjectSeed, w: usize, h: usize) -> Option<Vec<u8>> {
+    if seed.w == 0 || seed.h == 0 || seed.px.len() != seed.w * seed.h {
+        return None;
+    }
+    let mut trimap = vec![PR_BG; w * h];
+    let (mut any_fg, mut any_bg) = (false, false);
+    for y in 0..h {
+        for x in 0..w {
+            let sx = (x * seed.w / w).min(seed.w - 1);
+            let sy = (y * seed.h / h).min(seed.h - 1);
+            let p = seed.px[sy * seed.w + sx];
+            let i = y * w + x;
+            if p >= SEED_FG {
+                any_fg = true;
+                trimap[i] = PR_FG;
+            } else if p <= SEED_BG {
+                any_bg = true;
+                trimap[i] = BG;
+            }
+        }
+    }
+    if !any_fg {
+        return None;
+    }
+    // One pixel of probable background around the marked foreground: the seed is sampled at its
+    // own resolution, so the pixel or two at the subject's edge carries the neighbouring label.
+    // Left hard, those slivers train the background model in the subject's colour and the cut
+    // then explains the subject away; free, the cut gives them back to the subject.
+    let mut banded = trimap.clone();
+    for y in 0..h {
+        for x in 0..w {
+            if trimap[y * w + x] == PR_FG {
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                        if (0..w as i32).contains(&nx) && (0..h as i32).contains(&ny) && banded[ny as usize * w + nx as usize] == BG {
+                            banded[ny as usize * w + nx as usize] = PR_BG;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !any_bg || !banded.contains(&BG) {
+        // A subject that fills the frame leaves the cut no background to learn from (the band
+        // may also have taken the last of it): a one-pixel outer ring provides some, over the
+        // band (the fallback rectangle Object Selection uses), at the cost of at most that ring.
+        for x in 0..w {
+            banded[x] = BG;
+            banded[(h - 1) * w + x] = BG;
+        }
+        for y in 0..h {
+            banded[y * w] = BG;
+            banded[y * w + w - 1] = BG;
+        }
+    }
+    Some(banded)
 }
 
 /// Step 5: GrabCut again with a background model that only knows the backdrop. A colour model
@@ -402,6 +534,71 @@ mod component_tests {
         assert!(!result[110 * side + 147], "clutter past the margin is kept");
         assert!(!result[143 * side + 110], "a speck inside the margin is kept");
         assert!(result[143 * side + 120], "a part inside the margin is dropped");
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::super::grabcut::{BG, PR_BG, PR_FG};
+    use super::{SubjectSeed, drop_specks, trimap_from_seed};
+
+    #[test]
+    fn trimap_bands_follow_the_seed_thresholds() {
+        // A 3 × 2 seed over a 6 × 4 image: nearest neighbour doubles every seed pixel. The
+        // columns are 0.9 (foreground), 0.5 (undecided) and 0.1 (background).
+        let seed = SubjectSeed { px: vec![0.9, 0.5, 0.1, 0.9, 0.5, 0.1], w: 3, h: 2 };
+        let t = trimap_from_seed(&seed, 6, 4).unwrap();
+        for y in 0..4 {
+            for x in 0..6 {
+                let expect = match x / 2 {
+                    0 => PR_FG,
+                    2 => BG,
+                    _ => PR_BG,
+                };
+                assert_eq!(t[y * 6 + x], expect, "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn trimap_needs_foreground_and_rejects_malformed_seeds() {
+        let no_fg = SubjectSeed { px: vec![0.1; 4], w: 2, h: 2 };
+        let short = SubjectSeed { px: vec![0.9; 3], w: 2, h: 2 };
+        let empty = SubjectSeed { px: Vec::new(), w: 0, h: 0 };
+        for s in [&no_fg, &short, &empty] {
+            assert!(trimap_from_seed(s, 4, 4).is_none(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn all_foreground_seed_gains_a_background_ring() {
+        let seed = SubjectSeed { px: vec![0.95; 12], w: 4, h: 3 };
+        let t = trimap_from_seed(&seed, 8, 6).unwrap();
+        for y in 0..6 {
+            for x in 0..8 {
+                let border = x == 0 || y == 0 || x + 1 == 8 || y + 1 == 6;
+                assert_eq!(t[y * 8 + x], if border { BG } else { PR_FG }, "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn drop_specks_keeps_small_parts_and_loses_specks() {
+        // A 40 × 40 main part (1600 px, speck floor ceil(1600 · 0.005) = 8), a 4 × 4 part
+        // (16 ≥ 8, kept) and a 2 × 2 speck (4 < 8, dropped).
+        let side = 240;
+        let mut mask = vec![false; side * side];
+        for (x0, y0, x1, y1) in [(100, 100, 140, 140), (150, 110, 154, 114), (110, 150, 112, 152)] {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    mask[y * side + x] = true;
+                }
+            }
+        }
+        let kept = drop_specks(&mask, side, side);
+        assert!(kept[100 * side + 100] && kept[110 * side + 150]);
+        assert!(kept[110 * side + 150 + 1]);
+        assert!(!kept[150 * side + 110], "the 2 × 2 speck is kept");
     }
 }
 

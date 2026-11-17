@@ -287,7 +287,8 @@ fn wand(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     divider(ui);
     let subject = Button::new(label("Select Subject")).show(ui);
     if clicked(&subject.response) {
-        let result = app.run("select.subject", serde_json::json!({}));
+        let mode = crate::tool_feedback::click_mode(app, Tool::MagicWand, app.ui.selection_mode, ui.ctx().input(|i| i.modifiers));
+        let result = app.run("select.subject", serde_json::json!({ "mode": mode }));
         crate::retouch_ui::report_smart_result(app, result, tl!("No subject found — try Object Selection or the Lasso"));
     }
     select_and_mask(ui);

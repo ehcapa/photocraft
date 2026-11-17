@@ -40,6 +40,20 @@ pub fn grabcut(img: &RgbImage, trimap: &mut [u8], iters: usize) -> Option<(Gmm, 
 /// [`grabcut`] that stops with `Err(Cancelled)` once `ctl` is cancelled, asked each iteration
 /// and inside its min cut. `trimap` is then partly updated.
 pub fn grabcut_with(img: &RgbImage, trimap: &mut [u8], iters: usize, ctl: &Interrupt) -> Result<Option<(Gmm, Gmm)>, Cancelled> {
+    grabcut_impl(img, trimap, iters, ctl, false)
+}
+
+/// [`grabcut_with`] whose background model trains on the certain background only (`BG`, not
+/// `PR_BG`). A probable-background pixel is precisely one whose colour is in doubt, and with a
+/// coarse learned seed's trimap the band can carry subject-coloured slivers — training the
+/// background model on those lets it explain the subject away and the cut drops it. The
+/// band is assigned by the cut instead (as in Rother et al.'s formulation). The reference-tuned
+/// classical paths keep the original semantics.
+pub fn grabcut_with_certain_bg(img: &RgbImage, trimap: &mut [u8], iters: usize, ctl: &Interrupt) -> Result<Option<(Gmm, Gmm)>, Cancelled> {
+    grabcut_impl(img, trimap, iters, ctl, true)
+}
+
+fn grabcut_impl(img: &RgbImage, trimap: &mut [u8], iters: usize, ctl: &Interrupt, certain_bg: bool) -> Result<Option<(Gmm, Gmm)>, Cancelled> {
     let cancel = || ctl.cancelled();
     let beta = contrast_beta(img);
     let fixed: Vec<u8> = trimap
@@ -55,7 +69,11 @@ pub fn grabcut_with(img: &RgbImage, trimap: &mut [u8], iters: usize, ctl: &Inter
         ctl.check()?;
         let (mut fs, mut bs) = (Vec::new(), Vec::new());
         for (p, t) in img.px.iter().zip(trimap.iter()) {
-            if is_fg(*t) { fs.push(*p) } else { bs.push(*p) }
+            if is_fg(*t) {
+                fs.push(*p);
+            } else if !certain_bg || *t == BG {
+                bs.push(*p);
+            }
         }
         let (fs, bs) = (subsample(&fs, MAX_SAMPLES), subsample(&bs, MAX_SAMPLES));
         let (fg, bg) = match &models {

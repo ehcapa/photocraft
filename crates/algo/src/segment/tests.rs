@@ -1148,6 +1148,118 @@ fn antialias_skips_only_spans_without_edge_pixels() {
     }
 }
 
+// ---------- Select Subject with a learned seed ----------
+
+/// A `SubjectSeed` marking `truth` at quarter resolution: 0.95 inside, 0.05 outside — the shape
+/// of mask a coarse model would hand back.
+fn seed_of(truth: &[bool], w: usize, h: usize) -> subject::SubjectSeed {
+    let (sw, sh) = (w / 4, h / 4);
+    let px = (0..sw * sh)
+        .map(|i| {
+            // The seed pixel's centre in image coordinates.
+            let (x, y) = ((i % sw) * 4 + 1, (i / sw) * 4 + 1);
+            let inside = truth.get((y.min(h - 1)) * w + x.min(w - 1)).copied().unwrap_or(false);
+            if inside { 0.95 } else { 0.05 }
+        })
+        .collect();
+    subject::SubjectSeed { px, w: sw, h: sh }
+}
+
+#[test]
+fn select_subject_seeded_keeps_a_second_distant_subject() {
+    let (w, h) = (320, 200);
+    let in_a = |x: usize, y: usize| (x as f32 + 0.5 - 80.0).powi(2) + (y as f32 + 0.5 - 100.0).powi(2) <= 30.0f32.powi(2);
+    let in_b = |x: usize, y: usize| (x as f32 + 0.5 - 270.0).powi(2) + (y as f32 + 0.5 - 60.0).powi(2) <= 12.0f32.powi(2);
+    let mut img = RgbImage::new(w, h);
+    let mut truth = vec![false; w * h];
+    let mut truth_a = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            truth_a[y * w + x] = in_a(x, y);
+            if in_a(x, y) || in_b(x, y) {
+                img.px[y * w + x] = [0.85, 0.2, 0.15];
+                truth[y * w + x] = true;
+            } else {
+                img.px[y * w + x] = [0.8, 0.8, 0.8];
+            }
+        }
+    }
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let canvas = Rect::new(0, 0, w as i32, h as i32);
+    // Classical: the far disc is under a fifth of the near one and well outside its margin, so
+    // the component filter drops it — exactly the shortfall the seed exists to fix.
+    let reg = subject::select_subject(&s, canvas).unwrap();
+    assert!(iou(&reg, &truth_a, w, h) > 0.8, "classical on A only: {}", iou(&reg, &truth_a, w, h));
+    assert!(reg.at(270, 60) < 0.5, "classical kept the far disc");
+    let seed = seed_of(&truth, w, h);
+    let reg = subject::select_subject_seeded_with(&s, canvas, Some(&seed), &photocraft_raster::Interrupt::NONE).unwrap().unwrap();
+    eprintln!("seeded reg bbox {:?}", reg.bbox);
+    let mut b_in = 0usize;
+    let mut b_out = 0usize;
+    for y in 44..76 {
+        for x in 256..284 {
+            if in_b(x, y) {
+                b_in += (reg.at(x as i32, y as i32) >= 0.5) as usize;
+                b_out += (reg.at(x as i32, y as i32) < 0.5) as usize;
+            }
+        }
+    }
+    eprintln!("disc B: {b_in} selected, {b_out} missed");
+    assert!(reg.at(270, 60) >= 0.5, "seeded lost the far disc");
+    let v = iou(&reg, &truth, w, h);
+    assert!(v > 0.9, "seeded on both: {v}");
+}
+
+#[test]
+fn select_subject_seeded_finds_a_subject_filling_the_frame() {
+    // A disc covering ~85% of the frame and cut by its top and bottom edges: the classical
+    // border-as-background prior and saliency both work against such a subject, while the seed
+    // has no such assumptions.
+    let (w, h) = (240, 160);
+    let in_disc = |x: usize, y: usize| (x as f32 + 0.5 - 120.0).powi(2) + (y as f32 + 0.5 - 80.0).powi(2) <= 110.0f32.powi(2);
+    let mut img = RgbImage::new(w, h);
+    let mut truth = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            if in_disc(x, y) {
+                img.px[y * w + x] = [0.3, 0.5, 0.25];
+                truth[y * w + x] = true;
+            } else {
+                img.px[y * w + x] = [0.9, 0.9, 0.88];
+            }
+        }
+    }
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let seed = seed_of(&truth, w, h);
+    let reg = subject::select_subject_seeded_with(&s, Rect::new(0, 0, w as i32, h as i32), Some(&seed), &photocraft_raster::Interrupt::NONE).unwrap().unwrap();
+    let v = iou(&reg, &truth, w, h);
+    assert!(v > 0.9, "{v}");
+}
+
+#[test]
+fn seed_without_foreground_or_malformed_runs_the_classical_path() {
+    use photocraft_raster::Interrupt;
+    let (img, truth) = disc_scene(200, 150, 100.0, 75.0, 40.0, 6);
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let canvas = Rect::new(0, 0, 200, 150);
+    let classical = subject::select_subject(&s, canvas);
+    assert!(classical.as_ref().is_some_and(|r| iou(r, &truth, 200, 150) > 0.9));
+    let zero = subject::SubjectSeed { px: vec![0.05; 2500], w: 50, h: 50 };
+    let short = subject::SubjectSeed { px: vec![0.9; 9], w: 50, h: 50 };
+    assert_eq!(subject::select_subject_seeded_with(&s, canvas, Some(&zero), &Interrupt::NONE).unwrap(), classical);
+    assert_eq!(subject::select_subject_seeded_with(&s, canvas, Some(&short), &Interrupt::NONE).unwrap(), classical);
+}
+
+#[test]
+fn select_subject_seeded_stops_when_cancelled() {
+    use photocraft_raster::{Cancelled, Interrupt};
+    let (img, truth) = disc_scene(200, 150, 100.0, 75.0, 40.0, 6);
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let seed = seed_of(&truth, 200, 150);
+    let cancel = || true;
+    assert_eq!(subject::select_subject_seeded_with(&s, Rect::new(0, 0, 200, 150), Some(&seed), &Interrupt::cancel_only(&cancel)), Err(Cancelled));
+}
+
 /// Timing on a 6 MP figure, for before/after numbers (`cargo test --release -- --ignored select_subject_timing --nocapture`).
 #[test]
 #[ignore = "timing only"]
@@ -1210,6 +1322,17 @@ fn select_subject_dump_pictures() {
     let reg = subject::select_subject(&s, Rect::new(0, 0, w as i32, h as i32));
     write("ring", &img, None);
     write("ring-selected", &img, reg.as_ref());
+    // The seeded path on the same scene (a model-shaped seed from the ring's truth) for
+    // before/after pictures.
+    let truth: Vec<bool> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            (17.0..80.0).contains(&(x as f32 + 0.5 - 110.0).hypot(y as f32 + 0.5 - 100.0))
+        })
+        .collect();
+    let seed = seed_of(&truth, w, h);
+    let reg = subject::select_subject_seeded_with(&s, Rect::new(0, 0, w as i32, h as i32), Some(&seed), &photocraft_raster::Interrupt::NONE).unwrap();
+    write("ring-selected-seeded", &img, reg.as_ref());
 }
 
 /// A dark square on a light background with a square hole that shows the background colour.

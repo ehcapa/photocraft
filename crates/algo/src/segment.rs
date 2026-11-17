@@ -369,7 +369,11 @@ fn grid_cut_impl<const OPTIMIZED: bool>(
     let mut g = Graph::with_capacity(count as usize, count as usize * 4);
     for i in 0..n {
         if idx[i] != u32::MAX {
-            g.add_tweights(idx[i] as usize, cost_bg[i], cost_fg[i]);
+            // A negative cost (a pixel a model explains "too well", −ln p < 0) would corrupt the
+            // flow accounting, so both terminal capacities shift by the same negative constant:
+            // the energy moves by a label-independent amount and the minimiser stays put.
+            let shift = cost_bg[i].min(cost_fg[i]).min(0.0);
+            g.add_tweights(idx[i] as usize, cost_bg[i] - shift, cost_fg[i] - shift);
         }
     }
     let use_sparse = OPTIMIZED && (count as usize) < n / 8;
@@ -435,7 +439,9 @@ fn add_fixed_link(g: &mut Graph, node: usize, fixed: u8, wt: f32) {
     }
 }
 
-/// Data costs `(−ln p(z|fg), −ln p(z|bg))` for every pixel.
+/// Data costs `(−ln p(z|fg), −ln p(z|bg))` for every pixel, clamped to `0..=200`: a max-flow
+/// graph needs non-negative terminal capacities (a well-explained pixel pulls its side with the
+/// *difference* anyway — a negative cost would corrupt the flow accounting instead).
 pub fn data_costs(img: &RgbImage, fg: &Gmm, bg: &Gmm) -> (Vec<f32>, Vec<f32>) {
     let eval = |p: &[f32; 3]| (fg.neg_log(*p), bg.neg_log(*p));
     #[cfg(not(target_arch = "wasm32"))]

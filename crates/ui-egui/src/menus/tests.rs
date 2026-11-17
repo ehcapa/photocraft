@@ -225,3 +225,37 @@ fn copy_css_puts_the_layers_css_on_the_clipboard() {
     assert!(css.starts_with(".Box {\n  background-image: url(\"Box.png\");\n"), "{css}");
     assert_eq!(out.platform_output.commands, [egui::OutputCommand::CopyText(css)]);
 }
+
+/// Select › Subject honours the modifiers held when it runs: Shift adds the found subject to the
+/// selection, Alt subtracts it, a bare run replaces (`invoke`'s `smart_selection_mode`).
+#[test]
+fn select_subject_menu_honours_shift_and_alt() {
+    // A red dot (the subject) on a white canvas with a left-band selection overlapping its centre
+    // tells the three apart.
+    let mods_ctx = |m: egui::Modifiers| {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        ctx.input_mut(|i| i.modifiers = m);
+        ctx
+    };
+    let setup = || {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 150, "background": "white"})).unwrap();
+        app.run("paint.pencil", json!({"points": [[100, 75]], "size": 80, "color": "#c04010"})).unwrap();
+        app.run("select.rect", json!({"x": 0, "y": 0, "width": 120, "height": 150})).unwrap();
+        app
+    };
+    let selected = |app: &PhotocraftApp, x: i32, y: i32| app.session.active().unwrap().doc.selection.as_ref().is_some_and(|s| s.rgba(x, y)[0] >= 0.5);
+    // Bare: the subject replaces the band.
+    let mut app = setup();
+    invoke(&mut app, &mods_ctx(egui::Modifiers::NONE), "select.subject", json!({})).unwrap();
+    assert!(!selected(&app, 10, 10) && selected(&app, 100, 75), "replace");
+    // Shift: the subject joins it.
+    let mut app = setup();
+    invoke(&mut app, &mods_ctx(egui::Modifiers::SHIFT), "select.subject", json!({})).unwrap();
+    assert!(selected(&app, 10, 10) && selected(&app, 100, 75), "add");
+    // Alt: the subject leaves it.
+    let mut app = setup();
+    invoke(&mut app, &mods_ctx(egui::Modifiers::ALT), "select.subject", json!({})).unwrap();
+    assert!(selected(&app, 10, 10) && !selected(&app, 100, 75), "subtract");
+}
