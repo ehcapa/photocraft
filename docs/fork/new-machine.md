@@ -12,6 +12,13 @@ git switch feat/ml-subject        # 人像管线全在这里
 
 **前提:本机(旧机器)已把未推送的提交推上 origin**——不推,新机器上什么都没有。
 
+## 1.5 git 凭据(新机器要推送时)
+
+HTTPS 推送需要凭据:GitHub → Settings → Developer settings → Personal access tokens
+生成新 token(旧 token 已在对话/工具中暴露过,建议 revoke 重发),或配 SSH key。
+本仓库 remote:`origin = github.com/ehcapa/photocraft`(fork),`upstream =
+github.com/storytold/photocraft`(只读镜像,永不推送)。
+
 ## 2. 模型(运行时目录,不进仓库)
 
 ```sh
