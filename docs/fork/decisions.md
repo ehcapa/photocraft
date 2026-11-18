@@ -67,3 +67,21 @@ u2netp.onnx 4.6MB 直接提交仓库（libfacedetection.bin 先例，>50MB 的�
 
 **后果。** upstreamable 的纯 UI 行为修复（无 AI 依赖）：回馈上游后在
 [`../decisions.md`](../decisions.md) 补条目，此处改留链接。
+
+## 2026-11-18: 智能人像管线——DAG 编排 + 标准图层，不加 Adjustment variant
+
+**背景。** 像素蛋糕式人像精修要做成"一个智能人像调整层"加进调整层组，约束是长期
+同步 upstream（日均数十 PR）与 PSD 往返兼容。初始方向为八段串行链
+（FeyNoBg 抠人 → Sapiens2 分区 → FaceMesh/Pose → 皮肤 → GAN 面部增强 → 换发色 →
+SD/Flux inpaint → 追色）。
+
+**决策。** 管线按 DAG 建模：分析层（抠像/分区/关键点，缓存元数据）→ 执行层并行
+分支（面部增强在皮肤之前；换发色；inpaint）→ 追色殿后。阶段分层：磨皮/换发色/追色
+L1 经典（可回馈上游）、抠像/关键点/face-parsing/面部增强 L2 tract（Sapiens2 越界
+降级）、SD/Flux L3 provider（对齐 upstream #41）。**不给 `doc::Adjustment`（PSD
+序列化格式）加 fork variant**：fork-only 编排 crate 创建标准图层（调整层 + 生成
+蒙版、智能滤镜、缓存栅格）+ sidecar 分析缓存，产出可手调图层组。
+
+**后果。** 共享代码触点收到菜单注册一处，doc 格式零分叉；生成类阶段以缓存栅格
+落地、按阶段失效重跑。完整落位表、风险与 spike 待办见
+[主题档案](2026-11-18-portrait-pipeline.md)。

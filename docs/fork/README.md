@@ -26,5 +26,7 @@ ehcapa/photocraft（方向：像素蛋糕式 AI 修图）的 **fork 级**文档�
 - [2026-11-18: ML Select Subject（tract + U²-Netᵖ）](2026-11-18-ml-subject.md) —— 选择主体
   换语义模型，经典管线保留回退；含模型升级阶梯与两个算法 bug 的根因
 - [2026-11-18: Select Subject 的 +/- 行为对齐 Photoshop](decisions.md) —— upstreamable UI 修复
+- [2026-11-18: 智能人像管线（设计选型，未实施）](2026-11-18-portrait-pipeline.md) ——
+  DAG 编排 + 标准图层落位（不加 Adjustment variant）；L1/L2/L3 分层表、tract spike 待办
 - [macOS 开发与测试注意事项](macos-dev.md) —— 单包测试的 egui/serde feature 统一坑、
   external_svg.rs 的 mkfifoat apple 门控坑、workspace 级验证配方

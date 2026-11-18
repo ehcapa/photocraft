@@ -42,17 +42,36 @@ mkfifoat,排除 apps(躲 mkfifoat)必丢 egui/serde。
 **临时姿势。** 验证时把该测试的 cfg 临时改成
 `#[cfg(all(unix, not(target_os = "macos")))]`,跑完恢复,**不进提交**。
 
+## 3. automation crate 的 trusted-root 路径校验在 macOS 误判(2026-11-18 发现)
+
+**现象。** `cargo test --workspace --lib` 里 `crates/automation` 的
+`trusted_root_names_are_not_validated_as_relative_request_names` 失败:
+`automation path rejected: absolute paths must be inside the automation root:
+/var/folders/…/T/photocraft-workspace-…/inside/aux/new-0.bin`——路径明明是测试在
+自己的临时根下构造的。
+
+**根因。** macOS 的 `TMPDIR`(`/var/folders/…`)与 canonicalize 后的
+`/private/var/folders/…` 符号链接不一致,"在根内"的前缀比较一边 canonical 一边不
+canonical,误判为越界。upstream CI 无 macOS,盲区。
+
+**现状。** 与本地改动无关(干净树同样失败),属 upstream bug,待回馈;本地验证时
+知晓即可,不影响 portrait/人像链路的任何测试。
+
 **修法(待回馈 upstream)。** apple 走 `mkfifo`(无 `*at` 变体,用 `libc`/`nix`),
 或把该测试 cfg 到 Linux;顺手可在 ui-egui 的 dev-dependencies 显式声明
 `egui = { features = ["serde"] }`,让单包测试也能编(坑 1 的防御)。
 
-## 验证配方(2026-11-18 实测)
+## 验证配方(2026-11-18 实测,同日二次修正)
 
 | 目的 | 命令 |
 |---|---|
-| 编译(非测试) | `cargo check -p <crate>`(单包无碍,serde 错误只出现在 lib **测试**构建) |
+| 编译 | `cargo check --workspace`;或 `cargo check -p <crate>`(**仅当**该 crate 不依赖 ui-egui) |
 | 单元测试 | `cargo test --workspace --lib -- <过滤器>` |
 | 含集成测试 | 临时门控坑 2 的测试后 `cargo test --workspace --lib --tests` |
 
+- **`-p photocraft-ui-egui` 的任何构建(lib check 也在内)都失败**——dialogs 的
+  `json!({"dialog": id})` 是 lib 代码,`DialogId = egui::Id` 的 serde 就在 egui feature
+  后面。多包选择只要含 `photocraft`(app)即可借它的 eframe 链统一 feature
+  (如 `cargo check -p photocraft-ui-egui -p photocraft`),但那不如直接 `--workspace`。
 - `cargo test -p photocraft-ui-egui` 与 `--exclude` 变体都不可用(分别踩坑 1 的两面)。
 - 回馈 upstream 后更新本文件与 [`README.md`](README.md) 索引。
