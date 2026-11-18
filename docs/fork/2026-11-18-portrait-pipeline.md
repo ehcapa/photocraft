@@ -97,7 +97,26 @@ SD/Flux Inpainting 背景与衣物 → 追色。评估结论:方向成立,两处
      0.25..4,源统计按 Person 蒙版取)→ **"Color Match" Curves 调整层**(Person 蒙版,
      两点线性曲线;参数化可手调,域外点钳进 0..255)。engine 测试 11✓ 两态。
 4. ~~面部增强 spike~~ ✅ 2026-11-18:**GFPGAN v1.4 在 tract 上完全可用**(见下节)。
-5. ~~Landmarks~~ ✅ 2026-11-18 同日:**FaceMesh 已集成**——astaileyyoung/FaceMeshONNX
+5. ~~妆容扩展~~ ✅ 2026-11-18 同日:**腮红**(颊点 205/425 椭圆对,眼距定标,羽化)
+  + **眼影**(眼环 1.6× 放大、钳于眼中心线以上,羽化)——`Region::Cheeks/Eyelids`,
+  Colorize HueSat 层,`blushHue…`/`shadowHue…` 参数,对话框有行;**零模型依赖**。
+  几何单元测试(颊心覆盖/上限位置、眼影不上眼心以下)+ engine 17✓ 两态。
+6. ~~五官算子第一批~~ ✅ 2026-11-18 同日:**Lip Color**(口红,Colorize HueSat × 唇环,
+  `lipHue`/`lipSaturation`)+ **Eye Brighten**(提亮,BrightnessContrast × 眼环,
+  `eyeBrighten`)——**零模型依赖**(mesh 内嵌,任何构建可用,确定性测试)。
+6. ~~专属 UI~~ ✅ 2026-11-18 一期:**Smart Portrait 对话框**——`portrait.create` 的
+  params 规格改为对话框记法(区间/bool),`has_dialog` 收编 → 菜单行
+  Layer › New Adjustment Layer › Smart Portrait… 打开通用配方对话框
+  (sampleAllLayers/磨皮/增强/发色/唇色/提亮/整体 HSL 全部成行,reference 走协议不出行),
+  OK 即运行。**无实时预览**(管线 5–10s,`previews()` 门控在外)——正确的取舍。
+  UI 测试:开框→设值→OK→管线落地一条龙 ✓。
+7. ~~批量流水线~~ ✅ 2026-11-18:**阶段 0 一次通过**——`file.automate.batch`(upstream)
+   × `portrait.create` **零胶水组合**(steps 直接吃命令对;测试:2 输入→2 PNG 输出,
+   引擎侧批量即此组合)。配套 `portrait.saveRecipe {name, …配方}`:配方存为命名
+   Action,Actions 面板可列出、Batch 按 `action` 名引用(同款测试覆盖)。
+   鼠标驱动的"批量精修"对话框(文件夹进出/格式/配方行)留作二期——引擎与协议层
+   已完整,吞吐 ~15–20s/张全开(见 decisions 的吞吐注记)。
+8. ~~Landmarks~~ ✅ 2026-11-18 同日:**FaceMesh 已集成**——astaileyyoung/FaceMeshONNX
    导出(MIT,5.13MB)**按 u2netp 先例直接提交仓库**(`crates/ml/data/facemesh.onnx`,
    含 LICENSE + ATTRIBUTION 行,wasm 编出),无需 env 路径、原生始终可用:加载
    ~100ms、推理 **15ms @ 256² NHWC 0..1**,输出 478 点(含虹膜,0..256 输入像素域,

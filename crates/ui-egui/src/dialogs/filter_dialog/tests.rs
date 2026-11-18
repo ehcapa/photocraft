@@ -220,6 +220,34 @@ fn remembering_dialogs_never_persists_paths_or_document_indices() {
 /// A layer-id param has no number field: the Auto-Align dialog used to write `reference: 0`
 /// back, which the engine rejects as not a selected layer (#674).
 #[test]
+/// Layer › New Adjustment Layer › Smart Portrait… opens the recipe dialog (the fork's
+/// portrait pipeline): every recipe knob is a row, the protocol-only reference paths are
+/// not, and OK runs `portrait.create` with the dialog's values as one history step.
+#[test]
+fn smart_portrait_opens_the_recipe_dialog_and_runs_on_ok() {
+    const CMD: &str = "portrait.create";
+    let mut app = new_app();
+    app.run("file.new", json!({"width": 64, "height": 64, "background": "white"})).unwrap();
+    // A red blob the subject line can find (a blank document has no person to analyze).
+    app.run("paint.pencil", json!({"points": [[32, 32]], "size": 40, "color": "#c04010"})).unwrap();
+    let spec = photocraft_engine::commands::find(CMD).unwrap().params;
+    let rows = params(&mut app, CMD, spec);
+    for key in ["skinRadius", "skinThreshold", "enhanceFace", "hairHue", "lipHue", "lipSaturation", "eyeBrighten"] {
+        assert!(rows.iter().any(|p| p.key == key), "a {key} row");
+    }
+    assert!(!rows.iter().any(|p| p.key == "reference" || p.key == "referenceStats"), "protocol-only rows stay out");
+    assert!(crate::filter_dialog::previews(CMD) == false, "the pipeline is too heavy for a live preview");
+    // The menu row routes to the dialog, and an OK runs the command.
+    let ctx = app.ctx().clone();
+    let r = crate::menus::invoke(&mut app, &ctx, CMD, Value::Null).unwrap();
+    assert!(r["dialog"].is_string(), "opens a dialog, not an immediate run: {r}");
+    let id = top_dialog(&app);
+    app.framework.dialogs.set_json_field(&ctx, id, "eyeBrighten", json!(20.0)).unwrap();
+    assert!(ok(&mut app, id), "the OK closed the dialog");
+    let layer = app.session.active().unwrap().active_layer.map(|l| app.session.active().unwrap().doc.layer(l).unwrap()).unwrap();
+    assert_eq!(layer.name, "Portrait", "the pipeline ran");
+}
+
 fn layer_id_params_stay_out_of_the_dialog() {
     let mut app = new_app();
     app.run("file.new", json!({"width": 8, "height": 8})).unwrap();

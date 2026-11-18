@@ -19,7 +19,11 @@ pub enum Region {
     Hair,
     Face,
     Eyes,
+    /// The eyelids above the eyes: the eyeshadow area, the eye ring scaled up and clipped.
+    Eyelids,
     Lips,
+    /// The cheek ellipses at FaceMesh's cheek points: the blush area.
+    Cheeks,
     Clothes,
     Background,
     Whole,
@@ -60,7 +64,7 @@ impl StageId {
         match self {
             StageId::Cutout => &[Region::Person],
             StageId::Parsing => &[Region::Skin, Region::Hair, Region::Face, Region::Eyes, Region::Lips, Region::Clothes, Region::Background],
-            StageId::Landmarks => &[],
+            StageId::Landmarks => &[Region::Face, Region::Eyes, Region::Eyelids, Region::Lips, Region::Cheeks],
             StageId::Enhance | StageId::Skin | StageId::HairColor | StageId::Inpaint | StageId::Grade => &[],
         }
     }
@@ -125,11 +129,34 @@ pub struct Recipe {
     pub hair: Option<HueSat>,
     pub skin: Option<Skin>,
     pub grade: Option<Grade>,
+    /// The GFPGAN face restoration (a `512²` aligned crop through the models-dir model,
+    /// pasted back masked to the face). Off without the model, silently.
+    pub enhance: bool,
+    /// The lip colour (口红): a Colorize Hue/Saturation on the landmark lip ring.
+    pub lips: Option<HueSat>,
+    /// The eye brighten amount (0..100), a Brightness/Contrast on the eye rings.
+    pub eyes: Option<f32>,
+    /// The blush (腮红): a Colourize Hue/Saturation on the feathered cheek ellipses.
+    pub blush: Option<HueSat>,
+    /// The eyeshadow (眼影): a Colourize Hue/Saturation on the scaled eye rings.
+    pub eyeshadow: Option<HueSat>,
 }
 
 impl Default for Recipe {
     fn default() -> Self {
-        Recipe { stages: vec![StageId::Cutout], group_name: "Portrait".into(), hue_saturation: HueSat::default(), hair: None, skin: None, grade: None }
+        Recipe {
+            stages: vec![StageId::Cutout],
+            group_name: "Portrait".into(),
+            hue_saturation: HueSat::default(),
+            hair: None,
+            skin: None,
+            grade: None,
+            enhance: false,
+            lips: None,
+            eyes: None,
+            blush: None,
+            eyeshadow: None,
+        }
     }
 }
 
@@ -160,6 +187,11 @@ mod tests {
             hair: Some(HueSat { hue: -15.0, saturation: 40.0, lightness: 0.0 }),
             skin: Some(Skin::default()),
             grade: None,
+            enhance: false,
+            lips: None,
+            eyes: None,
+            blush: None,
+            eyeshadow: None,
         };
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap(), full);

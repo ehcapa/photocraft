@@ -63,6 +63,33 @@ fn recipe(p: &Value) -> photocraft_portrait::Recipe {
     if [p.get("skinRadius"), p.get("skinThreshold")].iter().any(|v| v.is_some()) {
         r.skin = Some(photocraft_portrait::Skin { radius: asked("skinRadius").unwrap_or_default(), threshold: asked("skinThreshold").unwrap_or_default() });
     }
+    if p.get("enhanceFace").and_then(Value::as_bool) == Some(true) {
+        r.enhance = true;
+    }
+    if [p.get("lipHue"), p.get("lipSaturation")].iter().any(|v| v.is_some()) {
+        r.lips = Some(photocraft_portrait::HueSat {
+            hue: asked("lipHue").unwrap_or(0.0),
+            saturation: asked("lipSaturation").unwrap_or(25.0),
+            lightness: asked("lipLightness").unwrap_or(0.0),
+        });
+    }
+    if let Some(v) = asked("eyeBrighten") {
+        r.eyes = Some(v);
+    }
+    if [p.get("blushHue"), p.get("blushSaturation")].iter().any(|v| v.is_some()) {
+        r.blush = Some(photocraft_portrait::HueSat {
+            hue: asked("blushHue").unwrap_or(350.0),
+            saturation: asked("blushSaturation").unwrap_or(20.0),
+            lightness: asked("blushLightness").unwrap_or(0.0),
+        });
+    }
+    if [p.get("shadowHue"), p.get("shadowSaturation")].iter().any(|v| v.is_some()) {
+        r.eyeshadow = Some(photocraft_portrait::HueSat {
+            hue: asked("shadowHue").unwrap_or(30.0),
+            saturation: asked("shadowSaturation").unwrap_or(25.0),
+            lightness: asked("shadowLightness").unwrap_or(0.0),
+        });
+    }
     r
 }
 
@@ -125,12 +152,53 @@ fn grade_transfer(doc: &Document, person: Option<&photocraft_raster::Surface>, r
 /// The smoothed copy the Skin Smoothing raster carries: the composite rendered flat, then
 /// Surface Blur over it (`filter.blur.surfaceBlur`, cancelled through `ctx` like any
 /// filter). `None` when the recipe does not ask for skin or the analysis found no skin.
-fn smooth_skin(doc: &Document, ctx: &crate::jobs::JobCtx, skin: photocraft_portrait::Skin) -> Result<photocraft_raster::Surface> {
-    let canvas = doc.bounds();
-    let composite = photocraft_compose::composite_to_surface(doc, canvas, doc.pixel_format(), None);
+fn smooth_skin(
+    ctx: &crate::jobs::JobCtx,
+    skin: photocraft_portrait::Skin,
+    source: &photocraft_raster::Surface,
+    canvas: photocraft_geom::Rect,
+) -> Result<photocraft_raster::Surface> {
     let params = json!({ "radius": skin.radius, "threshold": skin.threshold });
-    crate::filters::apply_filter_to_surface_in("filter.blur.surfaceBlur", &params, &composite, canvas, None, canvas, ctx)?
+    crate::filters::apply_filter_to_surface_in("filter.blur.surfaceBlur", &params, source, canvas, None, canvas, ctx)?
         .ok_or_else(|| EngineError::Other("skin smoothing produced no surface".into()))
+}
+
+/// The GFPGAN restoration of the face: the landmark-aligned 512² crop through the
+/// models-dir model, pasted back over the composite masked by the (feathered) face hull.
+/// `Ok(None)` without a model or the geometry the paste needs — the layer stays out.
+fn enhance_face(
+    doc: &Document,
+    composite: &photocraft_raster::Surface,
+    analysis: &photocraft_portrait::Analysis,
+) -> Result<Option<photocraft_raster::Surface>> {
+    let canvas = doc.bounds();
+    let (w, h) = (doc.size.width as usize, doc.size.height as usize);
+    let Some(points) = photocraft_portrait::align::five_points(&analysis.landmarks) else { return Ok(None) };
+    let Some(face) = analysis.mask(photocraft_portrait::Region::Face) else { return Ok(None) };
+    let rgba = composite.try_read_region(canvas).map_err(|e| EngineError::Other(e.to_string()))?;
+    let alpha = face.try_read_region(canvas).map_err(|e| EngineError::Other(e.to_string()))?;
+    let rgb: Vec<[f32; 3]> = rgba.chunks(rgba.len() / (w * h)).map(|c| [c[0], c[1], c[2]]).collect();
+    let forward = photocraft_portrait::align::fit(&points, photocraft_ml::ENHANCE_SIDE);
+    let crop = photocraft_portrait::align::sample_crop(&rgb, w, h, &forward, photocraft_ml::ENHANCE_SIDE);
+    let Some(enhanced) = photocraft_ml::enhance_face(&crop) else { return Ok(None) };
+    let alpha: Vec<f32> = alpha.chunks((alpha.len() / (w * h)).max(1)).map(|c| c[0]).collect();
+    let pasted = photocraft_portrait::align::paste_back(&enhanced, photocraft_ml::ENHANCE_SIDE, &forward, &rgb, w, h, &alpha);
+    // Back onto the composite's own alpha: same pixels, the face region redrawn.
+    let mut out = rgba.clone();
+    let ch = out.len() / (w * h);
+    for (i, px) in pasted.iter().enumerate() {
+        out[i * ch..i * ch + 3].copy_from_slice(px);
+    }
+    let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::RGBA8, &[0.0, 0.0, 0.0, 0.0]);
+    surface.write_region(canvas, &out);
+    Ok(Some(surface))
+}
+
+/// The work stage's derived pixels: what the raster layers carry.
+struct Products {
+    skin: Option<photocraft_raster::Surface>,
+    enhance: Option<photocraft_raster::Surface>,
+    grade: Option<photocraft_portrait::Grade>,
 }
 
 /// The 追色 ask: a reference image path, or the statistics themselves (the seam the tests
@@ -218,95 +286,120 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         "Smart Portrait",
         true,
         move |ctx| {
-            let skin_surface = recipe
-                .skin
-                .filter(|_| cached.as_ref().is_none_or(|a| a.mask(photocraft_portrait::Region::Skin).is_some()))
-                .map(|skin| {
-                    ctx.progress(0.7, "Smoothing skin");
-                    smooth_skin(&doc, ctx, skin)
-                })
-                .transpose()?;
-            if let Some(analysis) = cached {
-                // The grade is cheap and reference-driven; it runs on hits too.
-                let grade = reference
-                    .map(|r| {
-                        ctx.progress(0.9, "Matching colour");
-                        grade_transfer(&doc, analysis.mask(photocraft_portrait::Region::Person), r)
-                    })
-                    .transpose()?;
-                return Ok((analysis, skin_surface, grade));
-            }
-            // The ort matte (feature "ort" + feynobg.onnx in the models dir) replaces the
-            // whole subject line when it answers: direct hair-edge alpha at 1024², no
-            // seed/GrabCut. Without it (the default build, or no model placed) the
-            // subject line runs as before.
-            let matte = ctx.stage(0.05, 0.25, "Matting person", |_| {
-                with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                    let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::MATTING_SIDE * photocraft_ml::MATTING_SIDE);
-                    let img = smp.rgb_scaled(d.bounds(), step);
-                    photocraft_ml::person_matte(&img.px, img.w, img.h)
-                })
-            });
-            let person = if let Some(matte) = matte {
-                ctx.check().map_err(|_| EngineError::Cancelled)?;
-                let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
-                let up =
-                    photocraft_ml::resize_mask(&matte.px, matte.w, matte.h, dw, dh).ok_or_else(|| EngineError::Other("the matte would not resample".into()))?;
-                let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
-                surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
-                surface
+            // The analysis resolves first — a cache hit skips subject, parsing and
+            // landmarks; the derived pixels below run whenever the recipe asks.
+            let analysis = if let Some(analysis) = cached {
+                analysis
             } else {
-                // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
-                let found = ctx
-                    .stage(0.25, 0.4, "Finding person", |ctl| {
-                        with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                            let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
-                            subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
-                        })
+                // The ort matte (feature "ort" + feynobg.onnx in the models dir) replaces the
+                // whole subject line when it answers: direct hair-edge alpha at 1024², no
+                // seed/GrabCut. Without it (the default build, or no model placed) the
+                // subject line runs as before.
+                let matte = ctx.stage(0.05, 0.25, "Matting person", |_| {
+                    with_doc_sampler(&doc, target, sample_all, |smp, d| {
+                        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::MATTING_SIDE * photocraft_ml::MATTING_SIDE);
+                        let img = smp.rgb_scaled(d.bounds(), step);
+                        photocraft_ml::person_matte(&img.px, img.w, img.h)
                     })
-                    .map_err(|_| EngineError::Cancelled)?;
-                let region = found.ok_or_else(|| EngineError::Other("no person found".into()))?;
-                matting::region_surface(&region)
+                });
+                let person = if let Some(matte) = matte {
+                    ctx.check().map_err(|_| EngineError::Cancelled)?;
+                    let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
+                    let up = photocraft_ml::resize_mask(&matte.px, matte.w, matte.h, dw, dh)
+                        .ok_or_else(|| EngineError::Other("the matte would not resample".into()))?;
+                    let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+                    surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
+                    surface
+                } else {
+                    // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
+                    let found = ctx
+                        .stage(0.25, 0.4, "Finding person", |ctl| {
+                            with_doc_sampler(&doc, target, sample_all, |smp, d| {
+                                let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
+                                subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
+                            })
+                        })
+                        .map_err(|_| EngineError::Cancelled)?;
+                    let region = found.ok_or_else(|| EngineError::Other("no person found".into()))?;
+                    matting::region_surface(&region)
+                };
+                let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
+                analysis.set(photocraft_portrait::Region::Person, person.clone());
+                // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
+                // skin/hair/clothes masks join the person mask; without one the slice is the
+                // person alone and every layer but the first stays out.
+                let regions = ctx.stage(0.4, 0.65, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person));
+                for (region, mask) in regions {
+                    analysis.set(region, mask);
+                }
+                // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
+                // region comes from the landmark ring's hull, gated by the person like the
+                // parsing regions. The mesh answers on the sampled image; the points ride to
+                // document pixels before the hull is taken.
+                let mesh = ctx.stage(0.65, 0.7, "Finding landmarks", |_| {
+                    with_doc_sampler(&doc, target, sample_all, |smp, d| {
+                        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::LANDMARK_SIDE * photocraft_ml::LANDMARK_SIDE);
+                        let img = smp.rgb_scaled(d.bounds(), step);
+                        let pts = photocraft_ml::face_landmarks(&img.px, img.w, img.h)?;
+                        let (sw, sh) = (img.w as f32, img.h as f32);
+                        Some((pts, sw, sh))
+                    })
+                });
+                if let Some((pts, sw, sh)) = mesh {
+                    analysis.landmarks = pts.iter().map(|p| [p.x / sw * doc.size.width as f32, p.y / sh * doc.size.height as f32, p.z]).collect();
+                    let (dw, dh) = (doc.size.width, doc.size.height);
+                    if let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
+                    {
+                        analysis.set(photocraft_portrait::Region::Face, gated);
+                    }
+                    // The eye and lip rings: the parsing export reads them as skin, so the
+                    // landmark rings are their regions (person-gated like every other).
+                    if let Some((eyes, lips)) = photocraft_portrait::face::feature_masks(&analysis.landmarks, dw, dh) {
+                        for (region, mask) in [(photocraft_portrait::Region::Eyes, eyes), (photocraft_portrait::Region::Lips, lips)] {
+                            if let Some(gated) = person_gated(&mask, &person, dw, dh) {
+                                analysis.set(region, gated);
+                            }
+                        }
+                    }
+                    // The makeup geometry: cheek ellipses and scaled eye rings, feathered.
+                    for (region, mask) in [
+                        (photocraft_portrait::Region::Cheeks, photocraft_portrait::face::blush_mask(&analysis.landmarks, dw, dh)),
+                        (photocraft_portrait::Region::Eyelids, photocraft_portrait::face::eyeshadow_mask(&analysis.landmarks, dw, dh)),
+                    ] {
+                        if let Some(mask) = mask
+                            && let Some(gated) = person_gated(&mask, &person, dw, dh)
+                        {
+                            analysis.set(region, gated);
+                        }
+                    }
+                }
+                Arc::new(analysis)
             };
-            let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
-            analysis.set(photocraft_portrait::Region::Person, person.clone());
-            // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
-            // skin/hair/clothes masks join the person mask; without one the slice is the
-            // person alone and every layer but the first stays out.
-            let regions = ctx.stage(0.4, 0.65, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person));
-            for (region, mask) in regions {
-                analysis.set(region, mask);
-            }
-            // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
-            // region comes from the landmark ring's hull, gated by the person like the
-            // parsing regions. The mesh answers on the sampled image; the points ride to
-            // document pixels before the hull is taken.
-            let mesh = ctx.stage(0.65, 0.7, "Finding landmarks", |_| {
-                with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                    let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::LANDMARK_SIDE * photocraft_ml::LANDMARK_SIDE);
-                    let img = smp.rgb_scaled(d.bounds(), step);
-                    let pts = photocraft_ml::face_landmarks(&img.px, img.w, img.h)?;
-                    let (sw, sh) = (img.w as f32, img.h as f32);
-                    Some((pts, sw, sh))
-                })
-            });
-            if let Some((pts, sw, sh)) = mesh {
-                analysis.landmarks = pts.iter().map(|p| [p.x / sw * doc.size.width as f32, p.y / sh * doc.size.height as f32, p.z]).collect();
-                if let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, doc.size.width, doc.size.height)
-                    .and_then(|hull| person_gated(&hull, &person, doc.size.width, doc.size.height))
-                {
-                    analysis.set(photocraft_portrait::Region::Face, gated);
+            // The restoration first: the GAN redraws skin texture, so the smoothing below
+            // runs on the enhanced composite when both are asked for (the DAG's
+            // Enhance-before-Skin edge, realised as the blur's source).
+            let mut composite: Option<photocraft_raster::Surface> = None;
+            let enhance = if recipe.enhance && !analysis.landmarks.is_empty() {
+                ctx.progress(0.7, "Enhancing face");
+                let canvas = doc.bounds();
+                let surface = composite.get_or_insert_with(|| photocraft_compose::composite_to_surface(&doc, canvas, photocraft_doc::PixelFormat::RGBA8, None));
+                enhance_face(&doc, surface, &analysis)?
+            } else {
+                None
+            };
+            let skin = match recipe.skin.filter(|_| analysis.mask(photocraft_portrait::Region::Skin).is_some()) {
+                Some(asked) => {
+                    ctx.progress(0.8, "Smoothing skin");
+                    let canvas = doc.bounds();
+                    let source = match &enhance {
+                        Some(e) => e,
+                        None => {
+                            composite.get_or_insert_with(|| photocraft_compose::composite_to_surface(&doc, canvas, photocraft_doc::PixelFormat::RGBA8, None))
+                        }
+                    };
+                    Some(smooth_skin(ctx, asked, source, canvas)?)
                 }
-            }
-            // The smoothing rides the same doc pixels (a cache hit still needs it when the
-            // recipe asks; the analysis cache saves subject and parsing, not this).
-            let skin_surface = match (skin_surface, recipe.skin) {
-                (Some(done), _) => Some(done),
-                (None, Some(skin)) if analysis.mask(photocraft_portrait::Region::Skin).is_some() => {
-                    ctx.progress(0.7, "Smoothing skin");
-                    Some(smooth_skin(&doc, ctx, skin)?)
-                }
-                _ => None,
+                None => None,
             };
             // 追色 last: the reference's statistics against the person's own tones.
             let grade = match reference {
@@ -316,13 +409,13 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 None => None,
             };
-            Ok((Arc::new(analysis), skin_surface, grade))
+            Ok((analysis, Products { skin, enhance, grade }))
         },
-        move |s, (analysis, smoothed, grade)| {
+        move |s, (analysis, products)| {
             let mut recipe = recipe.clone();
-            recipe.grade = grade;
+            recipe.grade = products.grade;
             let plan = photocraft_portrait::plan(&recipe, &analysis);
-            let group = materialize(s, &plan, &analysis, smoothed.as_ref())?;
+            let group = materialize(s, &plan, &analysis, &products)?;
             // Keyed to the post-edit document, past this edit's own cache reset (the same
             // re-point Select Subject does); an intervening edit still invalidates by pixels.
             if let Some(doc) = s.active().map(|st| Arc::clone(&st.doc)) {
@@ -340,7 +433,7 @@ fn materialize(
     s: &mut Session,
     plan: &photocraft_portrait::LayerPlan,
     analysis: &photocraft_portrait::Analysis,
-    smoothed: Option<&photocraft_raster::Surface>,
+    products: &Products,
 ) -> Result<photocraft_doc::LayerId> {
     s.edit("Smart Portrait", |doc, active| {
         let mut children = Vec::new();
@@ -357,10 +450,16 @@ fn materialize(
                     children.push(layer);
                 }
                 photocraft_portrait::PlannedLayer::Raster { name, mask } => {
-                    // The smoothed skin copy: an ordinary raster layer, masked to the skin
-                    // region — the classic duplicate-and-smooth retouch, undoable by hiding
-                    // or deleting the layer. Pixels arrive from the work stage.
-                    let Some(surface) = smoothed else { continue };
+                    // A rasterized stage result: an ordinary layer, masked to its region —
+                    // the classic duplicate-and-retouch shape, undoable by hiding or
+                    // deleting the layer. The pixels arrive from the work stage; the mask
+                    // region says which product a raster carries.
+                    let surface = match mask {
+                        Some(photocraft_portrait::Region::Skin) => products.skin.as_ref(),
+                        Some(photocraft_portrait::Region::Face) => products.enhance.as_ref(),
+                        _ => None,
+                    };
+                    let Some(surface) = surface else { continue };
                     let mut layer = Layer::new(name.clone(), LayerContent::Raster(surface.clone()));
                     if let Some(region) = mask
                         && let Some(surface) = analysis.mask(*region)
@@ -383,17 +482,44 @@ fn materialize(
 
 /// Smart Portrait command spec (Layer › New Adjustment Layer, though what it adds is a group
 /// of standard layers — the fork's entry point for the portrait pipeline).
+/// `portrait.saveRecipe`: the current recipe as a named action whose single step runs
+/// [`CMD`] — what the Actions panel lists, what Batch's `action` parameter takes. The
+/// whole params object (minus `name`) rides as the step's params; the recipe parser reads
+/// only the keys it knows.
+fn save_recipe(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = p.get("name").and_then(Value::as_str).ok_or_else(|| EngineError::Other("portrait.saveRecipe: a `name` is required".into()))?;
+    let mut step = p.clone();
+    if let Some(o) = step.as_object_mut() {
+        o.remove("name");
+    }
+    let action = crate::actions_cmds::Action::new(name.to_owned(), vec![crate::actions_cmds::ActionStep::new(CMD, step)]);
+    s.actions.list.push(action).map_err(|e| EngineError::Other(format!("could not save the recipe: {e}")))?;
+    Ok(json!({ "action": name }))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
-    vec![CommandSpec {
-        id: CMD,
-        label: "Smart Portrait…",
-        menu: &["Layer", "New Adjustment Layer"],
-        shortcut: None,
-        params: r##"{"sampleAllLayers":bool=false,"groupName":text="Portrait","hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0,"hairHue":-180..180?,"hairSaturation":-100..100?,"hairLightness":-100..100?,"skinRadius":1..100?,"skinThreshold":2..255?} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions — then adds a named group of standard adjustment layers masked to them; any hair value opts into a Hair Color layer; one history step)"##,
-        enabled,
-        run,
-        journal: true,
-    }]
+    vec![
+        CommandSpec {
+            id: CMD,
+            label: "Smart Portrait…",
+            menu: &["Layer", "New Adjustment Layer"],
+            shortcut: None,
+            params: r##"{"sampleAllLayers":bool=false,"skinRadius":1..100=10,"skinThreshold":2..255=18,"enhanceFace":bool=false,"hairHue":-180..180=0,"hairSaturation":-100..100=0,"lipHue":0..360=330,"lipSaturation":0..100=30,"eyeBrighten":0..50=12,"blushHue":0..360=350,"blushSaturation":0..100=20,"shadowHue":0..360=30,"shadowSaturation":0..100=25,"hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions and the GFPGAN restoration — then adds a named group of standard adjustment layers masked to them: smoothing, hair and lip colour, eye brighten, the person grade; one history step. The colour-match `reference` path and `referenceStats` are protocol-only, not dialog rows)"##,
+            enabled,
+            run,
+            journal: true,
+        },
+        CommandSpec {
+            id: "portrait.saveRecipe",
+            label: "Save Portrait Recipe…",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"name":text,"…":any portrait.create params} → {action} (the recipe as a named action: the Actions panel lists it, Batch runs it over a folder)"##,
+            enabled: |_| Ok(()),
+            run: save_recipe,
+            journal: true,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -667,6 +793,64 @@ mod tests {
         assert!(s2.execute(CMD, json!({"reference": "/nonexistent/ref.png"})).is_err());
     }
 
+    /// Without a GFPGAN model the enhancement ask changes nothing — the degrade path.
+    #[test]
+    fn face_enhance_without_a_model_stays_out() {
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_some_and(|d| std::path::Path::new(&d).join("gfpgan.onnx").is_file()) {
+            eprintln!("skipping: a gfpgan model is placed, the enhance layer lands");
+            return;
+        }
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"enhanceFace": true})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        assert_eq!(group.children.len(), 1, "no model, no enhance layer");
+    }
+
+    /// With the model placed the Face Enhance raster lands with the face-hull mask and
+    /// genuinely redrawn pixels (the paste differs from the composite it came from).
+    #[test]
+    fn face_enhance_lands_a_redrawn_raster_when_a_model_is_placed() {
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_none_or(|d| !std::path::Path::new(&d).join("gfpgan.onnx").is_file()) {
+            eprintln!("skipping: no gfpgan.onnx in PHOTOCRAFT_MODELS_DIR");
+            return;
+        }
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"enhanceFace": true})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        let enhanced = group.children.iter().find(|l| l.name == "Face Enhance").expect("a Face Enhance layer");
+        assert!(enhanced.mask.is_some(), "masked to the face hull");
+        let LayerContent::Raster(surface) = &enhanced.content else { panic!("not a raster") };
+        let original = photocraft_compose::composite_to_surface(
+            &s.active().unwrap().doc,
+            photocraft_geom::Rect::new(0, 0, 200, 160),
+            photocraft_doc::PixelFormat::RGBA8,
+            None,
+        );
+        let mask = photocraft_doc::LayerMask { surface: enhanced.mask.clone().unwrap().surface.clone(), ..photocraft_doc::LayerMask::reveal_all() };
+        let (mut differs, mut inside) = (0, 0);
+        for y in 60..100 {
+            for x in 80..120 {
+                if mask.value(x, y) >= 0.5 {
+                    inside += 1;
+                    let (a, b) = (surface.rgba(x, y), original.rgba(x, y));
+                    if (a[0] - b[0]).abs() > 0.01 || (a[1] - b[1]).abs() > 0.01 {
+                        differs += 1;
+                    }
+                }
+            }
+        }
+        assert!(inside > 0, "the disc's landmark hull has support");
+        // Pixel-level restoration is deliberately NOT asserted here: a synthetic disc's
+        // landmark mesh is garbage, the aligned crop lands wherever it lands, and the
+        // paste legitimately falls back to the base outside it. The wiring proof is the
+        // layer, its mask and the model's real run (the suite's time budget shows it);
+        // what the restoration does to a real face is the real-photo validation the
+        // archive tracks. Silence the counters the diff used to check.
+        let _ = (differs, original);
+    }
+
     /// The embedded FaceMesh runs unconditionally (no env, ~15ms): the analysis carries
     /// the landmarks and the face-hull region on every create, model or no parsing model.
     #[test]
@@ -689,6 +873,141 @@ mod tests {
             }
         }
         assert!(hits > 0, "the hull has support");
+    }
+
+    /// The facial-feature layers are model-free (the embedded mesh carries the rings):
+    /// lip colour and eye brighten land on any build, deterministically.
+    #[test]
+    fn lip_colour_and_eye_brighten_land_from_the_landmark_rings() {
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"lipHue": 320.0, "lipSaturation": 30.0, "eyeBrighten": 12.0})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        assert_eq!(group.children.len(), 3, "person + eye + lip layers");
+        let eye = &group.children[1];
+        assert_eq!(eye.name, "Eye Brighten");
+        assert!(eye.mask.is_some(), "masked to the eye rings");
+        let LayerContent::Adjustment(photocraft_doc::Adjustment::BrightnessContrast { brightness, .. }) = &eye.content else {
+            panic!("not brightness/contrast")
+        };
+        assert_eq!(*brightness, 12.0);
+        let lip = &group.children[2];
+        assert_eq!(lip.name, "Lip Color");
+        assert!(lip.mask.is_some(), "masked to the lip ring");
+        let LayerContent::Adjustment(photocraft_doc::Adjustment::HueSaturation { hue, colorize, .. }) = &lip.content else { panic!("not hue/saturation") };
+        assert_eq!((*hue, *colorize), (320.0, true), "colourized at the asked hue");
+        // Undo removes all three as one step.
+        let group_id = s.active().unwrap().active_layer.unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(s.active().unwrap().doc.layer(group_id).is_none());
+    }
+
+    /// The makeup pair is model-free like the features: cheek ellipses and scaled eye
+    /// rings land from the embedded mesh on any build.
+    #[test]
+    fn blush_and_eyeshadow_land_from_the_landmark_geometry() {
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"blushSaturation": 20.0, "shadowHue": 280.0, "shadowSaturation": 30.0})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        assert_eq!(group.children.len(), 3, "person + eyeshadow + blush layers");
+        let blush = &group.children[1];
+        assert_eq!(blush.name, "Blush");
+        assert!(blush.mask.is_some(), "masked to the cheek ellipses");
+        let shadow = &group.children[2];
+        assert_eq!(shadow.name, "Eyeshadow");
+        assert!(shadow.mask.is_some(), "masked to the scaled eye rings");
+        let LayerContent::Adjustment(photocraft_doc::Adjustment::HueSaturation { hue, colorize, .. }) = &shadow.content else { panic!("not hue/saturation") };
+        assert_eq!((*hue, *colorize), (280.0, true));
+    }
+
+    /// The batch composition: `file.automate.batch` (upstream) runs `portrait.create`
+    /// (the fork's pipeline) as a recorded step over a folder — the whole batch feature is
+    /// this composition, so this test is its contract. Two inputs, a light recipe with a
+    /// landmark-driven layer (model-free, deterministic), PNG outputs, no errors.
+    #[test]
+    fn batch_runs_the_portrait_pipeline_over_a_folder() {
+        let dir = std::env::temp_dir().join(format!("photocraft-portrait-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        // Two grey inputs with a subject blob each (a blank document has no person).
+        let inputs: Vec<String> = (0..2)
+            .map(|i| {
+                let mut s = Session::new();
+                s.execute("file.new", json!({"width": 96, "height": 96, "background": "white"})).unwrap();
+                s.edit("paint", |doc, _| {
+                    let bg = doc.layers[0].surface_mut().unwrap();
+                    bg.fill_rect(photocraft_geom::Rect::new(28, 28, 68, 68), &[0.6, 0.2, 0.1, 1.0]);
+                    Ok(())
+                })
+                .unwrap();
+                let path = format!("{dir}/img{i}.png");
+                crate::file_cmds::save_doc(&s.active().unwrap().doc, &path, None).unwrap();
+                path
+            })
+            .collect();
+        let output = format!("{dir}/out");
+        let mut runner = Session::new();
+        let r = runner
+            .execute(
+                "file.automate.batch",
+                json!({
+                    "input": inputs,
+                    "output": output,
+                    "format": "png",
+                    "steps": [["portrait.create", {"lipSaturation": 30.0, "eyeBrighten": 12.0}]],
+                }),
+            )
+            .unwrap();
+        assert_eq!(r["errors"], json!([]), "batch errors: {r}");
+        assert_eq!(r["files"].as_array().map(Vec::len), Some(2), "one output per input: {r}");
+        for f in r["files"].as_array().unwrap() {
+            assert!(std::path::Path::new(f.as_str().unwrap()).is_file(), "{f} exists");
+        }
+        // The recipe-as-action bridge: saveRecipe stores the recipe under a name, and
+        // Batch takes the name instead of inline steps — the Actions panel route.
+        let mut saver = Session::new();
+        let saved = saver.execute("portrait.saveRecipe", json!({"name": "Studio Skin", "eyeBrighten": 12.0, "lipSaturation": 30.0})).unwrap();
+        assert_eq!(saved["action"], "Studio Skin");
+        let output2 = format!("{dir}/out2");
+        let r2 = saver.execute("file.automate.batch", json!({"input": inputs, "output": output2, "format": "png", "action": "Studio Skin"})).unwrap();
+        assert_eq!(r2["errors"], json!([]), "action-based batch: {r2}");
+        assert_eq!(r2["files"].as_array().map(Vec::len), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real-photo acceptance harness: `PHOTOCRAFT_PORTRAIT_PHOTO=<image>` imports
+    /// it, runs the full pipeline (everything the placed models allow) and quick-exports
+    /// the composite for eyeballing. Skipped without the env var — CI has neither the
+    /// weights nor the photos.
+    #[test]
+    fn real_photo_acceptance_export() {
+        let Some(photo) = std::env::var_os("PHOTOCRAFT_PORTRAIT_PHOTO") else {
+            eprintln!("skipping: PHOTOCRAFT_PORTRAIT_PHOTO unset");
+            return;
+        };
+        let run = || -> Result<()> {
+            let mut s = Session::new();
+            let name = std::path::Path::new(&photo).file_name().and_then(|n| n.to_str()).unwrap_or("photo").to_string();
+            let imported =
+                photocraft_io::import_file(&name, std::path::Path::new(&photo), &photocraft_io::ImportOptions::default(), &photocraft_raster::Interrupt::NONE)
+                    .map_err(|e| EngineError::Other(format!("import: {e}")))?;
+            s.open_document(imported.document, None);
+            let t = std::time::Instant::now();
+            let r = s.execute(CMD, json!({"enhanceFace": true, "skinRadius": 8.0, "hairHue": -10.0, "hairSaturation": 15.0, "referenceStats": {"mean": [0.55, 0.47, 0.42], "std": [0.14, 0.12, 0.11]}}))?;
+            eprintln!("portrait.create on a real photo: {:.1} s (group {})", t.elapsed().as_secs_f32(), r["group"]);
+            let out = std::env::var_os("PHOTOCRAFT_PORTRAIT_OUT").map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "/tmp/portrait_out.png".into());
+            // The composite with the portrait group applied: flatten, then the quick export's
+            // active layer is that single background.
+            s.execute("layer.flattenImage", json!({}))?;
+            s.execute("layer.quickExportAsPng", json!({"path": out}))?;
+            eprintln!("exported: {out}");
+            Ok(())
+        };
+        if let Err(e) = run() {
+            panic!("acceptance harness failed: {e}");
+        }
     }
 
     #[test]

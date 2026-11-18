@@ -62,11 +62,61 @@ pub fn plan(recipe: &Recipe, analysis: &Analysis) -> LayerPlan {
             mask: Some(Region::Hair),
         });
     }
+    // The restoration sits between the colour layers and the smoothing: the GAN redraws
+    // skin texture, so anything later must see it (the engine computes the smoothing from
+    // the enhanced composite when both are asked for). Needs the face region the landmark
+    // hull provides.
+    if recipe.enhance && analysis.mask(Region::Face).is_some() {
+        layers.push(PlannedLayer::Raster { name: "Face Enhance".into(), mask: Some(Region::Face) });
+    }
     // The smoothed skin rides on the parsing analysis like the hair layer does. The
     // raster's pixels are the engine's to fill (a Surface-Blur of the composite); the plan
     // carries the ask and the mask.
     if recipe.skin.is_some() && analysis.mask(Region::Skin).is_some() {
         layers.push(PlannedLayer::Raster { name: "Skin Smoothing".into(), mask: Some(Region::Skin) });
+    }
+    // The facial features: the eye rings brighten and the lip ring takes a Colourize —
+    // both ride the landmark rings (model-free), landing under the grade.
+    if let Some(amount) = recipe.eyes
+        && analysis.mask(Region::Eyes).is_some()
+    {
+        layers.push(PlannedLayer::Adjustment {
+            name: "Eye Brighten".into(),
+            kind: "brightnessContrast".into(),
+            params: serde_json::json!({ "brightness": amount }),
+            mask: Some(Region::Eyes),
+        });
+    }
+    if let Some(HueSat { hue, saturation, lightness }) = recipe.lips
+        && analysis.mask(Region::Lips).is_some()
+    {
+        layers.push(PlannedLayer::Adjustment {
+            name: "Lip Color".into(),
+            kind: "hueSaturation".into(),
+            params: serde_json::json!({ "hue": hue, "saturation": saturation, "lightness": lightness, "colorize": true }),
+            mask: Some(Region::Lips),
+        });
+    }
+    // The makeup pair rides the landmark geometry like the features do.
+    if let Some(HueSat { hue, saturation, lightness }) = recipe.blush
+        && analysis.mask(Region::Cheeks).is_some()
+    {
+        layers.push(PlannedLayer::Adjustment {
+            name: "Blush".into(),
+            kind: "hueSaturation".into(),
+            params: serde_json::json!({ "hue": hue, "saturation": saturation, "lightness": lightness, "colorize": true }),
+            mask: Some(Region::Cheeks),
+        });
+    }
+    if let Some(HueSat { hue, saturation, lightness }) = recipe.eyeshadow
+        && analysis.mask(Region::Eyelids).is_some()
+    {
+        layers.push(PlannedLayer::Adjustment {
+            name: "Eyeshadow".into(),
+            kind: "hueSaturation".into(),
+            params: serde_json::json!({ "hue": hue, "saturation": saturation, "lightness": lightness, "colorize": true }),
+            mask: Some(Region::Eyelids),
+        });
     }
     // The colour match runs last (topmost): the Curves points carry the transfer the
     // engine computed from the reference, masked to the person like the rest of the
@@ -129,6 +179,11 @@ mod tests {
             hair: None,
             skin: None,
             grade: None,
+            enhance: false,
+            lips: None,
+            eyes: None,
+            blush: None,
+            eyeshadow: None,
         };
         let planned = plan(&recipe, &analysis_with_person(true));
         let PlannedLayer::Adjustment { name, kind, params, .. } = &planned.layers[0] else { panic!("not an adjustment") };

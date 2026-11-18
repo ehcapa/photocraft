@@ -50,6 +50,9 @@ pub use landmarks::{LANDMARK_COUNT, LANDMARK_SIDE};
 /// The ort tier's matting input side (1024), exported unconditionally so callers scale
 /// samplers without a feature gate; only the run itself needs feature "ort".
 pub const MATTING_SIDE: usize = crate::ort_side::MATTING_SIDE;
+
+/// The GFPGAN enhancement input side (512), unconditional like [`MATTING_SIDE`].
+pub const ENHANCE_SIDE: usize = crate::ort_side::ENHANCE_SIDE;
 pub use parsing::{PARSING_CLASSES, PARSING_SIDE};
 
 /// One FaceMesh landmark: `x`/`y` in the caller's pixel space, `z` a rough depth relative
@@ -99,6 +102,22 @@ pub fn face_landmarks(px: &[[f32; 3]], w: usize, h: usize) -> Option<Vec<Landmar
     }
 }
 
+/// The restored face of an aligned `512 × 512` crop (row-major RGB, `0..=1`), clamped
+/// to `0..=1`. `None` without `PHOTOCRAFT_MODELS_DIR/gfpgan.onnx` (or on failure) — the
+/// enhancement layer does not appear. Input contract: **0..1** (this export bakes no
+/// normalisation), unlike the parsing export's raw 0–255.
+pub fn enhance_face(px: &[[f32; 3]]) -> Option<Vec<[f32; 3]>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        enhance::enhance_face(px)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = px;
+        None
+    }
+}
+
 /// The soft person matte of `px` (`w × h` row-major RGB, `0..=1`) through the ort tier
 /// (feature `ort` + `PHOTOCRAFT_MODELS_DIR/feynobg.onnx`): hair-edge alpha at 1024²,
 /// ~10s a run. `None` without the feature or the model — callers fall back to the
@@ -137,7 +156,11 @@ pub mod landmarks;
 /// The ort-tier side constant, feature-free (see [`MATTING_SIDE`]).
 mod ort_side {
     pub const MATTING_SIDE: usize = 1024;
+    pub const ENHANCE_SIDE: usize = 512;
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+mod enhance;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ort"))]
 mod ort_matting;
