@@ -45,7 +45,17 @@ pub fn subject_mask(px: &[[f32; 3]], w: usize, h: usize) -> Option<SubjectMask> 
     }
 }
 
+pub use landmarks::{LANDMARK_COUNT, LANDMARK_SIDE};
 pub use parsing::{PARSING_CLASSES, PARSING_SIDE};
+
+/// One FaceMesh landmark: `x`/`y` in the caller's pixel space, `z` a rough depth relative
+/// to the head centre (MediaPipe's convention).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Landmark {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
 
 /// The face-parsing result: one probability plane per class, at the caller's size.
 pub struct ParsingProbs {
@@ -70,6 +80,21 @@ pub fn parsing_probs(px: &[[f32; 3]], w: usize, h: usize) -> Option<ParsingProbs
     }
 }
 
+/// The 478 FaceMesh landmarks of `px` (`w × h` row-major RGB, `0..=1`), normalised to that
+/// size. `None` on a size mismatch or inference failure — the pipeline's alignment stage
+/// simply stays empty.
+pub fn face_landmarks(px: &[[f32; 3]], w: usize, h: usize) -> Option<Vec<Landmark>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        landmarks::face_landmarks(px, w, h)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (px, w, h);
+        None
+    }
+}
+
 /// A single-plane `0..=1` mask resampled to `to_w × to_h` (the subject mask's filter).
 pub fn resize_mask(px: &[f32], w: usize, h: usize, to_w: usize, to_h: usize) -> Option<Vec<f32>> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -85,6 +110,9 @@ pub fn resize_mask(px: &[f32], w: usize, h: usize, to_w: usize, to_h: usize) -> 
 
 #[cfg(not(target_arch = "wasm32"))]
 mod model;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod landmarks;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod parsing;

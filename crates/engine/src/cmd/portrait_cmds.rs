@@ -21,6 +21,13 @@ use crate::{EngineError, Result, Session};
 
 const CMD: &str = "portrait.create";
 
+/// A 追色 reference: a file path, or the statistics themselves (the protocol seam the
+/// tests drive; a path is what a user hands the command).
+enum Either {
+    Path(String),
+    Stats { mean: [f32; 3], std: [f32; 3] },
+}
+
 fn enabled(s: &Session) -> std::result::Result<(), String> {
     s.active().ok_or("no document open")?;
     Ok(())
@@ -53,7 +60,90 @@ fn recipe(p: &Value) -> photocraft_portrait::Recipe {
             lightness: asked("hairLightness").unwrap_or(0.0),
         });
     }
+    if [p.get("skinRadius"), p.get("skinThreshold")].iter().any(|v| v.is_some()) {
+        r.skin = Some(photocraft_portrait::Skin { radius: asked("skinRadius").unwrap_or_default(), threshold: asked("skinThreshold").unwrap_or_default() });
+    }
     r
+}
+
+/// Per-channel mean/std of `surf`'s RGB, optionally weighted by a person mask (the
+/// portrait's own tones, not the backdrop's). Alpha-transparent pixels never count.
+fn channel_stats(surf: &photocraft_raster::Surface, area: photocraft_geom::Rect, person: Option<&photocraft_raster::Surface>) -> ([f32; 3], [f32; 3]) {
+    let mut sums = [0f64; 3];
+    let mut sqs = [0f64; 3];
+    let mut n = 0u64;
+    for y in area.y0..area.y1 {
+        for x in area.x0..area.x1 {
+            let px = surf.rgba(x, y);
+            if px[3] < 0.5 {
+                continue;
+            }
+            if person.is_some_and(|p| p.rgba(x, y)[0] < 0.5) {
+                continue;
+            }
+            for c in 0..3 {
+                sums[c] += f64::from(px[c]);
+                sqs[c] += f64::from(px[c]) * f64::from(px[c]);
+            }
+            n += 1;
+        }
+    }
+    let n = n.max(1) as f64;
+    let mean = sums.map(|s| (s / n) as f32);
+    // Population std, floored at one level so a flat channel never divides by zero below.
+    let std = std::array::from_fn(|c| (((sqs[c] / n - f64::from(mean[c]) * f64::from(mean[c])).max(0.0)).sqrt() as f32).max(1.0 / 255.0));
+    (mean, std)
+}
+
+/// The 追色 transfer: Reinhard-style mean/std matching per RGB channel, computed from the
+/// document (masked to the person) and the reference. `None` without a usable reference.
+fn grade_transfer(doc: &Document, person: Option<&photocraft_raster::Surface>, reference: Either) -> Result<photocraft_portrait::Grade> {
+    let canvas = doc.bounds();
+    let src = photocraft_compose::composite_to_surface(doc, canvas, photocraft_doc::PixelFormat::RGBA8, None);
+    let (src_mean, src_std) = channel_stats(&src, canvas, person);
+    let (ref_mean, ref_std) = match reference {
+        Either::Stats { mean, std } => (mean, std),
+        Either::Path(path) => {
+            let name = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("reference");
+            let imported =
+                photocraft_io::import_file(name, std::path::Path::new(&path), &photocraft_io::ImportOptions::default(), &photocraft_raster::Interrupt::NONE)
+                    .map_err(|e| EngineError::Other(format!("could not read the reference image: {e}")))?;
+            let bounds = imported.document.bounds();
+            let surf = photocraft_compose::composite_to_surface(&imported.document, bounds, photocraft_doc::PixelFormat::RGBA8, None);
+            channel_stats(&surf, bounds, None)
+        }
+    };
+    let mut slope = [0.0f32; 3];
+    let mut offset = [0.0f32; 3];
+    for c in 0..3 {
+        slope[c] = (ref_std[c] / src_std[c]).clamp(0.25, 4.0);
+        offset[c] = ref_mean[c] - slope[c] * src_mean[c];
+    }
+    Ok(photocraft_portrait::Grade { slope, offset })
+}
+
+/// The smoothed copy the Skin Smoothing raster carries: the composite rendered flat, then
+/// Surface Blur over it (`filter.blur.surfaceBlur`, cancelled through `ctx` like any
+/// filter). `None` when the recipe does not ask for skin or the analysis found no skin.
+fn smooth_skin(doc: &Document, ctx: &crate::jobs::JobCtx, skin: photocraft_portrait::Skin) -> Result<photocraft_raster::Surface> {
+    let canvas = doc.bounds();
+    let composite = photocraft_compose::composite_to_surface(doc, canvas, doc.pixel_format(), None);
+    let params = json!({ "radius": skin.radius, "threshold": skin.threshold });
+    crate::filters::apply_filter_to_surface_in("filter.blur.surfaceBlur", &params, &composite, canvas, None, canvas, ctx)?
+        .ok_or_else(|| EngineError::Other("skin smoothing produced no surface".into()))
+}
+
+/// The 追色 ask: a reference image path, or the statistics themselves (the seam the tests
+/// drive; a path is what a user hands the command). `None` when the params carry neither.
+fn reference(p: &Value) -> Option<Either> {
+    if let Some(stats) = p.get("referenceStats") {
+        let nums = |key: &str| {
+            let v = stats.get(key)?.as_array()?;
+            Some([v.first()?.as_f64()? as f32, v.get(1)?.as_f64()? as f32, v.get(2)?.as_f64()? as f32])
+        };
+        return Some(Either::Stats { mean: nums("mean")?, std: nums("std")? });
+    }
+    p.get("reference").and_then(Value::as_str).map(|s| Either::Path(s.into()))
 }
 
 /// The parsing regions of `doc`, upsampled to document resolution and intersected with the
@@ -98,6 +188,23 @@ fn parsing_regions(
         .collect()
 }
 
+/// A copy of `mask` clipped by `person` (per-pixel multiply), the hull's share of the gate
+/// the parsing regions ride. `None` when the read-back fails.
+fn person_gated(mask: &photocraft_raster::Surface, person: &photocraft_raster::Surface, w: u32, h: u32) -> Option<photocraft_raster::Surface> {
+    let area = photocraft_geom::Rect::new(0, 0, w as i32, h as i32);
+    let mut vals = mask.try_read_region(area).ok()?;
+    let gate = photocraft_doc::LayerMask { surface: person.clone(), ..photocraft_doc::LayerMask::reveal_all() };
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let i = (y * w as i32 + x) as usize;
+            vals[i] *= gate.value(x, y);
+        }
+    }
+    let mut out = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+    out.write_region(area, &vals);
+    Some(out)
+}
+
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let recipe = recipe(p);
     let sample_all = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
@@ -105,13 +212,29 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let cached = s.portrait_cache.get(&st.doc, crate::layer_multi_cmds::same_pixels);
     let doc = Arc::clone(&st.doc);
     let target = st.active_layer;
+    let reference = reference(p);
     crate::jobs::run(
         s,
         "Smart Portrait",
         true,
         move |ctx| {
+            let skin_surface = recipe
+                .skin
+                .filter(|_| cached.as_ref().is_none_or(|a| a.mask(photocraft_portrait::Region::Skin).is_some()))
+                .map(|skin| {
+                    ctx.progress(0.7, "Smoothing skin");
+                    smooth_skin(&doc, ctx, skin)
+                })
+                .transpose()?;
             if let Some(analysis) = cached {
-                return Ok(analysis);
+                // The grade is cheap and reference-driven; it runs on hits too.
+                let grade = reference
+                    .map(|r| {
+                        ctx.progress(0.9, "Matching colour");
+                        grade_transfer(&doc, analysis.mask(photocraft_portrait::Region::Person), r)
+                    })
+                    .transpose()?;
+                return Ok((analysis, skin_surface, grade));
             }
             // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
             let found = ctx
@@ -129,15 +252,56 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             // The parsing stage when a model is handed in (`PHOTOCRAFT_PORTRAIT_PARSING`):
             // skin/hair/clothes masks join the person mask; without one the slice is the
             // person alone and every layer but the first stays out.
-            let regions = ctx.stage(0.4, 0.7, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person));
+            let regions = ctx.stage(0.4, 0.65, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person));
             for (region, mask) in regions {
                 analysis.set(region, mask);
             }
-            Ok(Arc::new(analysis))
+            // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
+            // region comes from the landmark ring's hull, gated by the person like the
+            // parsing regions. The mesh answers on the sampled image; the points ride to
+            // document pixels before the hull is taken.
+            let mesh = ctx.stage(0.65, 0.7, "Finding landmarks", |_| {
+                with_doc_sampler(&doc, target, sample_all, |smp, d| {
+                    let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::LANDMARK_SIDE * photocraft_ml::LANDMARK_SIDE);
+                    let img = smp.rgb_scaled(d.bounds(), step);
+                    let pts = photocraft_ml::face_landmarks(&img.px, img.w, img.h)?;
+                    let (sw, sh) = (img.w as f32, img.h as f32);
+                    Some((pts, sw, sh))
+                })
+            });
+            if let Some((pts, sw, sh)) = mesh {
+                analysis.landmarks = pts.iter().map(|p| [p.x / sw * doc.size.width as f32, p.y / sh * doc.size.height as f32, p.z]).collect();
+                if let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, doc.size.width, doc.size.height)
+                    .and_then(|hull| person_gated(&hull, &person, doc.size.width, doc.size.height))
+                {
+                    analysis.set(photocraft_portrait::Region::Face, gated);
+                }
+            }
+            // The smoothing rides the same doc pixels (a cache hit still needs it when the
+            // recipe asks; the analysis cache saves subject and parsing, not this).
+            let skin_surface = match (skin_surface, recipe.skin) {
+                (Some(done), _) => Some(done),
+                (None, Some(skin)) if analysis.mask(photocraft_portrait::Region::Skin).is_some() => {
+                    ctx.progress(0.7, "Smoothing skin");
+                    Some(smooth_skin(&doc, ctx, skin)?)
+                }
+                _ => None,
+            };
+            // 追色 last: the reference's statistics against the person's own tones.
+            let grade = match reference {
+                Some(r) => {
+                    ctx.progress(0.9, "Matching colour");
+                    Some(grade_transfer(&doc, analysis.mask(photocraft_portrait::Region::Person), r)?)
+                }
+                None => None,
+            };
+            Ok((Arc::new(analysis), skin_surface, grade))
         },
-        move |s, analysis| {
+        move |s, (analysis, smoothed, grade)| {
+            let mut recipe = recipe.clone();
+            recipe.grade = grade;
             let plan = photocraft_portrait::plan(&recipe, &analysis);
-            let group = materialize(s, &plan, &analysis)?;
+            let group = materialize(s, &plan, &analysis, smoothed.as_ref())?;
             // Keyed to the post-edit document, past this edit's own cache reset (the same
             // re-point Select Subject does); an intervening edit still invalidates by pixels.
             if let Some(doc) = s.active().map(|st| Arc::clone(&st.doc)) {
@@ -151,7 +315,12 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
 /// One history step named "Smart Portrait": the plan's standard layer subtree, built directly
 /// (`Layer::group` takes children; masks are assigned, no selection roundtrip). Unimplemented
 /// stages plan nothing, so the match's other arms are the generative stages' landing spots.
-fn materialize(s: &mut Session, plan: &photocraft_portrait::LayerPlan, analysis: &photocraft_portrait::Analysis) -> Result<photocraft_doc::LayerId> {
+fn materialize(
+    s: &mut Session,
+    plan: &photocraft_portrait::LayerPlan,
+    analysis: &photocraft_portrait::Analysis,
+    smoothed: Option<&photocraft_raster::Surface>,
+) -> Result<photocraft_doc::LayerId> {
     s.edit("Smart Portrait", |doc, active| {
         let mut children = Vec::new();
         for step in &plan.layers {
@@ -166,7 +335,20 @@ fn materialize(s: &mut Session, plan: &photocraft_portrait::LayerPlan, analysis:
                     }
                     children.push(layer);
                 }
-                photocraft_portrait::PlannedLayer::Group { .. } | photocraft_portrait::PlannedLayer::Raster { .. } => {}
+                photocraft_portrait::PlannedLayer::Raster { name, mask } => {
+                    // The smoothed skin copy: an ordinary raster layer, masked to the skin
+                    // region — the classic duplicate-and-smooth retouch, undoable by hiding
+                    // or deleting the layer. Pixels arrive from the work stage.
+                    let Some(surface) = smoothed else { continue };
+                    let mut layer = Layer::new(name.clone(), LayerContent::Raster(surface.clone()));
+                    if let Some(region) = mask
+                        && let Some(surface) = analysis.mask(*region)
+                    {
+                        layer.mask = Some(crate::commands::mask_at_depth(LayerMask { surface: surface.clone(), ..LayerMask::reveal_all() }, doc.depth)?);
+                    }
+                    children.push(layer);
+                }
+                photocraft_portrait::PlannedLayer::Group { .. } => {}
             }
         }
         let group = Layer::group(plan.group_name.clone(), children);
@@ -186,7 +368,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Smart Portrait…",
         menu: &["Layer", "New Adjustment Layer"],
         shortcut: None,
-        params: r##"{"sampleAllLayers":bool=false,"groupName":text="Portrait","hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0,"hairHue":-180..180?,"hairSaturation":-100..100?,"hairLightness":-100..100?} → {group} (analyzes the person — and, with PHOTOCRAFT_PORTRAIT_PARSING, the skin/hair/clothes regions — then adds a named group of standard adjustment layers masked to them; any hair value opts into a Hair Color layer; one history step)"##,
+        params: r##"{"sampleAllLayers":bool=false,"groupName":text="Portrait","hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0,"hairHue":-180..180?,"hairSaturation":-100..100?,"hairLightness":-100..100?,"skinRadius":1..100?,"skinThreshold":2..255?} → {group} (analyzes the person — and, with PHOTOCRAFT_PORTRAIT_PARSING, the skin/hair/clothes regions — then adds a named group of standard adjustment layers masked to them; any hair value opts into a Hair Color layer; one history step)"##,
         enabled,
         run,
         journal: true,
@@ -366,6 +548,122 @@ mod tests {
         // masked, and its mask sits inside the person (the gate above). Real hair volume
         // is the real-photo validation the spike archive records, not this test.
         assert!(hair_px > 0, "hair mask has no support at all");
+    }
+
+    /// Without a parsing model there is no Skin region, so asking for smoothing changes
+    /// nothing — the degrade path, deterministic everywhere.
+    #[test]
+    fn skin_smoothing_without_regions_stays_one_layer() {
+        if std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING").is_some() {
+            eprintln!("skipping: a parsing model is set, the Skin region exists");
+            return;
+        }
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"skinRadius": 12.0})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        assert_eq!(group.children.len(), 1);
+    }
+
+    /// With a model handed in the smoothing raster lands third, masked to the skin region
+    /// and carrying blurred pixels (smoothed ≠ original somewhere).
+    #[test]
+    fn skin_smoothing_lands_a_blurred_raster_when_a_model_is_provided() {
+        if std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING").is_none() {
+            eprintln!("skipping: PHOTOCRAFT_PORTRAIT_PARSING unset");
+            return;
+        }
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"skinRadius": 12.0, "skinThreshold": 25.0})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        let skin_layer = group.children.iter().find(|l| l.name == "Skin Smoothing").expect("a Skin Smoothing layer");
+        assert!(skin_layer.mask.is_some(), "the smoothing raster is masked");
+        let LayerContent::Raster(surface) = &skin_layer.content else { panic!("not a raster") };
+        // Surface Blur of a noisy disc: at least somewhere the copy differs from the flat
+        // composite it came from (noise averaged away inside the disc).
+        let original = photocraft_compose::composite_to_surface(
+            &s.active().unwrap().doc,
+            photocraft_geom::Rect::new(0, 0, 200, 160),
+            photocraft_doc::PixelFormat::RGBA8,
+            None,
+        );
+        let mut differs = 0;
+        for y in 100..110 {
+            for x in 95..105 {
+                let a = surface.rgba(x, y);
+                let b = original.rgba(x, y);
+                if (a[0] - b[0]).abs() > 0.01 || (a[1] - b[1]).abs() > 0.01 {
+                    differs += 1;
+                }
+            }
+        }
+        assert!(differs > 0, "the smoothing raster is a copy, not a blur");
+    }
+
+    /// 追色 with injected statistics (no file, no model): the Color Match Curves layer
+    /// lands after the person layer, masked to the person, carrying the transfer.
+    #[test]
+    fn colour_match_lands_a_person_masked_curves_layer() {
+        let (mut s, _) = disc();
+        // Reference warmer and tighter than the disc's own stats: red mean up, red std down.
+        let r = s.execute(CMD, json!({"referenceStats": {"mean": [0.7, 0.5, 0.4], "std": [0.08, 0.12, 0.12]}})).unwrap();
+        assert!(r["group"].as_u64().is_some());
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        assert_eq!(group.children.len(), 2, "person layer + colour match");
+        let grade = &group.children[1];
+        assert_eq!(grade.name, "Color Match");
+        assert!(grade.mask.is_some(), "masked to the person");
+        let LayerContent::Adjustment(photocraft_doc::Adjustment::Curves { per_channel, .. }) = &grade.content else { panic!("not curves") };
+        // Every channel carries a two-point line (the affine transfer in curve points).
+        for curve in per_channel {
+            assert_eq!(curve.len(), 2, "{curve:?}");
+            assert!(curve[0].input < curve[1].input);
+        }
+        // And it actually grades: the composite inside the disc shifts toward the reference.
+        let inside = photocraft_compose::render(&s.active().unwrap().doc, photocraft_geom::Rect::from_xywh(100, 80, 1, 1)).px[0];
+        assert!(inside[0] > 0.55, "red lifted toward the reference: {inside:?}");
+        // Undo removes the whole group, grade included.
+        let group_id = s.active().unwrap().active_layer.unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(s.active().unwrap().doc.layer(group_id).is_none());
+    }
+
+    #[test]
+    fn colour_match_without_a_reference_stays_out() {
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        assert_eq!(group.children.len(), 1, "no ask, no grade layer");
+        // A malformed reference is an error, not a silent skip.
+        let mut s2 = disc().0;
+        assert!(s2.execute(CMD, json!({"reference": "/nonexistent/ref.png"})).is_err());
+    }
+
+    /// The embedded FaceMesh runs unconditionally (no env, ~15ms): the analysis carries
+    /// the landmarks and the face-hull region on every create, model or no parsing model.
+    #[test]
+    fn landmarks_and_face_region_land_on_every_create() {
+        let (mut s, inside) = disc();
+        s.execute(CMD, json!({})).unwrap();
+        let doc = &s.active().unwrap().doc;
+        let cached = s.portrait_cache.get(doc, |_, _| true).expect("an analysis");
+        assert_eq!(cached.landmarks.len(), photocraft_ml::LANDMARK_COUNT);
+        let face = cached.mask(photocraft_portrait::Region::Face).expect("a face-hull region");
+        // Gated by the person: every face pixel sits inside the disc.
+        let gate = photocraft_doc::LayerMask { surface: face.clone(), ..photocraft_doc::LayerMask::reveal_all() };
+        let mut hits = 0;
+        for y in 0..160 {
+            for x in 0..200 {
+                if gate.value(x, y) >= 0.5 {
+                    hits += 1;
+                    assert!(inside(x, y), "face hull outside the person at ({x}, {y})");
+                }
+            }
+        }
+        assert!(hits > 0, "the hull has support");
     }
 
     #[test]

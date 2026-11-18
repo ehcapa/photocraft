@@ -6741,6 +6741,7 @@ name = "photocraft-portrait"
 version = "0.23.1"
 dependencies = [
  "photocraft-doc",
+ "photocraft-geom",
  "photocraft-raster",
  "serde",
  "serde_json",

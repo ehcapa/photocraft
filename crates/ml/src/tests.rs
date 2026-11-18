@@ -1,4 +1,4 @@
-use crate::{AVAILABLE, MODEL_SIDE, PARSING_CLASSES, parsing_probs, subject_mask};
+use crate::{AVAILABLE, LANDMARK_COUNT, MODEL_SIDE, PARSING_CLASSES, face_landmarks, parsing_probs, subject_mask};
 
 #[test]
 fn size_mismatch_is_none() {
@@ -133,4 +133,25 @@ fn parsing_probs_smoke_when_model_provided() {
         winners.insert(bc);
     }
     assert!(winners.len() >= 2, "one class everywhere: {winners:?}");
+}
+
+/// The embedded FaceMesh always answers: 478 landmarks, finite, essentially inside the
+/// image (a few can graze the edge, none belongs far outside).
+#[test]
+fn face_landmarks_answer_on_any_input() {
+    let (w, h) = (64, 64);
+    let px: Vec<[f32; 3]> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let inside = (x as f32 - 32.0).powi(2) + (y as f32 - 32.0).powi(2) < 20.0 * 20.0;
+            [if inside { 0.8 } else { 0.3 }; 3]
+        })
+        .collect();
+    let pts = face_landmarks(&px, w, h).expect("the embedded model always answers");
+    assert_eq!(pts.len(), LANDMARK_COUNT);
+    assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite()));
+    assert!(pts.iter().all(|p| ((-(w as f32))..=(2.0 * w as f32)).contains(&p.x)));
+    assert!(pts.iter().all(|p| ((-(h as f32))..=(2.0 * h as f32)).contains(&p.y)));
+    // A size mismatch is a None, not an inference.
+    assert!(face_landmarks(&px, w + 1, h).is_none());
 }

@@ -87,10 +87,35 @@ impl Default for HueSat {
     }
 }
 
+/// The skin-smoothing values: Surface Blur's own (the classical, upstreamable path —
+/// frequency separation can land behind the same struct later).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Skin {
+    pub radius: f32,
+    pub threshold: f32,
+}
+
+impl Default for Skin {
+    fn default() -> Self {
+        Skin { radius: 10.0, threshold: 18.0 }
+    }
+}
+
+/// The colour-match transfer (追色): a per-channel affine map the engine computes from the
+/// document's and the reference's statistics (Reinhard-style mean/std matching in RGB),
+/// materialized as the points of a Curves adjustment so the user keeps tuning it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Grade {
+    /// Per RGB channel: out = slope * in + offset, both in 0..1.
+    pub slope: [f32; 3],
+    pub offset: [f32; 3],
+}
+
 /// What the user asked the pipeline to do. The defaults describe the vertical slice the
 /// skeleton ships: analyze the person, then one Hue/Saturation layer masked to it inside a
-/// named group. `hair` opts into a second Hue/Saturation layer masked to the hair region —
-/// it only materializes when the parsing analysis produced one.
+/// named group. `hair` opts into a hair-recolor layer and `skin` into a smoothed raster
+/// layer — each only materializes when the parsing analysis produced its region.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Recipe {
@@ -98,11 +123,13 @@ pub struct Recipe {
     pub group_name: String,
     pub hue_saturation: HueSat,
     pub hair: Option<HueSat>,
+    pub skin: Option<Skin>,
+    pub grade: Option<Grade>,
 }
 
 impl Default for Recipe {
     fn default() -> Self {
-        Recipe { stages: vec![StageId::Cutout], group_name: "Portrait".into(), hue_saturation: HueSat::default(), hair: None }
+        Recipe { stages: vec![StageId::Cutout], group_name: "Portrait".into(), hue_saturation: HueSat::default(), hair: None, skin: None, grade: None }
     }
 }
 
@@ -131,6 +158,8 @@ mod tests {
             group_name: "Studio".into(),
             hue_saturation: HueSat { hue: 30.0, saturation: -20.0, lightness: 5.0 },
             hair: Some(HueSat { hue: -15.0, saturation: 40.0, lightness: 0.0 }),
+            skin: Some(Skin::default()),
+            grade: None,
         };
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap(), full);

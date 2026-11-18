@@ -87,10 +87,43 @@ SD/Flux Inpainting 背景与衣物 → 追色。评估结论:方向成立,两处
    主体门压制)后上采样进 Analysis;`portrait.create` 带 `hairHue` 等参数即产第二个
    "Hair Color" 层。测试:ml 8✓(含模型冒烟)、portrait crate 13✓、engine 7✓×
    (有/无模型两态)。
-3. L1 三件套(磨皮/换发色/追色)——换发色已随 Parsing 落地(Hair 蒙版 + HueSat);
-   磨皮(Skin 蒙版 + 频分/导向滤波)与追色待做,零模型依赖,可切小分支回馈上游。
-4. 面部增强 spike 定阶梯;L3 provider(SD inpaint)按 #41 对齐另立档案;模型管理器
-   (下载 + hash)把 env 路径升级为正式入口。
+3. ~~L1 三件套~~ **✅ 全部落地**(2026-11-18):
+   - **换发色**:Hair 蒙版 + HueSat 层(`hairHue` 等参数);
+   - **磨皮**:`skinRadius`/`skinThreshold` → work 阶段对合成图跑现有
+     `filter.blur.surfaceBlur`(经 `apply_filter_to_surface_in`,可取消)→
+     "Skin Smoothing" 栅格层(Skin 蒙版,经典"盖印+磨皮"形态,图层透明度=强度);
+   - **追色**:`reference`(图片路径,经 photocraft-io import)或 `referenceStats`
+     (均值/方差直接注入,测试口)→ Reinhard 式 RGB 逐通道均值/方差匹配(斜率钳
+     0.25..4,源统计按 Person 蒙版取)→ **"Color Match" Curves 调整层**(Person 蒙版,
+     两点线性曲线;参数化可手调,域外点钳进 0..255)。engine 测试 11✓ 两态。
+4. ~~面部增强 spike~~ ✅ 2026-11-18:**GFPGAN v1.4 在 tract 上完全可用**(见下节)。
+5. ~~Landmarks~~ ✅ 2026-11-18 同日:**FaceMesh 已集成**——astaileyyoung/FaceMeshONNX
+   导出(MIT,5.13MB)**按 u2netp 先例直接提交仓库**(`crates/ml/data/facemesh.onnx`,
+   含 LICENSE + ATTRIBUTION 行,wasm 编出),无需 env 路径、原生始终可用:加载
+   ~100ms、推理 **15ms @ 256² NHWC 0..1**,输出 478 点(含虹膜,0..256 输入像素域,
+   ml 层归一到调用方尺寸)。`Analysis.landmarks`(文档像素坐标)+ **Face 区域 =
+   FACE_OVAL 36 点环凸包扫描线填充**(`portrait::face`,不依赖 parsing 小类序)经
+   人像门控进 Analysis。engine 测试 12✓ 两态(landmark 阶段无条件运行,~15ms 无需
+   门控)。GFPGAN 集成的对齐前置已就绪。
+6. L3 provider(SD inpaint)按 #41 对齐另立档案;模型管理器(下载 + hash)把 env
+   路径升级为正式入口(GFPGAN 340MB 是第一个用户)。
+
+## 面部增强 spike 结果(2026-11-18,i7 桌面,tract-onnx 0.23,release)
+
+| 候选 | 体积 | 许可 | 结论 |
+|---|---|---|---|
+| **GFPGAN v1.4**(neurobytemind/GFPGANv1.4.onnx 导出) | 340MB | 导出仓 Apache-2.0(GFPGAN 本体 TencentARC Apache-2.0,**两者里商用最友好**;训练数据 CelebA-HQ 研究用途照旧待审) | ✅ **梯级选定**:加载 685ms,推理 **1.36s @ 512²**,峰值 RSS 1.44GB |
+| CodeFormer(bluefoxcreation onnx) | 377MB | S-Lab 研究许可系 + 导出仓 license:other | ⏸ 未 bench:许可劣于 GFPGAN,先不投入;质量对比需要时再下 |
+
+- **输入契约**:0..1 RGB、NCHW 512²(raw 0–255 会输出 1e15 级垃圾——与 parsing 的
+  raw 契约相反,两模型各记各的);输出 0..1 附近(GAN 负值属常态,钳 0..1)。
+- **质量(公共 Unsplash 人像,未用个人照片)**:同通道相关 0.974/0.955/0.945,
+  跨通道 0.78–0.84 → RGB 序正确、结构保留、像素真实重绘;输出 PNG 在
+  `/tmp/portrait-spike/output_gfpgan_v14.png` 供目检。
+- 1.36s 一次性增强走后台 job + 进度/取消完全可接受;1.44GB RSS 偏重,集成时注意
+  增强完释放(plan Drop)。
+- 集成形态(待做):Landmarks(3–5MB FaceMesh)→ 仿射对齐 512² 裁剪 → GFPGAN →
+  贴回混合 → PlannedLayer::Raster("Face Enhance",Face 蒙版)。
 
 ## Parsing 阶段 spike 结果(2026-11-18,i7 桌面,tract-tflite/onnx 0.23,release;同日质量复验后定稿)
 

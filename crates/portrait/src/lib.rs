@@ -16,6 +16,7 @@
 
 pub mod analysis;
 pub mod cache;
+pub mod face;
 pub mod parsing;
 pub mod plan;
 pub mod recipe;
@@ -23,4 +24,4 @@ pub mod recipe;
 pub use analysis::Analysis;
 pub use cache::Cache;
 pub use plan::{LayerPlan, PlannedLayer, plan};
-pub use recipe::{HueSat, Recipe, Region, StageId};
+pub use recipe::{Grade, HueSat, Recipe, Region, Skin, StageId};

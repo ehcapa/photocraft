@@ -1,0 +1,8 @@
+The facemesh.onnx weights in this directory are an ONNX export of MediaPipe's FaceMesh
+face-landmark network (478 landmarks incl. iris), taken from the community export
+repository https://huggingface.co/astaileyyoung/FaceMeshONNX (MIT), itself a port of
+Google's MediaPipe (Apache-2.0, https://github.com/google-ai-edge/mediapipe).
+
+License: MIT (the export repository's tag; MediaPipe upstream is Apache-2.0).
+Source md5 (as downloaded 2026-11-18): 9918ac2bb479d14791d889e5e09a2b99
+This copy ships as a build input of photocraft-ml, compiled out of wasm builds.

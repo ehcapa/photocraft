@@ -5,7 +5,7 @@
 use serde_json::Value;
 
 use crate::analysis::Analysis;
-use crate::recipe::{HueSat, Recipe, Region};
+use crate::recipe::{Grade, HueSat, Recipe, Region};
 
 /// One layer of the plan. `kind` is the engine's adjustment wire name ("hueSaturation", …)
 /// and `params` its JSON, so the engine materializes through the same `from_params` path a
@@ -62,6 +62,29 @@ pub fn plan(recipe: &Recipe, analysis: &Analysis) -> LayerPlan {
             mask: Some(Region::Hair),
         });
     }
+    // The smoothed skin rides on the parsing analysis like the hair layer does. The
+    // raster's pixels are the engine's to fill (a Surface-Blur of the composite); the plan
+    // carries the ask and the mask.
+    if recipe.skin.is_some() && analysis.mask(Region::Skin).is_some() {
+        layers.push(PlannedLayer::Raster { name: "Skin Smoothing".into(), mask: Some(Region::Skin) });
+    }
+    // The colour match runs last (topmost): the Curves points carry the transfer the
+    // engine computed from the reference, masked to the person like the rest of the
+    // portrait's work.
+    if let Some(grade) = recipe.grade
+        && analysis.mask(Region::Person).is_some()
+    {
+        let curves = |g: &Grade, c: usize| {
+            let (slope, offset) = (g.slope[c] as f64, g.offset[c] as f64);
+            serde_json::json!([[0, (offset * 255.0).round().clamp(0.0, 255.0)], [255, ((slope + offset) * 255.0).round().clamp(0.0, 255.0)]])
+        };
+        layers.push(PlannedLayer::Adjustment {
+            name: "Color Match".into(),
+            kind: "curves".into(),
+            params: serde_json::json!({ "red": curves(&grade, 0), "green": curves(&grade, 1), "blue": curves(&grade, 2) }),
+            mask: Some(Region::Person),
+        });
+    }
     LayerPlan { group_name: recipe.group_name.clone(), layers }
 }
 
@@ -104,6 +127,8 @@ mod tests {
             group_name: "Studio".into(),
             hue_saturation: HueSat { hue: 30.0, saturation: -20.0, lightness: 5.0 },
             hair: None,
+            skin: None,
+            grade: None,
         };
         let planned = plan(&recipe, &analysis_with_person(true));
         let PlannedLayer::Adjustment { name, kind, params, .. } = &planned.layers[0] else { panic!("not an adjustment") };
@@ -133,5 +158,37 @@ mod tests {
         let PlannedLayer::Adjustment { name, kind, params, mask } = &planned.layers[1] else { panic!("not an adjustment") };
         assert_eq!((name.as_str(), kind.as_str(), *mask), ("Hair Color", "hueSaturation", Some(Region::Hair)));
         assert_eq!((params["hue"].as_f64(), params["saturation"].as_f64(), params["lightness"].as_f64()), (Some(-15.0), Some(40.0), Some(1.0)));
+    }
+
+    #[test]
+    fn skin_raster_needs_both_the_ask_and_the_skin_region() {
+        let mut recipe = Recipe::default();
+        recipe.skin = Some(crate::Skin::default());
+        // Asked but not analyzed: nothing.
+        assert_eq!(plan(&recipe, &analysis_with_person(true)).layers.len(), 1);
+        // Analyzed but not asked: nothing.
+        let mut analysis = analysis_with_person(true);
+        analysis.set(Region::Skin, Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[1.0]));
+        assert_eq!(plan(&Recipe::default(), &analysis).layers.len(), 1);
+        // Both: the raster lands masked to Skin.
+        let planned = plan(&recipe, &analysis);
+        assert_eq!(planned.layers[1], PlannedLayer::Raster { name: "Skin Smoothing".into(), mask: Some(Region::Skin) });
+    }
+
+    #[test]
+    fn grade_lands_a_person_masked_curves_layer_last() {
+        let mut recipe = Recipe::default();
+        recipe.grade = Some(Grade { slope: [1.2, 1.0, 0.8], offset: [-0.05, 0.0, 0.1] });
+        let planned = plan(&recipe, &analysis_with_person(true));
+        let PlannedLayer::Adjustment { name, kind, params, mask } = &planned.layers[1] else { panic!("not an adjustment") };
+        assert_eq!((name.as_str(), kind.as_str(), *mask), ("Color Match", "curves", Some(Region::Person)));
+        // The transfer in curve points: [0, offset*255] and [255, (slope+offset)*255],
+        // clamped into Curves' 0..255 domain (an out-of-range point is refused, not moved).
+        let pt = |v: f64| (v * 255.0).round().clamp(0.0, 255.0);
+        assert_eq!(params["red"], serde_json::json!([[0, pt(-0.05)], [255, pt(1.15)]]));
+        assert_eq!(params["green"], serde_json::json!([[0, pt(0.0)], [255, pt(1.0)]]));
+        assert_eq!(params["blue"], serde_json::json!([[0, pt(0.1)], [255, pt(0.9)]]));
+        // No person analysis, no grade layer.
+        assert_eq!(plan(&recipe, &analysis_with_person(false)).layers.len(), 0);
     }
 }
