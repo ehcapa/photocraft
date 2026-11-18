@@ -34,3 +34,5 @@ ehcapa/photocraft（方向：像素蛋糕式 AI 修图）的 **fork 级**文档�
   >50MB 模型的来源/许可/指纹表
 - [新机器就绪清单](new-machine.md) —— 换机测试:代码/模型下载/环境变量/构建/
   三态测试/真图验收/应用冒烟,一张单子走完
+- [2026-11-19: Smart Portrait 对话框不再记忆配方](decisions.md) —— 滑杆残值伪装成
+  管线损坏的真图事件;not_remembered + portrait_diag 诊断工具

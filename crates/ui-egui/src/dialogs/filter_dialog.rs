@@ -329,6 +329,12 @@ pub(crate) fn params(app: &mut PhotocraftApp, command: &str, spec: &str) -> Vec<
             if document_derived(command, &p.key) {
                 p = p.not_remembered();
             }
+            // Smart Portrait's recipe never remembers: the spec defaults are the sane retouch,
+            // and a stale extreme slider from an earlier session presents as the pipeline
+            // breaking, not as a starting point (2026-11-19's hue-164/saturation--61 export).
+            if command == "portrait.create" {
+                p = p.not_remembered();
+            }
             // Global Light's Altitude takes whole degrees, as its Angle does (#14980).
             if command == "layer.layerStyle.globalLight" && p.key == "altitude" {
                 p = p.decimals(0);

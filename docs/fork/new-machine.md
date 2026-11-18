@@ -97,6 +97,10 @@ PHOTOCRAFT_PORTRAIT_OUT=/tmp/out.png \
 # 类语义诊断(如需重验映射):
 PHOTOCRAFT_PORTRAIT_PHOTO=/任意/脸部裁剪.jpg PHOTOCRAFT_MODELS_DIR=... \
   cargo run -p photocraft-engine --example class_probe
+# 逐层排障(哪个层/哪个蒙版出问题):每层 solo 合成 + 蒙版 PGM 转储到 /tmp/diag/,
+# 第二参数可选 params JSON(缺省 = 对话框默认配方;要 ort 档加 --features photocraft-ml/ort):
+PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models \
+  cargo run -p photocraft-engine --example portrait_diag -- /任意/人像.jpg
 ```
 
 ## 7. 应用内手动冒烟
@@ -107,6 +111,13 @@ Layer › New Adjustment Layer › Smart Portrait… → 对话框调参 → OK 
 
 ## 8. 已知等待项(测试时留意)
 
-- GFPGAN/磨皮/发色的**观感**未做过真人目检——今晚测试的主要目的
+- 2026-11-19 数值验收:默认配方下六个层蒙版解剖学正确(人物/皮肤/眼/唇/腮红/眼睑),
+  输出与原图差 ~1/255;GFPGAN/磨皮/发色的**真人观感**目检仍待做
 - 19 类里 14(neck)等未映射;眼/唇区域来自 landmark 环(此导出不分眼/唇)
 - matte(ort 档)~10s/张、峰值内存 ~5GB;批量全开 ~15–20s/张
+- **对话框会记住每个命令上次的值**(`~/.config/photocraft/config.toml` 的
+  `[sections.remembered]`)。2026-11-19 的"处理后全图青灰不可用"导出即前一晚实验
+  滑杆残值(hue 164/sat -61/light +43 + 绿腮红 91),管线本身无罪;
+  `portrait.create` 已改为不记忆(decisions.md 2026-11-19),其余 filter.* 对话框
+  仍记忆。排障口诀:输出离谱先查参数来源(config.toml / 对话框滑杆位置),
+  再怀疑管线(portrait_diag 逐层转储一分钟能定性)

@@ -85,3 +85,23 @@ L1 经典（可回馈上游）、抠像/关键点/face-parsing/面部增强 L2 t
 **后果。** 共享代码触点收到菜单注册一处，doc 格式零分叉；生成类阶段以缓存栅格
 落地、按阶段失效重跑。完整落位表、风险与 spike 待办见
 [主题档案](2026-11-18-portrait-pipeline.md)。
+
+## 2026-11-19: Smart Portrait 对话框不再记忆上次配方
+
+**背景。** 真图验收首晚出现"处理后完全不可用"的导出：全幅青灰罩层、绿色腮红块、
+紫色眼带。逐层转储（portrait_diag）证明管线无罪——默认配方下六个层蒙版全部解剖学
+正确、输出与原图差 ~1/255；元凶是 schema 对话框的"记住上次值"机制：前一晚实验留下
+的 `hue=164/saturation=-61/lightness=+43`（人物整体层）+ `blushHue=91`（绿腮红）+
+`shadowHue=286`（紫眼影）被原样载入执行，用这组残值回放与坏图逐通道一致（残差
+1.4 = JPEG 噪声）。
+
+**决策。** `portrait.create` 的全部对话框行 `not_remembered()`（filter_dialog 的
+`params()`），每次打开取 spec 默认值；"重复上次配方"的需求由既有的
+`portrait.saveRecipe` → Actions/Batch 承担——那才是带名字、可审计的配方载体。
+`crates/engine/examples/portrait_diag.rs`（逐层 solo 合成 + 蒙版 PGM 转储）作为
+fork 诊断工具保留，与 class_probe 同列。
+
+**后果。** 用户配置里已落盘的 `[sections.remembered."photocraft.portrait.create"]`
+残值自然失效（重开时按行过滤，不回填）；新增测试
+`smart_portrait_never_remembers_its_recipe_rows`；排障口诀进
+[new-machine.md](new-machine.md) §8：输出离谱先查参数来源，再怀疑管线。

@@ -217,9 +217,6 @@ fn remembering_dialogs_never_persists_paths_or_document_indices() {
     assert_ne!(f.int("mapDocument"), Some(0), "a document index is never remembered");
 }
 
-/// A layer-id param has no number field: the Auto-Align dialog used to write `reference: 0`
-/// back, which the engine rejects as not a selected layer (#674).
-#[test]
 /// Layer › New Adjustment Layer › Smart Portrait… opens the recipe dialog (the fork's
 /// portrait pipeline): every recipe knob is a row, the protocol-only reference paths are
 /// not, and OK runs `portrait.create` with the dialog's values as one history step.
@@ -248,6 +245,29 @@ fn smart_portrait_opens_the_recipe_dialog_and_runs_on_ok() {
     assert_eq!(layer.name, "Portrait", "the pipeline ran");
 }
 
+/// Smart Portrait's rows never remember their values: the recipe defaults are the sane
+/// retouch, and a stale extreme slider from an earlier session presents as the pipeline
+/// breaking (2026-11-19: hue 164/saturation -61/lightness +43 produced a cyan-veiled
+/// export nobody had asked for).
+#[test]
+fn smart_portrait_never_remembers_its_recipe_rows() {
+    const CMD: &str = "portrait.create";
+    let mut app = new_app();
+    app.run("file.new", json!({"width": 64, "height": 64, "background": "white"})).unwrap();
+    app.run("paint.pencil", json!({"points": [[32, 32]], "size": 40, "color": "#c04010"})).unwrap();
+    let id = open(&mut app, CMD).expect("the recipe dialog opens");
+    set(&mut app, id, "hue", json!(163.8));
+    set(&mut app, id, "saturation", json!(-61.3));
+    assert!(ok(&mut app, id), "the OK closed the dialog");
+    let again = open(&mut app, CMD).expect("the dialog reopens");
+    let f = fields_of(&app, again);
+    assert_eq!(f.number("hue"), Some(0.0), "the recipe rows reopen at the spec defaults, not the used values");
+    assert_eq!(f.number("saturation"), Some(0.0));
+}
+
+/// A layer-id param has no number field: the Auto-Align dialog used to write `reference: 0`
+/// back, which the engine rejects as not a selected layer (#674).
+#[test]
 fn layer_id_params_stay_out_of_the_dialog() {
     let mut app = new_app();
     app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
