@@ -10,6 +10,15 @@ rust-version.workspace = true
 # classical saliency pipeline in photocraft-algo.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tract-onnx = { workspace = true }
+# The ort tier (docs/fork L2.5): off by default; enabling pulls onnxruntime in for the
+# heavy matting models. Pure-Rust builds and the wasm gate never see it.
+ort = { workspace = true, optional = true }
+
+[dependencies]
+blake3 = { version = "1.8", default-features = false, features = ["pure"] }
+
+[features]
+ort = ["dep:ort"]
 
 [dev-dependencies]
 # The rembg parity test reads the reference PNGs (test-only; the library itself has no decoder).

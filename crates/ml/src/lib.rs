@@ -46,6 +46,10 @@ pub fn subject_mask(px: &[[f32; 3]], w: usize, h: usize) -> Option<SubjectMask> 
 }
 
 pub use landmarks::{LANDMARK_COUNT, LANDMARK_SIDE};
+
+/// The ort tier's matting input side (1024), exported unconditionally so callers scale
+/// samplers without a feature gate; only the run itself needs feature "ort".
+pub const MATTING_SIDE: usize = crate::ort_side::MATTING_SIDE;
 pub use parsing::{PARSING_CLASSES, PARSING_SIDE};
 
 /// One FaceMesh landmark: `x`/`y` in the caller's pixel space, `z` a rough depth relative
@@ -66,7 +70,7 @@ pub struct ParsingProbs {
 
 /// The face-parsing probabilities of `px` (`w × h` row-major RGB, `0..=1`): one plane per
 /// CelebAMask-HQ class, returned at the caller's size. `None` without a usable
-/// `PHOTOCRAFT_PORTRAIT_PARSING` model (always on wasm) — the portrait pipeline then runs
+/// `PHOTOCRAFT_MODELS_DIR` model (always on wasm) — the portrait pipeline then runs
 /// its person slice without region masks.
 pub fn parsing_probs(px: &[[f32; 3]], w: usize, h: usize) -> Option<ParsingProbs> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -95,6 +99,22 @@ pub fn face_landmarks(px: &[[f32; 3]], w: usize, h: usize) -> Option<Vec<Landmar
     }
 }
 
+/// The soft person matte of `px` (`w × h` row-major RGB, `0..=1`) through the ort tier
+/// (feature `ort` + `PHOTOCRAFT_MODELS_DIR/feynobg.onnx`): hair-edge alpha at 1024²,
+/// ~10s a run. `None` without the feature or the model — callers fall back to the
+/// subject line. The tract tier stays the default everywhere it is good enough.
+pub fn person_matte(px: &[[f32; 3]], w: usize, h: usize) -> Option<SubjectMask> {
+    #[cfg(all(not(target_arch = "wasm32"), feature = "ort"))]
+    {
+        ort_matting::person_matte(px, w, h)
+    }
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "ort")))]
+    {
+        let _ = (px, w, h);
+        None
+    }
+}
+
 /// A single-plane `0..=1` mask resampled to `to_w × to_h` (the subject mask's filter).
 pub fn resize_mask(px: &[f32], w: usize, h: usize, to_w: usize, to_h: usize) -> Option<Vec<f32>> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -113,6 +133,19 @@ mod model;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod landmarks;
+
+/// The ort-tier side constant, feature-free (see [`MATTING_SIDE`]).
+mod ort_side {
+    pub const MATTING_SIDE: usize = 1024;
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "ort"))]
+mod ort_matting;
+
+/// Runtime model files: resolution over env overrides and `PHOTOCRAFT_MODELS_DIR`, and
+/// fingerprint checks against the manifest. Pure path/hash logic, no network — see
+/// docs/fork/models.md.
+pub mod models;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod parsing;

@@ -30,3 +30,5 @@ ehcapa/photocraft（方向：像素蛋糕式 AI 修图）的 **fork 级**文档�
   DAG 编排 + 标准图层落位（不加 Adjustment variant）；L1/L2/L3 分层表、tract spike 待办
 - [macOS 开发与测试注意事项](macos-dev.md) —— 单包测试的 egui/serde feature 统一坑、
   external_svg.rs 的 mkfifoat apple 门控坑、workspace 级验证配方
+- [运行时模型清单](models.md) —— PHOTOCRAFT_MODELS_DIR 放置约定、blake3 校验、
+  >50MB 模型的来源/许可/指纹表

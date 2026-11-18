@@ -80,7 +80,7 @@ SD/Flux Inpainting 背景与衣物 → 追色。评估结论:方向成立,两处
 1. ~~`crates/portrait` 骨架~~ ✅ 2026-11-18 完成(垂直切片可用:`portrait.create` →
    Person 蒙版 HueSat 层 → "Portrait" 组,单 undo 步,6+10 测试)。
 2. ~~ Parsing 阶段 tract spike ~~ ✅ 见下节;**同日接入** ✅:`photocraft-ml` 新增
-   `parsing_probs`(env `PHOTOCRAFT_PORTRAIT_PARSING=<onnx路径>` 运行时加载、失败缓存
+   `parsing_probs`(`PHOTOCRAFT_MODELS_DIR/faceparser.onnx` 运行时加载、失败缓存
    None、raw 0–255 输入契约、逐像素 softmax 后 19 概率面),engine 的
    `parsing_regions` 把类面按 `photocraft_portrait::parsing::CLASS_REGIONS`
    (1=Skin、15=Clothes 待核、16=Hair 已证)组成区域、与人像区域取交集(域外预测被
@@ -105,8 +105,32 @@ SD/Flux Inpainting 背景与衣物 → 追色。评估结论:方向成立,两处
    FACE_OVAL 36 点环凸包扫描线填充**(`portrait::face`,不依赖 parsing 小类序)经
    人像门控进 Analysis。engine 测试 12✓ 两态(landmark 阶段无条件运行,~15ms 无需
    门控)。GFPGAN 集成的对齐前置已就绪。
-6. L3 provider(SD inpaint)按 #41 对齐另立档案;模型管理器(下载 + hash)把 env
-   路径升级为正式入口(GFPGAN 340MB 是第一个用户)。
+6. ~~模型管理器一期~~ ✅ 2026-11-18:**单一变量** `PHOTOCRAFT_MODELS_DIR`(无默认值,
+   无网络代码,试验用符号链接;曾有的文件级覆盖 `PHOTOCRAFT_PORTRAIT_PARSING` 同日
+   并入删除)+ blake3 指纹校验(不匹配警告不阻断)。`crates/ml/src/models.rs` +
+   [models.md](models.md) 清单。GFPGAN 340MB 已入清单,二期做显式"Download…"按钮。
+   L3 provider(SD inpaint)按 #41 对齐另立档案。
+
+## L2.5:ort 档(2026-11-18 落地)
+
+**动机**:像素蛋糕全功能对标 → 发丝抠图(FeyNoBg)与 CodeFormer 级修复是 attention
+重模型,tract 慢 1–2 个数量级,纯 tract 有质量天花板。决策条目见 decisions.md。
+
+**形态**:`photocraft-ml/ort` feature(默认关)——ort 2.0-rc.15
+(`download-binaries` + `tls-native`,构建期拉 onnxruntime,已验证本机网络可达),
+native-only。`ort_matting.rs`:FeyNoBg fp16(ImageNet 归一化 1024² NCHW,sigmoid
+alpha),`person_matte()` 走与 tract 档相同的 `PHOTOCRAFT_MODELS_DIR` 发现 +
+blake3 指纹;引擎 Person 路径 **matte-first**:`Matting person` 阶段(0.05–0.25)
+命中则直接用 alpha(免 seed/GrabCut),否则原 subject 线。取消经 `ctx.check()`
+在 matte 后生效(ort 推理本身不可中断,~10s)。
+
+**实测**(i7 桌面):session 构建 2.2s(进程缓存),推理 **~10s @ 1024²**(tract
+91.3s 的 1/9);fp32 形态 >15 分钟,**排除**;输出与 tract 一致(mean 0.602)。
+三态测试:default 12✓ / +模型 12✓ / +ort+模型 12✓(每个 create 真跑 matte,
+全套 123s)。
+
+**语义注意**:matting 模型对任何输入都给 alpha(flat grey 也有"主体")——
+"no person found" 错误是 subject 线的语义,matte 档下极少触发(测试相应门控)。
 
 ## 面部增强 spike 结果(2026-11-18,i7 桌面,tract-onnx 0.23,release)
 

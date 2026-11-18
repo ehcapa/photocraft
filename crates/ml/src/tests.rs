@@ -98,9 +98,9 @@ fn matches_rembg() {
 /// the behaviour under test, which the plain run covers everywhere else.
 #[test]
 fn parsing_probs_smoke_when_model_provided() {
-    let Some(path) = std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING") else {
+    let Some(path) = std::env::var_os("PHOTOCRAFT_MODELS_DIR") else {
         assert!(parsing_probs(&[], 0, 0).is_none());
-        eprintln!("skipping: PHOTOCRAFT_PORTRAIT_PARSING unset");
+        eprintln!("skipping: PHOTOCRAFT_MODELS_DIR unset");
         return;
     };
     let _ = path;
@@ -154,4 +154,31 @@ fn face_landmarks_answer_on_any_input() {
     assert!(pts.iter().all(|p| ((-(h as f32))..=(2.0 * h as f32)).contains(&p.y)));
     // A size mismatch is a None, not an inference.
     assert!(face_landmarks(&px, w + 1, h).is_none());
+}
+
+/// The ort tier answers only with both the feature and the model: this test builds with
+/// `--features ort` and skips (CI has no weights) without the file in the models dir.
+#[cfg(feature = "ort")]
+#[test]
+fn person_matte_through_ort_when_the_model_is_placed() {
+    use crate::person_matte;
+    if crate::models::locate(&crate::models::FEYNOBG).is_none() {
+        eprintln!("skipping: no feynobg.onnx in PHOTOCRAFT_MODELS_DIR");
+        return;
+    }
+    let (w, h) = (128, 128);
+    let px: Vec<[f32; 3]> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let inside = (x as f32 - 64.0).powi(2) + (y as f32 - 64.0).powi(2) < 40.0 * 40.0;
+            [if inside { 0.7 } else { 0.2 }; 3]
+        })
+        .collect();
+    let t = std::time::Instant::now();
+    let matte = person_matte(&px, w, h).expect("the ort tier answers with the model placed");
+    eprintln!("person_matte: {:.1} s at 1024²", t.elapsed().as_secs_f32());
+    assert_eq!((matte.w, matte.h, matte.px.len()), (w, h, w * h));
+    assert!(matte.px.iter().all(|v| (0.0..=1.0).contains(v)));
+    assert!(matte.px.iter().any(|v| *v > 0.5), "some foreground");
+    assert!(matte.px.iter().any(|v| *v < 0.5), "some background");
 }

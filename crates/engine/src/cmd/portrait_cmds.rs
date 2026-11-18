@@ -236,20 +236,41 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                     .transpose()?;
                 return Ok((analysis, skin_surface, grade));
             }
-            // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
-            let found = ctx
-                .stage(0.05, 0.4, "Finding person", |ctl| {
-                    with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                        let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
-                        subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
-                    })
+            // The ort matte (feature "ort" + feynobg.onnx in the models dir) replaces the
+            // whole subject line when it answers: direct hair-edge alpha at 1024², no
+            // seed/GrabCut. Without it (the default build, or no model placed) the
+            // subject line runs as before.
+            let matte = ctx.stage(0.05, 0.25, "Matting person", |_| {
+                with_doc_sampler(&doc, target, sample_all, |smp, d| {
+                    let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::MATTING_SIDE * photocraft_ml::MATTING_SIDE);
+                    let img = smp.rgb_scaled(d.bounds(), step);
+                    photocraft_ml::person_matte(&img.px, img.w, img.h)
                 })
-                .map_err(|_| EngineError::Cancelled)?;
-            let region = found.ok_or_else(|| EngineError::Other("no person found".into()))?;
+            });
+            let person = if let Some(matte) = matte {
+                ctx.check().map_err(|_| EngineError::Cancelled)?;
+                let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
+                let up =
+                    photocraft_ml::resize_mask(&matte.px, matte.w, matte.h, dw, dh).ok_or_else(|| EngineError::Other("the matte would not resample".into()))?;
+                let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+                surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
+                surface
+            } else {
+                // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
+                let found = ctx
+                    .stage(0.25, 0.4, "Finding person", |ctl| {
+                        with_doc_sampler(&doc, target, sample_all, |smp, d| {
+                            let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
+                            subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
+                        })
+                    })
+                    .map_err(|_| EngineError::Cancelled)?;
+                let region = found.ok_or_else(|| EngineError::Other("no person found".into()))?;
+                matting::region_surface(&region)
+            };
             let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
-            let person = matting::region_surface(&region);
             analysis.set(photocraft_portrait::Region::Person, person.clone());
-            // The parsing stage when a model is handed in (`PHOTOCRAFT_PORTRAIT_PARSING`):
+            // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
             // skin/hair/clothes masks join the person mask; without one the slice is the
             // person alone and every layer but the first stays out.
             let regions = ctx.stage(0.4, 0.65, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person));
@@ -368,7 +389,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Smart Portrait…",
         menu: &["Layer", "New Adjustment Layer"],
         shortcut: None,
-        params: r##"{"sampleAllLayers":bool=false,"groupName":text="Portrait","hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0,"hairHue":-180..180?,"hairSaturation":-100..100?,"hairLightness":-100..100?,"skinRadius":1..100?,"skinThreshold":2..255?} → {group} (analyzes the person — and, with PHOTOCRAFT_PORTRAIT_PARSING, the skin/hair/clothes regions — then adds a named group of standard adjustment layers masked to them; any hair value opts into a Hair Color layer; one history step)"##,
+        params: r##"{"sampleAllLayers":bool=false,"groupName":text="Portrait","hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0,"hairHue":-180..180?,"hairSaturation":-100..100?,"hairLightness":-100..100?,"skinRadius":1..100?,"skinThreshold":2..255?} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions — then adds a named group of standard adjustment layers masked to them; any hair value opts into a Hair Color layer; one history step)"##,
         enabled,
         run,
         journal: true,
@@ -502,7 +523,7 @@ mod tests {
         ctx.cancel();
         s.set_inline_job_ctx(Some(ctx.clone()));
         assert!(matches!(s.execute(CMD, json!({})), Err(EngineError::Cancelled)));
-        assert_eq!(ctx.message(), "Finding person");
+        assert!(matches!(ctx.message().as_str(), "Finding person" | "Matting person"), "stage message was {:#?}", ctx.message());
         assert_eq!(s.active().unwrap().revision, before);
         s.set_inline_job_ctx(None);
         s.execute(CMD, json!({})).unwrap();
@@ -511,6 +532,10 @@ mod tests {
 
     #[test]
     fn without_a_person_the_document_is_left_alone() {
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_some_and(|d| std::path::Path::new(&d).join("feynobg.onnx").is_file()) {
+            eprintln!("skipping: the ort matte mattes anything, flat grey included — the no-person error is the subject line's answer, not the matte tier's");
+            return;
+        }
         let mut s = session_with(32, 32, |_, _| [0.5, 0.5, 0.5]);
         let before = s.active().unwrap().revision;
         assert!(s.execute(CMD, json!({})).is_err());
@@ -522,8 +547,8 @@ mod tests {
     /// the env var it reports the skip (CI has no weights in the tree).
     #[test]
     fn parsing_regions_feed_a_hair_layer_when_a_model_is_provided() {
-        if std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING").is_none() {
-            eprintln!("skipping: PHOTOCRAFT_PORTRAIT_PARSING unset");
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_none() {
+            eprintln!("skipping: PHOTOCRAFT_MODELS_DIR unset");
             return;
         }
         let (mut s, inside) = disc();
@@ -554,7 +579,7 @@ mod tests {
     /// nothing — the degrade path, deterministic everywhere.
     #[test]
     fn skin_smoothing_without_regions_stays_one_layer() {
-        if std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING").is_some() {
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_some() {
             eprintln!("skipping: a parsing model is set, the Skin region exists");
             return;
         }
@@ -569,8 +594,8 @@ mod tests {
     /// and carrying blurred pixels (smoothed ≠ original somewhere).
     #[test]
     fn skin_smoothing_lands_a_blurred_raster_when_a_model_is_provided() {
-        if std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING").is_none() {
-            eprintln!("skipping: PHOTOCRAFT_PORTRAIT_PARSING unset");
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_none() {
+            eprintln!("skipping: PHOTOCRAFT_MODELS_DIR unset");
             return;
         }
         let (mut s, _) = disc();

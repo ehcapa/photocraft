@@ -2,9 +2,9 @@
 //! image, from a runtime path. Native only (see the crate docs).
 //!
 //! Unlike the subject model the weights are not embedded — 52.6MB sits past the commit
-//! line — so the plan comes from `PHOTOCRAFT_PORTRAIT_PARSING=<path.onnx>` and every
-//! failure (unset, missing file, bad graph) caches as `None`: the portrait pipeline runs
-//! its person slice without region masks and nothing else changes.
+//! line — so the plan comes from `PHOTOCRAFT_MODELS_DIR/faceparser.onnx` (models.rs) and
+//! every failure (unset, missing file, bad graph) caches as `None`: the portrait pipeline
+//! runs its person slice without region masks and nothing else changes.
 //!
 //! Preprocessing contract (docs/fork/2026-11-18-portrait-pipeline.md, spike of 2026-11-18):
 //! this export family bakes its normalisation into the graph — feed **raw 0–255** RGB,
@@ -32,15 +32,18 @@ const _: fn() = {
 
 static PLAN: OnceLock<Option<Plan>> = OnceLock::new();
 
-/// The process-wide plan from the `PHOTOCRAFT_PORTRAIT_PARSING` path, built on first use.
+/// The process-wide plan from `PHOTOCRAFT_MODELS_DIR/faceparser.onnx`, built on first use.
 /// A missing or broken model is cached as `None`: re-reading would re-pay the same miss.
 fn plan() -> Option<&'static Plan> {
     PLAN.get_or_init(build).as_ref()
 }
 
 fn build() -> Option<Plan> {
-    let path = std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING")?;
-    let proto = tract_onnx::onnx().model_for_path(std::path::Path::new(&path)).ok()?;
+    // PHOTOCRAFT_MODELS_DIR/faceparser.onnx is the one placement; a fingerprint mismatch
+    // warns and proceeds (models.rs).
+    let path = super::models::locate(&super::models::FACEPARSER)?;
+    super::models::matches(&path, &super::models::FACEPARSER);
+    let proto = tract_onnx::onnx().model_for_path(&path).ok()?;
     let typed = proto.into_typed().ok()?;
     let typed = typed.clone().into_optimized().unwrap_or(typed);
     typed.into_runnable().ok()
