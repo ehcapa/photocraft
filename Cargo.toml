@@ -99,9 +99,12 @@ rayon = "1"
 # ML inference for Select Subject: pure-Rust ONNX runtime, native only (crates/ml).
 tract-onnx = "0.23"
 # The ort tier (crates/ml feature "ort"): onnxruntime bindings for the heavy attention
-# models tract cannot run interactively. Optional, native only; build-time it fetches
-# the onnxruntime binaries from pyke's CDN.
-ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native"] }
+# models tract cannot run interactively. Optional, native only. `load-dynamic`: pyke's
+# prebuilt static archives need glibc ≥ 2.38 / libstdc++ ≥ 13 (Ubuntu 24.04-era) and fail
+# to link on older LTS (22.04: __isoc23_strtol, _M_replace_cold undefined); the official
+# dynamic library (microsoft/onnxruntime releases, manylinux2014 baseline) loads anywhere.
+# At runtime point ORT_DYLIB_PATH at libonnxruntime.so (docs/fork/new-machine.md).
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "tls-native"] }
 rustc-hash = "2.1.3"
 criterion = { version = "0.8", default-features = false }
 getrandom = "0.3"

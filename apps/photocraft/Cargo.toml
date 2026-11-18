@@ -11,6 +11,9 @@ build = "build.rs"
 # Open HEIC/HEIF photos (the optional craft-heif crate). Not default so distributors choose
 # it; official builds (CI, packaging/, release) build with `--features heif`.
 heif = ["photocraft-codecs/heif"]
+# The ML ort tier (FeyNoBg matting, docs/fork/models.md), forwarded through the engine —
+# `--features photocraft-ml/ort` cannot reach a transitive dependency from `-p photocraft`.
+ort = ["photocraft-engine/ort"]
 
 [lints]
 workspace = true

@@ -10,6 +10,9 @@ workspace = true
 [features]
 # Real-file corpus tests (opt-in; `cargo xtask test-corpus`). Fail when the corpus is missing.
 corpus = []
+# The ML ort tier, forwarded for the app: `--features dep/feature` on the command line only
+# reaches direct dependencies, and the app reaches photocraft-ml through this crate.
+ort = ["photocraft-ml/ort"]
 
 [dependencies]
 photocraft-geom = { workspace = true }

@@ -38,18 +38,39 @@ mv model_fp16.onnx feynobg.onnx                                         # 563MB,
 ## 3. 环境变量
 
 ```sh
-# ~/.zshrc(或运行配置)三行:
+# ~/.zshrc(或运行配置):
 export PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models
 export CRAFT_I18N_DIR=/Users/<你>/Project/Rust/craft-i18n   # 中文 UI,路径按新机器改
-# ort 档(仅 feynobg 需要)不是变量,是编译 feature,见下
+export ORT_DYLIB_PATH=~/Project/Rust/onnxruntime/lib/libonnxruntime.so   # ort 档运行时动态库(见 §4)
+# ort 档(仅 feynobg 需要)= 编译 feature(§4)+ 上面的 ORT_DYLIB_PATH
 ```
 
 ## 4. 构建
 
 ```sh
 cargo build -p photocraft                                   # 纯 Rust 默认档
-cargo build -p photocraft --features photocraft-ml/ort      # + ort 档(feynobg)
-#   首次构建 ort 会从 pyke CDN 下载 onnxruntime 二进制(需网络)
+cargo build -p photocraft --features ort                    # + ort 档(feynobg)
+#   app 的 ort 是转发 feature(engine → photocraft-ml/ort);`--features photocraft-ml/ort`
+#   只在直接依赖 ml 的包上合法(如 -p photocraft-engine),从 app 传会报 does not contain this feature
+```
+
+**Linux 坑(Ubuntu 22.04,glibc 2.35)**:pyke 预编译的 onnxruntime 静态库要 glibc ≥ 2.38 +
+libstdc++ ≥ 13(`__isoc23_strtol`/`_M_replace_cold` 未定义符号),链接必败。工作区 ort 已改
+`load-dynamic`(运行时 dlopen),构建期零原生链接。动态库三个条件:**必须 1.23.x**(ort
+2.0-rc.15 的 `GraphOptimizationLevel::Level3` 映射 `ORT_ENABLE_LAYOUT=3`,1.22 会报
+`graph_optimization_level is not valid` 且被 ml 的 `.ok()?` 吞成 None)、**必须导出 C API 入口
+`OrtGetApiBase`**、GLIBC ≤ 2.27 / GLIBCXX ≤ 3.4.22。GitHub release tarball 与 NuGet 的
+`Microsoft.ML.OnnxRuntime` 包皆满足。**陷阱:PyPI wheel 里那把 `libonnxruntime.so` 是
+Python 裁剪 ABI,不导出 C API**。GitHub 直连不稳时走 NuGet(可断点续传):
+
+```sh
+mkdir -p ~/Project/Rust/onnxruntime/lib && cd /tmp
+curl -L -C - "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/1.23.2" -o ort.nupkg   # ~123MB,断了重跑即续传
+unzip -q ort.nupkg -d ort-extract
+cp ort-extract/runtimes/linux-x64/native/libonnxruntime.so ~/Project/Rust/onnxruntime/lib/libonnxruntime.so.1.23.2
+cd ~/Project/Rust/onnxruntime/lib && ln -sf libonnxruntime.so.1.23.2 libonnxruntime.so
+nm -D libonnxruntime.so | grep OrtGetApiBase    # 验证入口存在
+# 运行(IDEA 运行配置/终端)都要带:ORT_DYLIB_PATH=~/Project/Rust/onnxruntime/lib/libonnxruntime.so
 ```
 
 ## 5. 测试(macOS 专属注意,见 macos-dev.md)

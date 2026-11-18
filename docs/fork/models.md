@@ -20,7 +20,7 @@ export PHOTOCRAFT_MODELS_DIR=/path/to/models        # 唯一的变量,无默认�
 | 规范文件名 | 模型 | 体积 | blake3 | 来源(官方 / hf-mirror) | 许可 | 消费阶段 |
 |---|---|---|---|---|---|---|
 | `faceparser.onnx` | BiSeNet face-parsing(zllrunning 权重,bluefoxcreation 导出;原名 `faceparser_sim.onnx`) | 52.6MB | `c1f14e23…d0a8b8e` | [bluefoxcreation/Face_parsing_onnx](https://huggingface.co/bluefoxcreation/Face_parsing_onnx) / `hf-mirror.com` 同路径 | 代码 MIT;权重训自 CelebAMask-HQ(**研究用途,商用待审**) | Parsing |
-| `feynobg.onnx` | FeyNoBg/BiRefNet 抠图(**ort 档专用**,需 `--features photocraft-ml/ort` 编译;fp16 导出) | 563MB | `c9634e83…7885fcef` | [PinkPixel/fey-nobg-onnx](https://huggingface.co/PinkPixel/fey-nobg-onnx) / 同 mirror 路径 | Apache-2.0(Fey Inc 官方,BiRefNet 底座) | Person matte(tract 上 91s 不可用 → ort ~10s;**fp32 已排除:>15min**) |
+| `feynobg.onnx` | FeyNoBg/BiRefNet 抠图(**ort 档专用**,需 ort feature 编译:app `--features ort`,engine 侧 `-p photocraft-engine --features photocraft-ml/ort`;fp16 导出) | 563MB | `c9634e83…7885fcef` | [PinkPixel/fey-nobg-onnx](https://huggingface.co/PinkPixel/fey-nobg-onnx) / 同 mirror 路径 | Apache-2.0(Fey Inc 官方,BiRefNet 底座) | Person matte(tract 上 91s 不可用 → ort ~10s;**fp32 已排除:>15min**) |
 | `gfpgan.onnx`(版本无关槽位) | GFPGAN **v1.4**(neurobytemind 导出;当前占用槽位,hash 即此版) | 340MB | `42a4f8e1…37a25d08` | [neurobytemind/GFPGANv1.4.onnx](https://huggingface.co/neurobytemind/GFPGANv1.4.onnx) / 同 mirror 路径 | Apache-2.0(训练数据 CelebA-HQ 照旧待审) | 面部增强(待集成) |
 
 - **换版测试**:`gfpgan.onnx` 是无版本槽位,v1.x 系列接口通用(512²/0..1/RGB)——
