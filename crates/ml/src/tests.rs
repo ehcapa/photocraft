@@ -1,4 +1,4 @@
-use crate::{AVAILABLE, MODEL_SIDE, subject_mask};
+use crate::{AVAILABLE, MODEL_SIDE, PARSING_CLASSES, parsing_probs, subject_mask};
 
 #[test]
 fn size_mismatch_is_none() {
@@ -91,4 +91,46 @@ fn matches_rembg() {
     let iou = inter as f64 / union.max(1) as f64;
     eprintln!("rembg parity: IoU {iou:.4} over {w}×{h}, input side {MODEL_SIDE}");
     assert!(iou > 0.9, "IoU {iou} below 0.9 against rembg");
+}
+
+/// `parsing_probs` smoke: sizes, softmax sums, and non-degenerate classes — but only when a
+/// model path is handed in (the weights are not in the tree). Without it the None path is
+/// the behaviour under test, which the plain run covers everywhere else.
+#[test]
+fn parsing_probs_smoke_when_model_provided() {
+    let Some(path) = std::env::var_os("PHOTOCRAFT_PORTRAIT_PARSING") else {
+        assert!(parsing_probs(&[], 0, 0).is_none());
+        eprintln!("skipping: PHOTOCRAFT_PORTRAIT_PARSING unset");
+        return;
+    };
+    let _ = path;
+    // A synthetic 64×64 face-ish blob: any content exercises the graph; the assertions are
+    // about the output's shape, not its semantics.
+    let (w, h) = (64, 64);
+    let px: Vec<[f32; 3]> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let inside = (x as f32 - 32.0).powi(2) + (y as f32 - 32.0).powi(2) < 20.0 * 20.0;
+            [if inside { 0.8 } else { 0.3 }; 3]
+        })
+        .collect();
+    let probs = parsing_probs(&px, w, h).expect("model provided but no probs");
+    assert_eq!((probs.w, probs.h), (w, h));
+    assert_eq!(probs.planes.len(), PARSING_CLASSES);
+    for i in 0..w * h {
+        let sum: f32 = probs.planes.iter().map(|p| p[i]).sum();
+        assert!((sum - 1.0).abs() < 1e-3, "softmax sums to {sum}");
+    }
+    // Argmax variety: more than one class wins somewhere on a two-tone image.
+    let mut winners = std::collections::HashSet::new();
+    for i in 0..w * h {
+        let (mut best, mut bc) = (f32::MIN, 0);
+        for (c, p) in probs.planes.iter().enumerate() {
+            if p[i] > best {
+                (best, bc) = (p[i], c);
+            }
+        }
+        winners.insert(bc);
+    }
+    assert!(winners.len() >= 2, "one class everywhere: {winners:?}");
 }

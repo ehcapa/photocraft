@@ -1,0 +1,16 @@
+[package]
+name = "photocraft-portrait"
+description = "The fork's smart-portrait pipeline: stage-DAG recipe, analysis cache, and the standard-layer plan it materializes into (no workspace engine dependency)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+photocraft-doc = { workspace = true }
+photocraft-raster = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

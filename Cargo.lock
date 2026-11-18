@@ -6567,6 +6567,7 @@ dependencies = [
  "photocraft-ops",
  "photocraft-paint",
  "photocraft-plugins",
+ "photocraft-portrait",
  "photocraft-raster",
  "photocraft-raw",
  "photocraft-testkit",
@@ -6733,6 +6734,16 @@ dependencies = [
  "thiserror 2.0.21",
  "wasmi",
  "wat",
+]
+
+[[package]]
+name = "photocraft-portrait"
+version = "0.23.1"
+dependencies = [
+ "photocraft-doc",
+ "photocraft-raster",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

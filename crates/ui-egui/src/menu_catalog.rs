@@ -317,6 +317,10 @@ pub static CATALOG: &[(&[&str], &str, Option<&str>, &str)] = &[
     (&["Layer", "New Adjustment Layer"], "Threshold…", None, "layer.newAdjustmentLayer.threshold"),
     (&["Layer", "New Adjustment Layer"], "Gradient Map…", None, "layer.newAdjustmentLayer.gradientMap"),
     (&["Layer", "New Adjustment Layer"], "Selective Color…", None, "layer.newAdjustmentLayer.selectiveColor"),
+    (&["Layer", "New Adjustment Layer"], "---", None, "---"),
+    // The fork's portrait pipeline entry: analyzes the person, then adds a named group of
+    // standard adjustment layers masked to it (docs/fork/2026-11-18-portrait-pipeline.md).
+    (&["Layer", "New Adjustment Layer"], "Smart Portrait…", None, "portrait.create"),
     (&["Layer"], "Layer Content Options…", None, "layer.layerContentOptions"),
     (&["Layer"], "---", None, "---"),
     (&["Layer", "Layer Mask"], "Reveal All", None, "layer.layerMask.revealAll"),

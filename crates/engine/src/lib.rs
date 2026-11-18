@@ -133,6 +133,7 @@ pub use cmd::perspective_crop_cmds;
 pub use cmd::photo_cmds;
 pub use cmd::pick_cmds;
 pub use cmd::plugin_cmds;
+pub use cmd::portrait_cmds;
 pub use cmd::preset_import_cmds;
 pub use cmd::print_cmds;
 pub use cmd::rasterize_style_cmds;
@@ -317,6 +318,9 @@ pub struct Session {
     /// Object Selection's Object Finder results (#4087), shared by the hover preview and the
     /// click that commits it; valid while the pixels are unchanged.
     pub object_finder: smartselect_cmds::ObjectFinderCache,
+    /// The portrait pipeline's analysis (crates/portrait), reused while the pixels are
+    /// unchanged — the SubjectCache pattern.
+    pub(crate) portrait_cache: photocraft_portrait::Cache,
     /// A finished live stroke offered to the `paint.stroke` / `paint.pencil` that commits it
     /// ([`Session::offer_live_stroke`]).
     pub(crate) live_commit: Option<brush_cmds::LiveCommit>,

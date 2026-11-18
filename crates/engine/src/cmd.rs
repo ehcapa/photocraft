@@ -142,6 +142,7 @@ pub mod perspective_crop_cmds;
 pub mod photo_cmds;
 pub mod pick_cmds;
 pub mod plugin_cmds;
+pub mod portrait_cmds;
 pub mod preset_import_cmds;
 pub mod print_cmds;
 pub mod rasterize_style_cmds;
@@ -1367,6 +1368,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::path_edit_cmds::specs());
     v.extend(crate::smartselect_cmds::specs());
     v.extend(crate::cutout_cmds::specs());
+    v.extend(crate::portrait_cmds::specs());
     v.extend(crate::symmetry_cmds::specs());
     v.extend(crate::edit_cmds::specs());
     v.extend(crate::smart_svg_cmds::specs());

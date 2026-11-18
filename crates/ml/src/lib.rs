@@ -45,8 +45,49 @@ pub fn subject_mask(px: &[[f32; 3]], w: usize, h: usize) -> Option<SubjectMask> 
     }
 }
 
+pub use parsing::{PARSING_CLASSES, PARSING_SIDE};
+
+/// The face-parsing result: one probability plane per class, at the caller's size.
+pub struct ParsingProbs {
+    pub planes: Vec<Vec<f32>>,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// The face-parsing probabilities of `px` (`w × h` row-major RGB, `0..=1`): one plane per
+/// CelebAMask-HQ class, returned at the caller's size. `None` without a usable
+/// `PHOTOCRAFT_PORTRAIT_PARSING` model (always on wasm) — the portrait pipeline then runs
+/// its person slice without region masks.
+pub fn parsing_probs(px: &[[f32; 3]], w: usize, h: usize) -> Option<ParsingProbs> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        parsing::parsing_probs(px, w, h)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (px, w, h);
+        None
+    }
+}
+
+/// A single-plane `0..=1` mask resampled to `to_w × to_h` (the subject mask's filter).
+pub fn resize_mask(px: &[f32], w: usize, h: usize, to_w: usize, to_h: usize) -> Option<Vec<f32>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        parsing::resize_mask(px, w, h, to_w, to_h)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (px, w, h, to_w, to_h);
+        None
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod model;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod parsing;
 
 mod resample;
 
