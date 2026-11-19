@@ -122,3 +122,28 @@ Layer › New Adjustment Layer › Smart Portrait… → 对话框调参 → OK 
   `portrait.create` 已改为不记忆(decisions.md 2026-11-19),其余 filter.* 对话框
   仍记忆。排障口诀:输出离谱先查参数来源(config.toml / 对话框滑杆位置),
   再怀疑管线(portrait_diag 逐层转储一分钟能定性)
+
+## 9. 中文词条(craft-i18n fork)
+
+UI 新增英文字符串后,中文显示需要 `~/Project/Rust/craft-i18n`(fork 自
+storytold/craft-i18n,双远程同 photocraft)。流程:改
+`locales/zh-hans/photocraft.tsv` / `zh-hant`(TAB 三列:语境/英文/译文,按英文
+排序插入)→ `cargo test --workspace` 过目录检查器 → 按 AGENTS.md 在
+ATTRIBUTION.md 登记出处(AI 辅助需注明)→ 提交。**检查器规则提醒**:与
+common.tsv 同译文的行必须删(应用目录不允许重复覆盖共享行);顺序错了会挂。
+`tl!` 缺词条时回退英文,不阻断。
+
+## 10. target/ 磁盘管理(2026-11-19:164GB 案例)
+
+workspace 的 feature 组合 churn 会把 `target/debug/build/<pkg>/<hash>` 单元目录
+堆到天文数字(实测 photocraft-engine 一个包 838 个单元、41GB;cargo 稳定版无 GC)。
+每周或大实验后清一次:
+
+```sh
+cd target/debug && rm -rf incremental   # 增量缓存,零风险
+find build -maxdepth 2 -mindepth 2 -type d -mtime +0 -print0 | xargs -0 rm -rf   # 24h 前的陈旧单元
+```
+
+判别与预防:全量 `du -sh target/*`;日常测试可 `CARGO_INCREMENTAL=0` 抑制
+最大的增量缓存再增长(实测 60GB)。陈旧单元与"合并后 E0425 而 -p 通过"是同一
+现象两面(见 macos-dev.md §5)。

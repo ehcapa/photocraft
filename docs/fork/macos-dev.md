@@ -75,3 +75,31 @@ canonical,误判为越界。upstream CI 无 macOS,盲区。
   (如 `cargo check -p photocraft-ui-egui -p photocraft`),但那不如直接 `--workspace`。
 - `cargo test -p photocraft-ui-egui` 与 `--exclude` 变体都不可用(分别踩坑 1 的两面)。
 - 回馈 upstream 后更新本文件与 [`README.md`](README.md) 索引。
+
+## 4. engine 的 allocation.rs 非 UTF-8 路径测试失败(2026-11-19 发现)
+
+**现象。** `cargo test -p photocraft-engine --lib` 全量跑时
+`allocation::tests::read_file_within_reads_a_path_that_is_not_utf8` 失败:
+`Os { code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`。
+
+**根因。** macOS 对非 UTF-8 文件名的系统调用语义与 Linux 不同(EILCASE 一族),
+干净树同样失败(stash 验证过),与本地改动无关。upstream CI 无 macOS,盲区。
+
+**现状。** 环境既有问题,本地验证时忽略;待回馈 upstream。
+
+## 5. 大合并后 --workspace 报 E0425 而 -p 通过:陈旧 rmeta(2026-11-19 发现)
+
+**现象。** 合并 upstream 后 `cargo check --workspace --tests` 报 8 个
+`E0425: cannot find … in crate photocraft_ml`(源码里明明有无条件导出),而
+`cargo check -p photocraft-engine --lib`(带不带 `--features ort`)全部通过——
+现象自相矛盾。
+
+**根因。** 同一 crate 在 workspace 里存在多个 feature 组合的编译单元
+(`target/debug/build/photocraft-ml/<hash>/`),engine 链到了**合并前**的陈旧
+rmeta。`--workspace` 与 `-p` 选中的单元不同,不是代码问题。
+
+**修法。** `cargo clean -p photocraft-ml` 一次通过。判别:
+`cargo check --workspace -v 2>&1 | grep 'extern photocraft_ml='` 看 engine 实际
+消费的 rmeta 路径,再对 `ls -la target/debug/build/photocraft-ml/` 的日期。
+方向性口诀:**与坑 1(feature 统一)相反**——坑 1 是 `-p` 失败 `--workspace`
+通过,本坑是 `--workspace` 失败 `-p` 通过,先分清再动手。

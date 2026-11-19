@@ -36,3 +36,8 @@ ehcapa/photocraft（方向：像素蛋糕式 AI 修图）的 **fork 级**文档�
   三态测试/真图验收/应用冒烟,一张单子走完
 - [2026-11-19: Smart Portrait 对话框不再记忆配方](decisions.md) —— 滑杆残值伪装成
   管线损坏的真图事件;not_remembered + portrait_diag 诊断工具
+- [2026-11-19: 选区工具的模型区域化](decisions.md) —— analyze_person 共享(选区与人像
+  管线一份分析、一份缓存)、roi/SCRFD 自动放框、FeyNoBg 发丝档软选区、八区域
+  `select.region` + 族共用段 UI;FASHN 因许可不引入
+- [2026-11-19: faceparser 导出的类语义不可信](decisions.md) —— class_probe 判决
+  自相矛盾(左右眼环各被不同类占据),区域集封顶八类,脖/耳/眉/鼻不可给

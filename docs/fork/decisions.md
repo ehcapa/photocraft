@@ -105,3 +105,39 @@ fork 诊断工具保留，与 class_probe 同列。
 残值自然失效（重开时按行过滤，不回填）；新增测试
 `smart_portrait_never_remembers_its_recipe_rows`；排障口诀进
 [new-machine.md](new-machine.md) §8：输出离谱先查参数来源，再怀疑管线。
+
+## 2026-11-19: 选区工具的模型区域化——共享分析、八区域选区、发丝档
+
+**背景。** 人像管线的分析(主体 → SCRFD 检测 → FaceMesh → 脸部 parsing → 全身
+selfie_multiclass)只服务 Smart Portrait 一家,而选区工具侧只有内置 U²-Netᵖ 的
+Select Subject。全身皮肤/衣服/五官等区域没有选区入口;FaceMesh/BiSeNet 直接怼全图
+时输出崩塌(妆面落在下巴以下)也缺少 crop 级。
+
+**决策。** 三件事:(1) `analyze_person` 从 portrait.create 的 job 闭包提取为共享
+函数,`select.region`(皮肤/面部/头发/眼睛/眼睑/嘴唇/面颊/衣服八区域)与 Smart
+Portrait 共用同一份像素缓存分析——第一次付几秒,之后跨命令瞬时;(2) `roi`
+参数(用户框)与 SCRFD 自动放框并进 mesh/parsing 的 crop 级,two-pass 收紧;
+`select.subject` 的 `matting` 参数让 FeyNoBg alpha 直接成为软选区(发丝档);
+(3) UI 上这些动作是**选区族共用段**(十个选区工具的选项栏 + Select 菜单
+`Person ▸`),Subject 一个按钮 + 标准/发丝档位段控件(PS 的 Cloud/Device 先例),
+区域是 SplitButton。全身六类按 `Analysis::union` 逐像素取大并入既有区域
+(身体皮肤并入 Skin → 磨皮自动覆盖全身),而非新开区域。
+
+**后果。** `selfiemulticlass.onnx`(Apache-2.0)成为身体区域的既定来源;
+FASHN human parser 明确不引入(NVIDIA 非商用 + 专有训练数据,见
+[models.md](models.md) 许可列)。选区语义保持:软 alpha、±/交集、模式修饰键照常。
+
+## 2026-11-19: faceparser 导出的类语义不可信——区域集封顶为八类
+
+**背景。** BiSeNet faceparser.onnx(CelebAMask-HQ 19 类)的类别映射自引入起标注
+"顺序未验证"(face.rs 曾以 landmark 环绕过眼/唇)。脖/耳/眉/鼻四类是否可解锁,
+决定区域选区的上限。
+
+**决策。** 用 `class_probe`(landmark 锚定的环/带覆盖法)在真图上重验:该导出
+19 类里只有 6 类会响应,且**自相矛盾**——左眼环 78% 被 class 17 占据、右眼环
+100% 被 class 1 占据。结论:细类语义不可恢复,CLASS_REGIONS 的保守映射
+(1→Skin、16→Clothes、17/18→Hair)就是可辩护上限;脖/耳/眉/鼻正式判为不可给,
+眼/唇继续用 FaceMesh 环。
+
+**后果。** 区域选区全集封顶为八类(见上条);要解锁四细类只能换可信导出或自训,
+记录在案避免重复验证。
