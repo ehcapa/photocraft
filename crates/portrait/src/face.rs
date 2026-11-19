@@ -142,6 +142,16 @@ fn feather(a: &mut [f32], w: u32, h: u32) {
     }
 }
 
+/// The cheek band's lines from the mesh: the lower lids' mean y to the inner lips' mean y
+/// (document pixels) — above the first line is brow and forehead, below the second is
+/// chin. `None` when the landmarks run short.
+pub fn cheek_band(landmarks: &[[f32; 3]]) -> Option<(f32, f32)> {
+    Some((
+        (landmarks.get(145)?[1] + landmarks.get(374)?[1]) * 0.5,
+        (landmarks.get(13)?[1] + landmarks.get(14)?[1]) * 0.5,
+    ))
+}
+
 /// The blush mask: an ellipse per cheek point, sized off the eye span, feathered. The
 /// union of the pair; `None` on a too-short landmark vector.
 pub fn blush_mask(landmarks: &[[f32; 3]], w: u32, h: u32) -> Option<Surface> {
@@ -211,6 +221,19 @@ pub const FACE_REGION: Region = Region::Face;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cheek_band` averages the lower lids' line and the inner lips' line, and asks for
+    /// exactly the landmarks it reads (a short vector answers None, not a panic).
+    #[test]
+    fn cheek_band_reads_the_lids_and_lips_lines() {
+        let mut pts = vec![[0.0f32, 0.0, 0.0]; 478];
+        pts[145][1] = 10.0;
+        pts[374][1] = 12.0;
+        pts[13][1] = 30.0;
+        pts[14][1] = 34.0;
+        assert_eq!(cheek_band(&pts), Some((11.0, 32.0)));
+        assert_eq!(cheek_band(&pts[..200]), None);
+    }
 
     fn surface_value(s: &Surface, x: i32, y: i32) -> f32 {
         s.rgba(x, y)[0]

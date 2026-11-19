@@ -220,6 +220,76 @@ fn reference(p: &Value) -> Option<Either> {
 const BOX_MARGIN: f32 = 1.3;
 const RING_MARGIN: f32 = 1.6;
 
+/// The person bounds' growth for the body stage's crop: a little slack so the border
+/// classes are not cut at the matte's edge, still a person-dominant view.
+const BODY_MARGIN: f32 = 1.25;
+
+/// The body planes' confidence ramp: under `0.5` a pixel is noise on the union (the
+/// scarf that reads skin at 0.55, the background speckle of a distant framing), over
+/// `0.75` it is firm (the neck, the arms); between, a straight ramp keeps the soft edge
+/// a soft selection wants.
+const BODY_FLOOR: (f32, f32) = (0.5, 0.75);
+
+/// [`BODY_FLOOR`]'s ramp: 0 under the floor's low end, 1 over its high end, linear between.
+fn body_floor(v: f32) -> f32 {
+    ((v - BODY_FLOOR.0) / (BODY_FLOOR.1 - BODY_FLOOR.0)).clamp(0.0, 1.0)
+}
+
+/// A body-plane component smaller than this share of the plane's largest component is
+/// speckle, not a region (the 256² model's borderline pixels land as isolated dots far
+/// from anything they could belong to) — relative, because the planes ride at the
+/// person-crop's scale and no absolute count survives both crops.
+const BODY_SPECKLE_RATIO: f32 = 0.02;
+/// …but never keep a component under this many pixels, however small the largest is.
+const BODY_SPECKLE_MIN: usize = 16;
+
+/// Drops the 4-connected components of the on-pixels (`> 0`) under [`BODY_SPECKLE_RATIO`]
+/// of the largest (and under [`BODY_SPECKLE_MIN`]) — in place, on a floored plane.
+fn suppress_speckle(vals: &mut [f32], w: usize, h: usize) {
+    if w == 0 || h == 0 || vals.len() != w * h {
+        return;
+    }
+    // Component ids are 1-based into `sizes`; 0 is unvisited or off.
+    let mut labels = vec![0u32; w * h];
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..w * h {
+        if labels[start] != 0 || vals[start] <= 0.0 {
+            continue;
+        }
+        let id = sizes.len() as u32 + 1;
+        let mut size = 0usize;
+        labels[start] = id;
+        stack.push(start);
+        while let Some(i) = stack.pop() {
+            size += 1;
+            let (x, y) = (i % w, i / w);
+            for j in [
+                (x > 0).then(|| i - 1),
+                (x + 1 < w).then_some(i + 1),
+                (y > 0).then(|| i - w),
+                (y + 1 < h).then_some(i + w),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if labels[j] == 0 && vals[j] > 0.0 {
+                    labels[j] = id;
+                    stack.push(j);
+                }
+            }
+        }
+        sizes.push(size);
+    }
+    let Some(&largest) = sizes.iter().max() else { return };
+    let keep = (largest as f32 * BODY_SPECKLE_RATIO).max(BODY_SPECKLE_MIN as f32) as usize;
+    for (i, id) in labels.iter().enumerate() {
+        if *id > 0 && sizes[(*id - 1) as usize] < keep {
+            vals[i] = 0.0;
+        }
+    }
+}
+
 /// A face smaller than this in the tightened crop is not worth layers: the mesh's 256²
 /// input would be almost all upsample, and a garbage answer that passes the plausibility
 /// gate on a speck crop still builds nothing useful.
@@ -343,27 +413,38 @@ fn parsing_regions(
         .collect()
 }
 
-/// The whole-body regions of `doc` (`selfiemulticlass.onnx`, the whole document by design —
-/// no crop): the model's five person classes mapped onto the pipeline's regions
-/// (body-skin ∪ face-skin → `Skin`, hair → `Hair`, clothes → `Clothes`), each gated by the
-/// person like the face-parsing regions. Empty when the model is not placed — the caller's
-/// regions then stay whatever the face parsing found.
+/// The whole-body regions of `doc` (`selfiemulticlass.onnx`), sampled over the person's
+/// own bounds, not the document: the model is selfie-framing trained, so the person
+/// filling its 256² view is the distribution it understands, and the effective resolution
+/// rises with the person's share of the document (the whole-document ask put a panorama's
+/// small person into a handful of pixels, every class under 0.5 — docs/fork/models.md's
+/// known boundary). The model's five person classes map onto the pipeline's regions
+/// (body-skin ∪ face-skin → `Skin`, hair → `Hair`, clothes → `Clothes`), pass the
+/// [`BODY_FLOOR`] ramp and are gated by the person like the face-parsing regions. Empty
+/// when the model is not placed or the person has no bounds — the caller's regions then
+/// stay whatever the face parsing found.
 fn body_regions(
     doc: &Document,
     target: Option<photocraft_doc::LayerId>,
     sample_all: bool,
     person: &photocraft_raster::Surface,
 ) -> Vec<(photocraft_portrait::Region, photocraft_raster::Surface)> {
-    let Some((planes, sw, sh)) = with_doc_sampler(doc, target, sample_all, |smp, d| {
-        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::body::BODY_SIDE * photocraft_ml::body::BODY_SIDE);
-        let img = smp.rgb_scaled(d.bounds(), step);
+    let (dw, dh) = (doc.size.width, doc.size.height);
+    let bounds = person.content_bounds();
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+    let area = expanded(bounds, dw, dh, BODY_MARGIN);
+    let Some((planes, sw, sh)) = with_doc_sampler(doc, target, sample_all, |smp, _d| {
+        let step = photocraft_algo::segment::scale_for(area, photocraft_ml::body::BODY_SIDE * photocraft_ml::body::BODY_SIDE);
+        let img = smp.rgb_scaled(area, step);
         let (sw, sh) = (img.w, img.h);
         photocraft_ml::body::body_probs(&img.px, sw, sh).map(|p| (p, sw, sh))
     }) else {
         return Vec::new();
     };
-    let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
     let gate = photocraft_doc::LayerMask { surface: person.clone(), ..photocraft_doc::LayerMask::reveal_all() };
+    let (aw, ah) = (area.width() as usize, area.height() as usize);
     let mut out = Vec::new();
     for (class, region) in [
         (photocraft_ml::body::BODY_SKIN, photocraft_portrait::Region::Skin),
@@ -371,15 +452,17 @@ fn body_regions(
         (photocraft_ml::body::HAIR, photocraft_portrait::Region::Hair),
         (photocraft_ml::body::CLOTHES, photocraft_portrait::Region::Clothes),
     ] {
-        // The planes ride back at the sample's size; the gate and the document want doc pixels.
-        let Some(mut vals) = planes.get(class).and_then(|p| photocraft_ml::resize_mask(p, sw, sh, dw, dh)) else { continue };
-        for y in 0..dh {
-            for x in 0..dw {
-                vals[y * dw + x] *= gate.value(x as i32, y as i32);
+        // The planes ride back at the sample's size, through the floor, and land in a
+        // full-document surface at the crop's offset — outside it the region stays 0.
+        let Some(mut vals) = planes.get(class).and_then(|p| photocraft_ml::resize_mask(p, sw, sh, aw, ah)) else { continue };
+        for y in 0..ah {
+            for x in 0..aw {
+                vals[y * aw + x] = body_floor(vals[y * aw + x]) * gate.value(x as i32 + area.x0, y as i32 + area.y0);
             }
         }
+        suppress_speckle(&mut vals, aw, ah);
         let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
-        surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &vals);
+        surface.write_region(area, &vals);
         out.push((region, surface));
     }
     out
@@ -395,6 +478,77 @@ fn person_gated(mask: &photocraft_raster::Surface, person: &photocraft_raster::S
         for x in 0..w as i32 {
             let i = (y * w as i32 + x) as usize;
             vals[i] *= gate.value(x, y);
+        }
+    }
+    let mut out = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+    out.write_region(area, &vals);
+    Some(out)
+}
+
+/// `mask` with the pixels inside `r` zeroed — the body regions' step aside inside the mesh
+/// ring, where the face parsing's finer answer must stand alone: two qualities stitched
+/// per-pixel-max otherwise show the crop's straight edge as a seam.
+fn outside_rect(mask: &photocraft_raster::Surface, r: photocraft_geom::Rect, w: u32, h: u32) -> Option<photocraft_raster::Surface> {
+    let area = photocraft_geom::Rect::new(0, 0, w as i32, h as i32);
+    let mut vals = mask.try_read_region(area).ok()?;
+    for y in r.y0.max(0)..r.y1.min(h as i32) {
+        for x in r.x0.max(0)..r.x1.min(w as i32) {
+            vals[(y * w as i32 + x) as usize] = 0.0;
+        }
+    }
+    let mut out = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+    out.write_region(area, &vals);
+    Some(out)
+}
+
+/// The cheek geometry the mesh contributes to [`cheeks_from_parsing`] — everything the
+/// masks themselves do not carry.
+struct CheekGeometry {
+    /// The nose column: the tip's x and the column's half-width, document pixels — a
+    /// smoothstep ramp either side (the blush never lands on the nose, but the last
+    /// pixel of the ramp must not read as an edge).
+    nose_x: f32,
+    nose_half: f32,
+    /// The eye-line to mouth-line band (`face::cheek_band`), document pixels. The cheek
+    /// proper is a slice of it: below the under-eye, above the mouth corners.
+    band: (f32, f32),
+}
+
+/// The cheeks from the parsing's skin plane: the skin's own hairline- and jaw-accurate
+/// boundary, banded to the cheek slice of the eye-to-mouth line, minus the eye and lip
+/// rings the mesh places and the nose column between them. The `blush_mask` ellipses
+/// guess at all of this; here only the band and the exclusions are geometric — the
+/// boundary is the model's. `None` when a read-back fails.
+fn cheeks_from_parsing(
+    skin: &photocraft_raster::Surface,
+    eyes: &photocraft_raster::Surface,
+    lips: &photocraft_raster::Surface,
+    geo: &CheekGeometry,
+    w: u32,
+    h: u32,
+) -> Option<photocraft_raster::Surface> {
+    let area = photocraft_geom::Rect::new(0, 0, w as i32, h as i32);
+    let mut vals = skin.try_read_region(area).ok()?;
+    let eyes_v = eyes.try_read_region(area).ok()?;
+    let lips_v = lips.try_read_region(area).ok()?;
+    // The band's slice: in from the lid line by its top 18% (the under-eye is not the
+    // cheek), up from the mouth line by 8% (the corners are not either). The slice fades
+    // in over its top quarter and cuts at the bottom.
+    let height = geo.band.1 - geo.band.0;
+    let (top, bottom) = (geo.band.0 + height * 0.18, geo.band.1 - height * 0.08);
+    let fade = ((bottom - top) * 0.25).max(1.0);
+    let smoothstep = |t: f32| t * t * (3.0 - 2.0 * t);
+    for y in 0..h as i32 {
+        let yf = y as f32 + 0.5;
+        let band_v = if yf <= bottom { ((yf - top) / fade).clamp(0.0, 1.0) } else { 0.0 };
+        for x in 0..w as i32 {
+            let i = (y * w as i32 + x) as usize;
+            // Flat zero over the nose's inner 70%, rising over the outer 30% — the
+            // bridge and the tip carry no blush at all, and the cheek fades in only at
+            // the nose's own edge.
+            let dx = (((x as f32 + 0.5) - geo.nose_x).abs() / geo.nose_half).clamp(0.0, 1.0);
+            let nose_v = smoothstep(((dx - 0.7) / 0.3).clamp(0.0, 1.0));
+            vals[i] *= band_v * nose_v * (1.0 - eyes_v[i].min(1.0)) * (1.0 - lips_v[i].min(1.0));
         }
     }
     let mut out = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
@@ -512,10 +666,27 @@ pub(crate) fn analyze_person(
         let body = body_regions(doc, target, sample_all, &person);
         (regions, body)
     });
+    // The parsing's skin plane is the face skin, hairline-accurate — also the Face
+    // region's whole answer when it exists: the mesh hull below only floors a Face it
+    // cannot improve (a symmetric ring is not a traced hairline), so it lands solely
+    // when the parsing stage produced no skin (no model, or support under the filter).
+    let parsing_skin = regions.iter().any(|(r, _)| *r == photocraft_portrait::Region::Skin);
     for (region, mask) in regions {
+        if region == photocraft_portrait::Region::Skin {
+            analysis.union(photocraft_portrait::Region::Face, mask.clone());
+        }
         analysis.set(region, mask);
     }
     for (region, mask) in body {
+        // Inside the mesh ring the body classes step aside for the parsing's finer
+        // answer (Skin, Hair); what the ring cannot see — the neck below, the arms, the
+        // clothes — is what they add.
+        let mask = match (region, boxed.as_ref()) {
+            (photocraft_portrait::Region::Skin | photocraft_portrait::Region::Hair, Some((_, ring))) => {
+                outside_rect(&mask, *ring, doc.size.width, doc.size.height).unwrap_or(mask)
+            }
+            _ => mask,
+        };
         analysis.union(region, mask);
     }
     // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
@@ -528,22 +699,49 @@ pub(crate) fn analyze_person(
     };
     if let Some(pts) = mesh {
         analysis.landmarks = pts;
-        if let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
+        if !parsing_skin && let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
         {
-            analysis.set(photocraft_portrait::Region::Face, gated);
+            analysis.union(photocraft_portrait::Region::Face, gated);
         }
         // The eye and lip rings: the parsing export reads them as skin, so the
-        // landmark rings are their regions (person-gated like every other).
-        if let Some((eyes, lips)) = photocraft_portrait::face::feature_masks(&analysis.landmarks, dw, dh) {
+        // landmark rings are their regions (person-gated like every other). The cheeks
+        // read the same rings as exclusions.
+        let features = photocraft_portrait::face::feature_masks(&analysis.landmarks, dw, dh);
+        if let Some((eyes, lips)) = features.as_ref() {
             for (region, mask) in [(photocraft_portrait::Region::Eyes, eyes), (photocraft_portrait::Region::Lips, lips)] {
-                if let Some(gated) = person_gated(&mask, &person, dw, dh) {
+                if let Some(gated) = person_gated(mask, &person, dw, dh) {
                     analysis.set(region, gated);
                 }
             }
         }
-        // The makeup geometry: cheek ellipses and scaled eye rings, feathered.
+        // The cheeks: the parsing's skin, banded and feature-excluded, when the model
+        // answered — the ellipses only guess at where a tilted face's cheekbones are;
+        // they stay the degraded path's answer (no model, or no skin plane).
+        let cheeks = match (parsing_skin, analysis.mask(photocraft_portrait::Region::Skin), features.as_ref()) {
+            (true, Some(skin), Some((eyes, lips))) => {
+                let span = analysis.landmarks.get(263).zip(analysis.landmarks.get(33)).map(|(a, b)| (a[0] - b[0]).abs()).unwrap_or_default();
+                photocraft_portrait::face::cheek_band(&analysis.landmarks)
+                    .and_then(|band| {
+                        cheeks_from_parsing(
+                            skin,
+                            eyes,
+                            lips,
+                            &CheekGeometry {
+                                nose_x: analysis.landmarks.get(1).map(|p| p[0]).unwrap_or_default(),
+                                nose_half: span * 0.30,
+                                band,
+                            },
+                            dw,
+                            dh,
+                        )
+                    })
+                    .or_else(|| photocraft_portrait::face::blush_mask(&analysis.landmarks, dw, dh))
+            }
+            _ => photocraft_portrait::face::blush_mask(&analysis.landmarks, dw, dh),
+        };
+        // The makeup geometry: the cheeks above and the scaled eye rings, feathered.
         for (region, mask) in [
-            (photocraft_portrait::Region::Cheeks, photocraft_portrait::face::blush_mask(&analysis.landmarks, dw, dh)),
+            (photocraft_portrait::Region::Cheeks, cheeks),
             (photocraft_portrait::Region::Eyelids, photocraft_portrait::face::eyeshadow_mask(&analysis.landmarks, dw, dh)),
         ] {
             if let Some(mask) = mask
@@ -1304,6 +1502,227 @@ mod tests {
         if let Err(e) = run() {
             panic!("acceptance harness failed: {e}");
         }
+    }
+
+    /// The Select Region diagnostic: `PHOTOCRAFT_REGION_PHOTO=<image>` imports the photo,
+    /// runs the person analysis exactly as the `select.region` bar button does (no `roi`,
+    /// the active layer) and writes every region mask as `<out>/<stem>-<region>.png` —
+    /// grayscale, white = inside — plus a JSON summary (per-region mean coverage and
+    /// content bounds, the landmark count) to stdout. Skipped without the env var, like
+    /// the real-photo export above: a seeing instrument for "the regions are wrong",
+    /// which stage contributed what.
+    #[test]
+    fn region_dump_diagnostic() {
+        let Some(photo) = std::env::var_os("PHOTOCRAFT_REGION_PHOTO") else {
+            eprintln!("skipping: PHOTOCRAFT_REGION_PHOTO unset");
+            return;
+        };
+        let out = std::env::var_os("PHOTOCRAFT_REGION_OUT").map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "/tmp/regiondump".into());
+        std::fs::create_dir_all(&out).unwrap();
+        let stem = std::path::Path::new(&photo).file_stem().and_then(|s| s.to_str()).unwrap_or("photo").to_string();
+        let run = || -> Result<()> {
+            let mut s = Session::new();
+            let name = std::path::Path::new(&photo).file_name().and_then(|n| n.to_str()).unwrap_or("photo").to_string();
+            let imported =
+                photocraft_io::import_file(&name, std::path::Path::new(&photo), &photocraft_io::ImportOptions::default(), &photocraft_raster::Interrupt::NONE)
+                    .map_err(|e| EngineError::Other(format!("import: {e}")))?;
+            s.open_document(imported.document, None);
+            let analysis = {
+                let d = s.active().ok_or(EngineError::NoDocument)?;
+                let target = d.active_layer.filter(|id| d.doc.layer(*id).and_then(Layer::surface).is_some());
+                let ctx = crate::jobs::JobCtx::new();
+                crate::portrait_cmds::analyze_person(&d.doc, target, false, None, &ctx)?
+            };
+            let (w, h) = (analysis.width, analysis.height);
+            let mut summary = serde_json::Map::new();
+            summary.insert("landmarks".into(), json!(analysis.landmarks.len()));
+            for region in analysis.regions() {
+                let surface = analysis.mask(region).cloned().ok_or_else(|| EngineError::Other("mask read".into()))?;
+                let mask = photocraft_doc::LayerMask { surface: surface.clone(), ..photocraft_doc::LayerMask::reveal_all() };
+                let mut covered = 0usize;
+                let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        if mask.value(x, y) > 0.5 {
+                            covered += 1;
+                            x0 = x0.min(x);
+                            y0 = y0.min(y);
+                            x1 = x1.max(x);
+                            y1 = y1.max(y);
+                        }
+                    }
+                }
+                let name = format!("{region:?}").to_lowercase();
+                let bounds = (covered > 0).then_some(json!([x0, y0, x1, y1])).unwrap_or(json!(null));
+                summary.insert(name.clone(), json!({ "coverage": covered as f64 / (w as f64 * h as f64), "bounds": bounds }));
+                let mut doc = Document::new(&name, photocraft_geom::Size { width: w, height: h }, photocraft_doc::ColorMode::Grayscale, photocraft_doc::SampleType::U8);
+                doc.layers.push(Layer::new(&name, LayerContent::Raster(surface)));
+                let exported = photocraft_io::export(&doc, "png", &photocraft_io::ExportOptions::default()).map_err(|e| EngineError::Other(format!("export: {e}")))?;
+                std::fs::write(format!("{out}/{stem}-{name}.png"), &exported.bytes).map_err(|e| EngineError::Other(format!("write: {e}")))?;
+            }
+            eprintln!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(summary)).unwrap_or_default());
+            Ok(())
+        };
+        if let Err(e) = run() {
+            panic!("region diagnostic failed: {e}");
+        }
+    }
+
+    /// The body planes' floor: under 0.5 nothing survives (the scarf that reads skin at
+    /// 0.55, the background speckle), over 0.75 everything does (the neck, the arms), and
+    /// the stretch between ramps so a soft edge stays soft.
+    #[test]
+    fn body_floor_ramps_between_its_ends() {
+        assert_eq!(body_floor(0.0), 0.0);
+        assert_eq!(body_floor(0.49), 0.0);
+        assert!((body_floor(0.625) - 0.5).abs() < 1e-6);
+        assert_eq!(body_floor(0.75), 1.0);
+        assert_eq!(body_floor(1.0), 1.0);
+    }
+
+    /// `outside_rect` zeroes the ring's inside and leaves the rest of the mask alone.
+    #[test]
+    fn outside_rect_zeroes_only_the_ring_inside() {
+        let mask = |w: i32, h: i32| {
+            let vals: Vec<f32> = (0..w * h).map(|i| (i % 7) as f32 / 7.0).collect();
+            let mut s = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+            s.write_region(photocraft_geom::Rect::new(0, 0, w, h), &vals);
+            s
+        };
+        let m = photocraft_doc::LayerMask { surface: outside_rect(&mask(16, 8), photocraft_geom::Rect::new(4, 2, 9, 6), 16, 8).unwrap(), ..photocraft_doc::LayerMask::reveal_all() };
+        for y in 0..8 {
+            for x in 0..16 {
+                let expected = if (4..9).contains(&x) && (2..6).contains(&y) { 0.0 } else { (y * 16 + x) as f32 % 7.0 / 7.0 };
+                assert!((m.value(x, y) - expected).abs() < 0.01, "({x},{y})");
+            }
+        }
+    }
+
+    /// `suppress_speckle` keeps the components that matter relative to the plane's own
+    /// largest blob and drops the isolated dots — the 256² model's borderline pixels.
+    #[test]
+    fn suppress_speckle_drops_dots_not_blobs() {
+        let (w, h) = (16usize, 8usize);
+        let mut vals = vec![0.0f32; w * h];
+        // A 6×6 blob, a 2×2 dot and a single pixel — 36, 4 and 1 pixels.
+        for y in 0..6 {
+            for x in 0..6 {
+                vals[y * w + x] = 0.9;
+            }
+        }
+        for y in 6..8 {
+            for x in 12..14 {
+                vals[y * w + x] = 0.4;
+            }
+        }
+        vals[7 * w + 15] = 1.0;
+        suppress_speckle(&mut vals, w, h);
+        for y in 0..6 {
+            for x in 0..6 {
+                assert_eq!(vals[y * w + x], 0.9, "the blob survives ({x},{y})");
+            }
+        }
+        for y in 6..8 {
+            for x in 12..14 {
+                assert_eq!(vals[y * w + x], 0.0, "the 4-pixel dot dies ({x},{y})");
+            }
+        }
+        assert_eq!(vals[7 * w + 15], 0.0, "the single pixel dies");
+    }
+
+    /// The body planes' confidence probe: `PHOTOCRAFT_REGION_PHOTO=<image>` samples the
+    /// raw `body_probs` skin planes over two windows — the face (known skin) and a
+    /// user-named `PHOTOCRAFT_REGION_PROBE=[x,y,w,h]` rectangle (the misclassified
+    /// fabric) — and prints their confidence distributions. Decides whether a floor can
+    /// separate them or only a better model can.
+    #[test]
+    fn body_confidence_probe() {
+        let (Some(photo), Some(probe)) = (std::env::var_os("PHOTOCRAFT_REGION_PHOTO"), std::env::var_os("PHOTOCRAFT_REGION_PROBE")) else {
+            eprintln!("skipping: PHOTOCRAFT_REGION_PHOTO or PHOTOCRAFT_REGION_PROBE unset");
+            return;
+        };
+        let rect = |v: &str| -> Vec<f32> { v.split(',').filter_map(|n| n.trim().parse().ok()).collect() };
+        let probe = rect(&probe.to_string_lossy());
+        let run = || -> Result<()> {
+            let name = std::path::Path::new(&photo).file_name().and_then(|n| n.to_str()).unwrap_or("photo").to_string();
+            let imported =
+                photocraft_io::import_file(&name, std::path::Path::new(&photo), &photocraft_io::ImportOptions::default(), &photocraft_raster::Interrupt::NONE)
+                    .map_err(|e| EngineError::Other(format!("import: {e}")))?;
+            let doc = imported.document;
+            // The whole document: the probe asks about the model's raw confidence, not
+            // what any gate or crop makes of it.
+            let area = doc.bounds();
+            let Some((planes, sw, sh)) = with_doc_sampler(&doc, None, true, |smp, _d| {
+                let step = photocraft_algo::segment::scale_for(area, photocraft_ml::body::BODY_SIDE * photocraft_ml::body::BODY_SIDE);
+                let img = smp.rgb_scaled(area, step);
+                let (sw, sh) = (img.w, img.h);
+                photocraft_ml::body::body_probs(&img.px, sw, sh).map(|p| (p, sw, sh))
+            }) else {
+                return Ok(());
+            };
+            let stats = |label: &str, x: f32, y: f32, w: f32, h: f32| {
+                let (mut lo, mut hi, mut sum, mut n) = (1.0f32, 0.0f32, 0.0f32, 0usize);
+                let (x0, y0) = ((x / area.width() as f32 * sw as f32) as usize, (y / area.height() as f32 * sh as f32) as usize);
+                let (x1, y1) = (((x + w) / area.width() as f32 * sw as f32) as usize, ((y + h) / area.height() as f32 * sh as f32) as usize);
+                for y in y0..y1.min(sh) {
+                    for x in x0..x1.min(sw) {
+                        let v = planes.get(photocraft_ml::body::BODY_SKIN).map(|p| p[y * sw + x]).unwrap_or(0.0).max(planes.get(photocraft_ml::body::FACE_SKIN).map(|p| p[y * sw + x]).unwrap_or(0.0));
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                        sum += v;
+                        n += 1;
+                    }
+                }
+                eprintln!("{label}: n={n} min={lo:.3} mean={:.3} max={hi:.3}", if n > 0 { sum / n as f32 } else { 0.0 });
+            };
+            stats("face window", 220.0, 220.0, 150.0, 180.0);
+            stats("probe window", probe[0] - area.x0 as f32, probe[1] - area.y0 as f32, probe[2], probe[3]);
+            let _ = planes;
+            Ok(())
+        };
+        if let Err(e) = run() {
+            panic!("probe failed: {e}");
+        }
+    }
+
+    /// The parsing-derived cheeks: the skin's own boundary, kept only between the eye
+    /// line and the mouth line, with the eye rings, lip ring and nose column removed.
+    #[test]
+    fn cheeks_from_parsing_bands_and_excludes() {
+        let surface = |w: i32, h: i32, on: &dyn Fn(i32, i32) -> bool| {
+            let vals: Vec<f32> = (0..w * h).map(|i| if on(i % w, i / w) { 1.0 } else { 0.0 }).collect();
+            let mut s = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+            s.write_region(photocraft_geom::Rect::new(0, 0, w, h), &vals);
+            s
+        };
+        let (w, h) = (32, 16);
+        // Skin everywhere, eyes as two 6×3 boxes at y 4..7, lips as a 8×3 box at y 12..15.
+        let skin = surface(w, h, &|_, _| true);
+        let eyes = surface(w, h, &|x, y| (4..10).contains(&x) && (4..7).contains(&y) || (22..28).contains(&x) && (4..7).contains(&y));
+        let lips = surface(w, h, &|x, y| (12..20).contains(&x) && (12..15).contains(&y));
+        let mask = photocraft_doc::LayerMask {
+            surface: cheeks_from_parsing(
+                &skin,
+                &eyes,
+                &lips,
+                &CheekGeometry { nose_x: 16.0, nose_half: 6.0, band: (4.0, 12.0) },
+                32,
+                16,
+            )
+            .unwrap(),
+            ..photocraft_doc::LayerMask::reveal_all()
+        };
+        assert_eq!(mask.value(16, 2), 0.0, "above the eye line is forehead");
+        assert_eq!(mask.value(6, 5), 0.0, "the eye ring is excluded");
+        assert_eq!(mask.value(16, 13), 0.0, "the lip ring is excluded");
+        // The band's slice: top = 4 + 0.18×8 ≈ 5.4, bottom = 12 − 0.08×8 ≈ 11.4.
+        assert_eq!(mask.value(8, 5), 0.0, "the under-eye rows above the slice stay out");
+        assert!(mask.value(16, 8) < 0.1, "the nose column is near-zero at its centre");
+        assert!(mask.value(12, 8) < 0.35, "the nose ramp stays low beside the tip");
+        assert!(mask.value(7, 8) > 0.9, "outside the nose column the skin stands");
+        assert_eq!(mask.value(16, 14), 0.0, "below the mouth line is chin");
+        assert!(mask.value(8, 9) > 0.9, "the left cheek survives");
+        assert!(mask.value(24, 9) > 0.9, "the right cheek survives");
     }
 
     #[test]
