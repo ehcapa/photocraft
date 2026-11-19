@@ -1,26 +1,13 @@
 //! The Retouch options bar's selection family: Quick Selection and Object Selection.
 
-use craft::ui::buttons::Button;
-use craft::ui::contract::{Show as _, clicked};
+use craft::ui::contract::Show as _;
 use craft::ui::display::Divider;
 use craft::ui::text::RangeAlert;
-use serde_json::json;
 
 use super::heal::check;
 use crate::PhotocraftApp;
 use crate::option_cells::hint;
 use crate::state::Tool;
-
-/// The Select Subject button both selection tools carry; `empty` is the message when nothing is
-/// found. The click dispatches with the tool's own mode over the bar state and the modifiers held
-/// at the click, as a gesture's would.
-fn select_subject(ui: &mut egui::Ui, app: &mut PhotocraftApp, tool: Tool, empty: &str) {
-    if clicked(&Button::new(tl!("Select Subject")).show(ui)) {
-        let mode = crate::tool_feedback::click_mode(app, tool, app.ui.selection_mode, ui.ctx().input(|i| i.modifiers));
-        let r = app.run("select.subject", json!({ "mode": mode }));
-        crate::retouch_ui::report_smart_result(app, r, empty);
-    }
-}
 
 /// Quick Selection's options.
 pub(super) fn quick_selection(ui: &mut egui::Ui, app: &mut PhotocraftApp) -> Option<RangeAlert> {
@@ -28,8 +15,9 @@ pub(super) fn quick_selection(ui: &mut egui::Ui, app: &mut PhotocraftApp) -> Opt
     check(ui, tl!("Sample All Layers"), &mut o.sample_all.quick_selection, true, None);
     check(ui, tl!("Enhance Edge"), &mut o.enhance_edge, true, None);
     hint(ui, crate::i18n::fmt(tl!("{key} to subtract"), &[("key", &crate::shortcuts::pretty("Alt"))]));
-    Divider::vertical().show(ui);
-    select_subject(ui, app, Tool::QuickSelection, tl!("No subject found — try Object Selection or the Lasso"));
+    // The same smart selection actions every selection tool carries: Subject with its tier
+    // segment, Face, Region.
+    crate::panels::options_bar::selection::smart_selection(app, ui, Tool::QuickSelection);
     None
 }
 
@@ -43,7 +31,6 @@ pub(super) fn object_selection(ui: &mut egui::Ui, app: &mut PhotocraftApp) -> Op
     check(ui, tl!("Sample All Layers"), &mut o.sample_all.object_selection, true, None);
     check(ui, tl!("Hard Edge"), &mut o.object_hard_edge, true, None);
     hint(ui, tl!("Drag a rectangle around the object"));
-    Divider::vertical().show(ui);
-    select_subject(ui, app, Tool::ObjectSelection, tl!("No subject found — try a rectangle around the object"));
+    crate::panels::options_bar::selection::smart_selection(app, ui, Tool::ObjectSelection);
     None
 }

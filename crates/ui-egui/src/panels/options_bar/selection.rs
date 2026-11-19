@@ -276,7 +276,7 @@ fn magnetic_settings(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 /// heavy on purpose (~10s, GB-scale memory, ort builds with the model placed only) and never
 /// the default. Face is the portrait pipeline's entry: the drawn selection — any selection
 /// tool's — scopes the recipe dialog, and its OK builds the layers.
-fn smart_selection(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) {
+pub(crate) fn smart_selection(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) {
     divider(ui);
     let subject = Button::new(label("Select Subject")).show(ui);
     if clicked(&subject.response) {
