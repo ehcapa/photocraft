@@ -81,7 +81,7 @@ mod tests {
     fn union_takes_the_per_pixel_maximum() {
         let mut a = Analysis::new(8, 4);
         a.union(Region::Skin, mask(8, 4, |x, _| if x < 4 { 0.8 } else { 0.0 }));
-        a.union(Region::Skin, mask(8, 4, |x, _| if x >= 2 && x < 6 { 0.5 } else { 0.0 }));
+        a.union(Region::Skin, mask(8, 4, |x, _| if (2..6).contains(&x) { 0.5 } else { 0.0 }));
         let m = photocraft_doc::LayerMask { surface: a.mask(Region::Skin).unwrap().clone(), ..photocraft_doc::LayerMask::reveal_all() };
         // Left half stays the face's 0.8, the join keeps 0.5, the far right stays 0
         // (GRAY8 quantises, so approximate).

@@ -24,7 +24,7 @@ fn composite_ppm(s: &Session, path: &str) -> Result<(), String> {
     let doc = &st.doc;
     let bounds = doc.bounds();
     let surf = photocraft_compose::composite_to_surface(doc, bounds, photocraft_doc::PixelFormat::RGBA8, None);
-    let (w, h) = (bounds.width() as u32, bounds.height() as u32);
+    let (w, h) = (bounds.width(), bounds.height());
     let px = surf.try_read_region(bounds).map_err(|e| e.to_string())?;
     let ch = px.len() / ((w * h) as usize);
     let mut buf = Vec::with_capacity((w * h * 3) as usize);
@@ -38,7 +38,7 @@ fn composite_ppm(s: &Session, path: &str) -> Result<(), String> {
 fn mask_pgm(layer: &Layer, bounds: photocraft_geom::Rect, path: &str) -> Result<(f64, String), String> {
     let Some(raw) = layer.mask.as_ref() else { return Ok((-1.0, "NO MASK".into())) };
     let m = LayerMask { surface: raw.surface.clone(), ..LayerMask::reveal_all() };
-    let (w, h) = (bounds.width() as u32, bounds.height() as u32);
+    let (w, h) = (bounds.width(), bounds.height());
     let mut buf = Vec::with_capacity((w * h) as usize);
     let mut cov = 0u64;
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);

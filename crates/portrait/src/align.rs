@@ -202,8 +202,8 @@ mod tests {
         let t = TEMPLATE.map(|p| [p[0] * side as f32 * 2.0 + 100.0, p[1] * side as f32 * 2.0 + 50.0]);
         let fit = fit(&t, side);
         let back = fit.apply(t[2][0], t[2][1]);
-        assert!((back.0 - side as f32 * 0.50022447).abs() < 1.0, "nose to template: {back:?}");
-        assert!((back.1 - side as f32 * 0.62186887).abs() < 1.0, "nose to template: {back:?}");
+        assert!((back.0 - side as f32 * 0.500_224_5).abs() < 1.0, "nose to template: {back:?}");
+        assert!((back.1 - side as f32 * 0.621_868_9).abs() < 1.0, "nose to template: {back:?}");
         // The inverse round-trips.
         let inv = fit.inverse();
         let rt = inv.apply(back.0, back.1);

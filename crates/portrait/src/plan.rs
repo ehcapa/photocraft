@@ -199,8 +199,7 @@ mod tests {
 
     #[test]
     fn hair_layer_needs_both_the_ask_and_the_hair_region() {
-        let mut recipe = Recipe::default();
-        recipe.hair = Some(HueSat { hue: -15.0, saturation: 40.0, lightness: 1.0 });
+        let recipe = Recipe { hair: Some(HueSat { hue: -15.0, saturation: 40.0, lightness: 1.0 }), ..Default::default() };
         // Asked but not analyzed: nothing.
         assert_eq!(plan(&recipe, &analysis_with_person(true)).layers.len(), 1);
         // Analyzed but not asked: nothing (the default recipe).
@@ -217,8 +216,7 @@ mod tests {
 
     #[test]
     fn skin_raster_needs_both_the_ask_and_the_skin_region() {
-        let mut recipe = Recipe::default();
-        recipe.skin = Some(crate::Skin::default());
+        let recipe = Recipe { skin: Some(crate::Skin::default()), ..Default::default() };
         // Asked but not analyzed: nothing.
         assert_eq!(plan(&recipe, &analysis_with_person(true)).layers.len(), 1);
         // Analyzed but not asked: nothing.
@@ -232,8 +230,7 @@ mod tests {
 
     #[test]
     fn grade_lands_a_person_masked_curves_layer_last() {
-        let mut recipe = Recipe::default();
-        recipe.grade = Some(Grade { slope: [1.2, 1.0, 0.8], offset: [-0.05, 0.0, 0.1] });
+        let recipe = Recipe { grade: Some(Grade { slope: [1.2, 1.0, 0.8], offset: [-0.05, 0.0, 0.1] }), ..Default::default() };
         let planned = plan(&recipe, &analysis_with_person(true));
         let PlannedLayer::Adjustment { name, kind, params, mask } = &planned.layers[1] else { panic!("not an adjustment") };
         assert_eq!((name.as_str(), kind.as_str(), *mask), ("Color Match", "curves", Some(Region::Person)));

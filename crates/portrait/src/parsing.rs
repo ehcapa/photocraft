@@ -64,7 +64,7 @@ mod tests {
                 Region::Skin => 0.2,
                 Region::Clothes => 0.5,
                 Region::Hair => 0.9,
-                _ => unreachable!(),
+                other => panic!("unmapped region {other:?} grouped"),
             };
             assert!(mask.iter().all(|v| (*v - want).abs() < 1e-6), "{region:?}");
         }

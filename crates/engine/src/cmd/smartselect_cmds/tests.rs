@@ -751,7 +751,7 @@ fn subject_matting_falls_back_to_the_standard_line_with_a_note() {
     let r = s.execute("select.subject", json!({"matting": true})).unwrap();
     match r.get("matting") {
         Some(serde_json::Value::Bool(false)) => {
-            assert!(sel_iou(&s, 200, 160, |x, y| inside(x, y)) >= 0.75, "the standard line selected the disc");
+            assert!(sel_iou(&s, 200, 160, inside) >= 0.75, "the standard line selected the disc");
         }
         _ => assert_eq!(r["changed"], true, "the matte tier answered"),
     }
