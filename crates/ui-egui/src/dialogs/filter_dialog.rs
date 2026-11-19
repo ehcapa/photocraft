@@ -578,6 +578,20 @@ pub fn open_smart_edit(app: &mut PhotocraftApp, command: &str, recorded: &Map<St
     Ok(crate::dialogs::params::open_param_unsaved(app, command, opening, target, build))
 }
 
+/// Opens `command`'s dialog with `values` laid over the defaults: a key with a row opens as that
+/// row, a key without one (Smart Portrait's `roi`, the box a drawn selection hands in) rides
+/// along to the command as JSON, the way `open_with_spec`'s fixed params do. It remembers
+/// nothing — the values scope this opening, they are not a saved choice.
+pub fn open_with_values(app: &mut PhotocraftApp, command: &str, values: Map<String, Value>) -> Result<DialogId, String> {
+    let spec = photocraft_engine::commands::find(command).ok_or_else(|| format!("{command} has no dialog"))?;
+    let params = params(app, command, spec.params);
+    let mut opening = fields(app, command, &params);
+    overlay(&params, &values, &mut opening);
+    let reset = reset_values(&params, &opening);
+    let build = builder(app, command, title_of(spec.label), params, reset);
+    Ok(crate::dialogs::params::open_param_unsaved(app, command, opening, Value::Null, build))
+}
+
 /// The command parameters of the dialog values `fields`: the plain map, colours as `#rrggbb`,
 /// document choices as indices, and Radial Blur's centre as `centerX` / `centerY`. The preview and
 /// OK both build their parameters here, so they cannot differ.

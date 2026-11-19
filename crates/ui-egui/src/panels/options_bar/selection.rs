@@ -291,6 +291,21 @@ fn wand(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         let result = app.run("select.subject", serde_json::json!({ "mode": mode }));
         crate::retouch_ui::report_smart_result(app, result, tl!("No subject found — try Object Selection or the Lasso"));
     }
+    // The face entry: the drawn selection — any selection tool's — is the face box the
+    // portrait pipeline crops its mesh and parsing stages to; with no selection the detector
+    // finds the face itself. It opens the recipe dialog scoped to that box (the `roi` rides
+    // along without a row, like a fixed param), and the dialog's OK builds the layers.
+    let face = Button::new(label("Select Face")).show(ui);
+    if clicked(&face.response) {
+        let mut scoped = serde_json::Map::new();
+        if let Some(box_) = app.session.active().and_then(|st| st.doc.selection.as_ref()).map(|m| m.content_bounds()) {
+            scoped.insert("roi".into(), serde_json::json!([box_.x0, box_.y0, box_.width(), box_.height()]));
+        }
+        if let Err(error) = crate::filter_dialog::open_with_values(app, "portrait.create", scoped) {
+            app.ui.status = error;
+            app.ui.status_error = true;
+        }
+    }
     select_and_mask(ui);
 }
 

@@ -246,6 +246,30 @@ fn smart_portrait_opens_the_recipe_dialog_and_runs_on_ok() {
     assert_eq!(layer.name, "Portrait", "the pipeline ran");
 }
 
+/// Select Face (the wand bar's face entry) scopes the recipe dialog to the drawn selection:
+/// the box rides along as a rowless `roi` value that reaches the command's params — and an
+/// unscoped opening carries no `roi`, leaving the automatic detector to find the face.
+#[test]
+fn select_face_scopes_the_recipe_dialog_to_the_drawn_selection() {
+    const CMD: &str = "portrait.create";
+    let mut app = new_app();
+    app.run("file.new", json!({"width": 64, "height": 64, "background": "white"})).unwrap();
+    app.run("paint.pencil", json!({"points": [[32, 32]], "size": 40, "color": "#c04010"})).unwrap();
+    // A drawn rectangle over the blob: the box any selection tool hands Select Face.
+    app.run("select.rect", json!({"x": 8, "y": 8, "width": 48, "height": 40})).unwrap();
+    let bounds = app.session.active().unwrap().doc.selection.as_ref().unwrap().content_bounds();
+    let mut scoped = serde_json::Map::new();
+    scoped.insert("roi".into(), json!([bounds.x0, bounds.y0, bounds.width(), bounds.height()]));
+    let id = crate::filter_dialog::open_with_values(&mut app, CMD, scoped).expect("the scoped dialog opens");
+    assert_eq!(field_json(&app, id, "roi"), json!([8, 8, 48, 40]), "the box rides along, rowless");
+    assert!(ok(&mut app, id), "the OK closed the dialog");
+    let layer = app.session.active().unwrap().active_layer.map(|l| app.session.active().unwrap().doc.layer(l).unwrap()).unwrap();
+    assert_eq!(layer.name, "Portrait", "the pipeline ran");
+    // The unscoped opening carries no roi: the automatic detector's turn.
+    let plain = open(&mut app, CMD).expect("the plain dialog opens");
+    assert_eq!(field_json(&app, plain, "roi"), Value::Null, "no selection means no roi");
+}
+
 /// Smart Portrait's rows never remember their values: the recipe defaults are the sane
 /// retouch, and a stale extreme slider from an earlier session presents as the pipeline
 /// breaking (2026-11-19: hue 164/saturation -61/lightness +43 produced a cyan-veiled
