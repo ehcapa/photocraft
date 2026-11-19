@@ -5,9 +5,10 @@
 //!
 //! Preprocessing contract: the tflite heritage shows — **NHWC** `[1, 256, 256, 3]`, `0..1`
 //! RGB, stretched onto the square (the aspect distortion is undone on the way out, like the
-//! parsing model). The answer is `[1, 256, 256, 6]`, the **class axis last**, softmax already
-//! baked into this export — both verified on the acceptance photo (the class-last point the
-//! spike's first dump got wrong: plane-major reading scrambles every class into ~18% noise).
+//! parsing model). The answer is `[1, 256, 256, 6]`, the **class axis last**, raw logits:
+//! the softmax over that axis is applied here (the spike first read it plane-major, which
+//! scrambles every class into noise, then assumed softmax was baked in — a probe reads
+//! negative logits, which softmax output can never be).
 
 use std::sync::OnceLock;
 
@@ -72,11 +73,31 @@ pub fn body_probs(px: &[[f32; 3]], w: usize, h: usize) -> Option<Vec<Vec<f32>>> 
     if raw.len() != BODY_CLASSES * BODY_SIDE * BODY_SIDE {
         return None;
     }
+    // Softmax over the class axis is OURS to apply: this export emits raw logits (a probe
+    // over a real photo reads −1.7…3.8 — impossible softmax output — so the spike's
+    // "softmax already baked in" note was a confident-pixel eyeball, not a check). Per
+    // pixel, max-subtracted for stability; the probabilities then sum to 1 over the six
+    // classes, and the callers' thresholds mean what they say.
+    let mut probs: Vec<f32> = raw;
+    for i in 0..BODY_SIDE * BODY_SIDE {
+        let px = &mut probs[i * BODY_CLASSES..(i + 1) * BODY_CLASSES];
+        let max = px.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for v in px.iter_mut() {
+            *v = (*v - max).exp();
+            sum += *v;
+        }
+        if sum > 0.0 {
+            for v in px.iter_mut() {
+                *v /= sum;
+            }
+        }
+    }
     // Class-last NHWC → per-class planes at the caller's size (the background plane rides
     // back too and is dropped by the caller; resize per class like the mask resampler).
     (0..BODY_CLASSES)
         .map(|c| {
-            let plane: Vec<f32> = (0..BODY_SIDE * BODY_SIDE).map(|i| raw[i * BODY_CLASSES + c]).collect();
+            let plane: Vec<f32> = (0..BODY_SIDE * BODY_SIDE).map(|i| probs[i * BODY_CLASSES + c]).collect();
             super::resize_mask(&plane, BODY_SIDE, BODY_SIDE, w, h)
         })
         .collect::<Option<Vec<_>>>()

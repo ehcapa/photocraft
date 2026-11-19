@@ -182,3 +182,39 @@ fn person_matte_through_ort_when_the_model_is_placed() {
     assert!(matte.px.iter().any(|v| *v > 0.5), "some foreground");
     assert!(matte.px.iter().any(|v| *v < 0.5), "some background");
 }
+
+/// `body_probs` smoke — same contract as the parsing smoke, guarding the softmax that is
+/// ours to apply: the export emits raw logits (a probe reads negatives), the planes must
+/// come back probabilities — every value 0..=1, the six classes summing to ~1 per pixel.
+#[test]
+fn body_probs_smoke_when_model_provided() {
+    let Some(path) = std::env::var_os("PHOTOCRAFT_MODELS_DIR") else {
+        assert!(crate::body::body_probs(&[], 0, 0).is_none());
+        eprintln!("skipping: PHOTOCRAFT_MODELS_DIR unset");
+        return;
+    };
+    if !std::path::Path::new(&path).join("selfiemulticlass.onnx").is_file() {
+        eprintln!("skipping: no selfiemulticlass.onnx in PHOTOCRAFT_MODELS_DIR");
+        return;
+    }
+    let (w, h) = (64, 64);
+    let px: Vec<[f32; 3]> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let inside = (x as f32 - 32.0).powi(2) + (y as f32 - 32.0).powi(2) < 20.0 * 20.0;
+            [if inside { 0.8 } else { 0.3 }; 3]
+        })
+        .collect();
+    let planes = crate::body::body_probs(&px, w, h).expect("model provided but no probs");
+    assert_eq!(planes.len(), crate::body::BODY_CLASSES);
+    for p in &planes {
+        assert_eq!(p.len(), w * h);
+    }
+    for i in 0..w * h {
+        let sum: f32 = planes.iter().map(|p| p[i]).sum();
+        assert!((sum - 1.0).abs() < 1e-3, "softmax sums to {sum}");
+        for p in &planes {
+            assert!((0.0..=1.0).contains(&p[i]), "plane value out of range");
+        }
+    }
+}
