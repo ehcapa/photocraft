@@ -20,6 +20,10 @@ pub const FACEPARSER: ModelFile = ModelFile { canonical: "faceparser.onnx", blak
 /// tract tier cannot run interactively. fp16 export; see docs/fork/models.md.
 pub const FEYNOBG: ModelFile = ModelFile { canonical: "feynobg.onnx", blake3: Some("c9634e838aabe6a620f67b7b69a68508a040d9d0afefb02231296bdf7885fcef") };
 
+/// The face detector (SCRFD det_10g): insightface's buffalo_l detection model as hosted by
+/// immich-app — the automatic face box of `detect`, the drawn `roi`'s automatic sibling.
+pub const FACEDETECTOR: ModelFile = ModelFile { canonical: "facedetector.onnx", blake3: Some("fa3e5d8c62722a7b7122dc185245236589dcf0b3b5c9c5561cc742ce356fba56") };
+
 /// The face-enhancement model's slot — version-free on purpose: the GFPGAN v1.x line
 /// shares the 512² / 0..1 / RGB interface, so another version dropped into
 /// `gfpgan.onnx` runs too (a fingerprint mismatch warns, never blocks; register a kept

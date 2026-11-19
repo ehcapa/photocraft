@@ -26,6 +26,7 @@ mkdir -p ~/Project/Rust/models && cd ~/Project/Rust/models
 # 注意:huggingface.co 直连通常不通,用 hf-mirror.com
 curl -LO https://hf-mirror.com/bluefoxcreation/Face_parsing_onnx/resolve/main/faceparser_sim.onnx
 mv faceparser_sim.onnx faceparser.onnx                                  # 规范名,52.6MB
+curl -L -o facedetector.onnx https://hf-mirror.com/immich-app/buffalo_l/resolve/main/detection/model.onnx   # SCRFD 人脸检测,16MB,自动放框
 curl -LO https://hf-mirror.com/neurobytemind/GFPGANv1.4.onnx/resolve/main/GFPGANv1.4.onnx
 mv GFPGANv1.4.onnx gfpgan.onnx                                          # 340MB
 curl -LO https://hf-mirror.com/PinkPixel/fey-nobg-onnx/resolve/main/model_fp16.onnx

@@ -229,8 +229,8 @@ const MIN_FACE_SIDE: i32 = 24;
 /// inside it instead of over the whole document. Both models were trained on face-dominant
 /// crops (CelebAMask-HQ is face close-ups; FaceMesh assumes the face fills the frame), so a
 /// face that is a small fraction of the frame collapses — the box is the crop stage the
-/// models are missing, drawn by the one observer who knows where the face is. `None`
-/// without the param, or when the box clips away to nothing.
+/// models are missing. Without it the SCRFD detector supplies the largest face's box
+/// automatically (`detect`); `None` without the param, or when the box clips away to nothing.
 fn roi(p: &Value, size: photocraft_geom::Size) -> Option<photocraft_geom::Rect> {
     let v = p.get("roi")?.as_array()?;
     let mut n = v.iter().filter_map(Value::as_f64);
@@ -417,23 +417,52 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
                 analysis.set(photocraft_portrait::Region::Person, person.clone());
                 let (dw, dh) = (doc.size.width, doc.size.height);
+                // The box the mesh and parsing crop to: the user's `roi` wins; without one
+                // the detector (SCRFD, `facedetector.onnx` in the models dir) supplies the
+                // largest face's box — the automatic sibling of the drawn one. Neither a
+                // model nor a face leaves `None` and the legacy whole-document mesh runs.
+                let face_box = roi.or_else(|| {
+                    ctx.stage(0.4, 0.45, "Finding faces", |_| {
+                        with_doc_sampler(&doc, target, sample_all, |smp, d| {
+                            let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::detect::DETECT_SIDE * photocraft_ml::detect::DETECT_SIDE);
+                            let img = smp.rgb_scaled(d.bounds(), step);
+                            let face = photocraft_ml::detect::detect_faces(&img.px, img.w, img.h)?.first().copied()?;
+                            let (sw, sh) = (img.w as f32, img.h as f32);
+                            Some(photocraft_geom::Rect::new(
+                                (face.x0 / sw * dw as f32) as i32,
+                                (face.y0 / sh * dh as f32) as i32,
+                                (face.x1 / sw * dw as f32).ceil() as i32,
+                                (face.y1 / sh * dh as f32).ceil() as i32,
+                            ))
+                        })
+                    })
+                });
                 // The box path's mesh runs first: its oval ring defines the crop the parsing
                 // stage then reads (both models want the face-dominant crop — see `roi`). Two
-                // passes, because the user's box is only a guess at the face: the first over
-                // the box margin-expanded, the second over the ring's box, so a loose box
-                // still hands the mesh a face-dominant crop. A wrong box fails loudly here
-                // rather than building layers from a garbage mesh.
-                let boxed = match roi {
+                // passes, because a box is only a guess at the face: the first over the box
+                // margin-expanded, the second over the ring's box, so a loose box still hands
+                // the mesh a face-dominant crop. A drawn box that fails the gate errors the
+                // run (the user asked for that face); the automatic one falls back to the
+                // legacy whole-document mesh — the box stages are an improvement, not a
+                // requirement.
+                let boxed = match face_box {
                     Some(r) => {
                         let no_face = || EngineError::Other("no face found in the box — draw it tighter around the face".into());
                         let first = expanded(r, dw, dh, BOX_MARGIN);
-                        let pts = ctx.stage(0.4, 0.55, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, first)).ok_or_else(no_face)?;
-                        let ring = expanded(oval_box(&pts).ok_or_else(no_face)?, dw, dh, RING_MARGIN);
-                        if ring.width() < MIN_FACE_SIDE as u32 || ring.height() < MIN_FACE_SIDE as u32 {
-                            return Err(no_face());
+                        let pts = ctx.stage(0.45, 0.55, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, first));
+                        let ring = pts.and_then(|pts| {
+                            let ring = expanded(oval_box(&pts)?, dw, dh, RING_MARGIN);
+                            (ring.width() >= MIN_FACE_SIDE as u32 && ring.height() >= MIN_FACE_SIDE as u32).then_some(ring)
+                        });
+                        match ring {
+                            Some(ring) => match ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)) {
+                                Some(pts) => Some((pts, ring)),
+                                None if roi.is_some() => return Err(no_face()),
+                                None => None,
+                            },
+                            None if roi.is_some() => return Err(no_face()),
+                            None => None,
                         }
-                        let pts = ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)).ok_or_else(no_face)?;
-                        Some((pts, ring))
                     }
                     None => None,
                 };
@@ -614,7 +643,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Smart Portrait…",
             menu: &["Layer", "New Adjustment Layer"],
             shortcut: None,
-            params: r##"{"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none,"skinRadius":1..100=10,"skinThreshold":2..255=18,"enhanceFace":bool=false,"hairHue":-180..180=0,"hairSaturation":-100..100=0,"lipHue":0..360=330,"lipSaturation":0..100=30,"eyeBrighten":0..50=12,"blushHue":0..360=350,"blushSaturation":0..100=20,"shadowHue":0..360=30,"shadowSaturation":0..100=25,"hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions and the GFPGAN restoration — then adds a named group of standard adjustment layers masked to them: smoothing, hair and lip colour, eye brighten, the person grade; one history step. `roi` is the user-drawn face box (document pixels): the mesh and parsing stages run inside it — the face-dominant crop both models assume — and a box too small or whose clipped/degenerate mesh answer fails the gate errors with `no face found in the box` (a textured non-face still passes geometrically; rejecting that is a detector's job). The colour-match `reference` path and `referenceStats` are protocol-only, not dialog rows)"##,
+            params: r##"{"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none,"skinRadius":1..100=10,"skinThreshold":2..255=18,"enhanceFace":bool=false,"hairHue":-180..180=0,"hairSaturation":-100..100=0,"lipHue":0..360=330,"lipSaturation":0..100=30,"eyeBrighten":0..50=12,"blushHue":0..360=350,"blushSaturation":0..100=20,"shadowHue":0..360=30,"shadowSaturation":0..100=25,"hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions and the GFPGAN restoration — then adds a named group of standard adjustment layers masked to them: smoothing, hair and lip colour, eye brighten, the person grade; one history step. `roi` is the user-drawn face box (document pixels): the mesh and parsing stages run inside it — the face-dominant crop both models assume — and a box too small or whose clipped/degenerate mesh answer fails the gate errors with `no face found in the box`. Without `roi` the SCRFD detector (`facedetector.onnx` in the models dir) finds the largest face and boxes it the same way; no detector or no face leaves the whole-document analysis. The colour-match `reference` path and `referenceStats` are protocol-only, not dialog rows)"##,
             enabled,
             run,
             journal: true,

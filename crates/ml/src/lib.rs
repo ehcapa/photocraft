@@ -173,6 +173,10 @@ pub mod models;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod parsing;
 
+/// SCRFD face detection: the automatic face box (native only, tract tier).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod detect;
+
 mod resample;
 
 #[cfg(test)]
