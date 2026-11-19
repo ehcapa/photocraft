@@ -141,3 +141,31 @@ FASHN human parser 明确不引入(NVIDIA 非商用 + 专有训练数据,见
 
 **后果。** 区域选区全集封顶为八类(见上条);要解锁四细类只能换可信导出或自训,
 记录在案避免重复验证。
+
+## 2026-11-20: select.region 质量重建——softmax 归位、body 采样收缩、Face/Cheeks 改宗 parsing
+
+**背景。** 两张真实人像验收 select.region:body 类区域(skin/hair/clothes)全线
+崩坏——无结构色块、椒盐、方形接缝、锈色围巾高置信误判;Face 是 mesh 几何椭圆,
+Cheeks 是颊点直立椭圆,精修不可用。逐阶段 mask 落盘(region_dump_diagnostic)
++ 窗口置信度探针(body_confidence_probe)定位。
+
+**决策。**
+
+- **softmax 归我们**:selfiemulticlass 导出输出 raw logits(探针实测 −1.7…3.8),
+  spike 的"已烘焙"结论作废;`body_probs` 跨类 softmax + 契约测试(0..=1、六类和 1)。
+  实测修复后围巾 mean 0.304 vs 脸 0.900——地板从此有意义。
+- **body 阶段收缩**:按 person matte bbox(×1.25)裁剪采样,不再全文档(治全景
+  小人物已知边界);0.5→0.75 线性置信地板;连通域小组件抑制(<2% 最大组件且
+  <16px);Skin/Hair 在 mesh ring 内让位 parsing(杀双源拼接直边)。
+- **Face 改宗 parsing**:CelebAMask skin 平面即发际线级脸皮肤,hull 仅在 parsing
+  无 skin 时兜底;**Cheeks 同宗**——parsing skin × 颊带(眼线下 18% 起、嘴线上
+  8% 止)− 眼环/唇环 − 鼻列(内 70% 平零、外 30% smoothstep),椭圆退兜底。
+  依据:2026-11-19 已证该导出细类不可信,但 1(skin)可信且边界质量最高。
+- **验收方法学**:env 门控诊断测试(逐区域 PNG+JSON、窗口探针)+ PIL 叠加图
+  人审,替代"瞟几个 confident 像素"。
+
+**后果。** 两张验收图:skin 0.219→0.091(围巾大 blob 消失、头发/大衣/背景干净),
+face 变像素级发际线追踪,cheeks 双颊独立 patch 鼻/眼/唇全排除;残留为模型级
+(围巾 0.908 高置信像素、身体皮肤在小人脸图上仍低于地板)——下一档是 SCHP
+(ATR-18/LIP-20,512²,scarf/upper-clothes 独立类;其 arm/leg 为几何部位类的
+映射坑 spike 时验),Sapiens 0.3B(ort 档)列第二梯队。

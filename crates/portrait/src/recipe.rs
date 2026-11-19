@@ -22,7 +22,8 @@ pub enum Region {
     /// The eyelids above the eyes: the eyeshadow area, the eye ring scaled up and clipped.
     Eyelids,
     Lips,
-    /// The cheek ellipses at FaceMesh's cheek points: the blush area.
+    /// The cheeks: the parsing's skin banded and feature-excluded when the model
+    /// answered, the FaceMesh cheek-point ellipses otherwise — the blush area either way.
     Cheeks,
     Clothes,
     Background,
