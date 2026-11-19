@@ -291,6 +291,21 @@ fn wand(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         let result = app.run("select.subject", serde_json::json!({ "mode": mode }));
         crate::retouch_ui::report_smart_result(app, result, tl!("No subject found — try Object Selection or the Lasso"));
     }
+    // The hair tier: FeyNoBg's alpha as a live soft selection (ort builds with the model
+    // placed only; ~10s and GB-scale memory, hence its own ask, never the default). When the
+    // tier cannot run the standard line answers with "matting": false and the status says so.
+    let hair = Button::new(label("Select Subject (Hair)")).show(ui);
+    if clicked(&hair.response) {
+        let mode = crate::tool_feedback::click_mode(app, Tool::MagicWand, app.ui.selection_mode, ui.ctx().input(|i| i.modifiers));
+        let result = app.run("select.subject", serde_json::json!({ "mode": mode, "matting": true }));
+        if let Ok(ref v) = result
+            && v.get("matting") == Some(&serde_json::Value::Bool(false))
+        {
+            app.ui.status = tl!("Hair tier unavailable — used the standard model (needs the ort build with feynobg.onnx)").to_string();
+            app.ui.status_error = false;
+        }
+        crate::retouch_ui::report_smart_result(app, result, tl!("No subject found — try Object Selection or the Lasso"));
+    }
     // The face entry: the drawn selection — any selection tool's — is the face box the
     // portrait pipeline crops its mesh and parsing stages to; with no selection the detector
     // finds the face itself. It opens the recipe dialog scoped to that box (the `roi` rides

@@ -477,12 +477,74 @@ impl SubjectCache {
     }
 }
 
+/// The matte tier's person mask: FeyNoBg's alpha (feature `ort`, `feynobg.onnx` in the models
+/// dir plus `ORT_DYLIB_PATH`) resampled to document resolution — hair edges as live 8-bit
+/// selection values, no seed and no min-cut. `None` when the tier cannot run (a build without
+/// the feature, the model or the dylib missing); callers fall back to the standard line and
+/// say so. Heavy on purpose: ~10s and GB-scale memory per matte, which is why it is its own
+/// ask and never the default.
+fn subject_matte(doc: &std::sync::Arc<Document>, target: Option<LayerId>, all_layers: bool) -> Option<photocraft_raster::Surface> {
+    let matte = with_doc_sampler(doc, target, all_layers, |smp, d| {
+        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::MATTING_SIDE * photocraft_ml::MATTING_SIDE);
+        let img = smp.rgb_scaled(d.bounds(), step);
+        photocraft_ml::person_matte(&img.px, img.w, img.h)
+    })?;
+    let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
+    let up = photocraft_ml::resize_mask(&matte.px, matte.w, matte.h, dw, dh)?;
+    let mut surface = photocraft_raster::Surface::with_default(photocraft_color::PixelFormat::GRAY8, &[0.0]);
+    surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
+    Some(surface)
+}
+
+/// [`apply`] for a soft surface: the matte's alpha becomes the selection directly, combined
+/// with the current one by `m` exactly like Quick Selection combines its surface.
+fn apply_surface(s: &mut Session, label: &str, surface: &photocraft_raster::Surface, m: SelectionMode) -> Result<Value> {
+    let bounds = surface.content_bounds();
+    if bounds.is_empty() {
+        return apply(s, label, None, m);
+    }
+    let selected = s.edit(label, |doc, _| {
+        let empty = photocraft_raster::Surface::new(photocraft_color::PixelFormat::GRAY8);
+        let old = doc.selection.as_ref().unwrap_or(&empty);
+        let area = old.content_bounds().union(&bounds).intersect(&doc.bounds());
+        let out = match m {
+            SelectionMode::Replace => surface.clone(),
+            SelectionMode::Add => photocraft_algo::selection::combine_sparse(old, surface, area, f32::max),
+            SelectionMode::Subtract => photocraft_algo::selection::combine_sparse(old, surface, area, |a, b| (a - b).max(0.0)),
+            SelectionMode::Intersect => photocraft_algo::selection::combine_surfaces(old, surface, area, f32::min),
+        };
+        doc.selection = (!out.content_bounds().is_empty()).then_some(out);
+        Ok(doc.selection.is_some())
+    })?;
+    Ok(json!({"selected": selected, "changed": true, "bounds": [bounds.x0, bounds.y0, bounds.width(), bounds.height()]}))
+}
+
 fn select_subject(s: &mut Session, p: &Value) -> Result<Value> {
     // The selected layer's pixels; the composite only when no pixel layer is selected.
     let all_layers = b(p, "sampleAllLayers", false);
     let d = s.active().ok_or(EngineError::NoDocument)?;
     // What `with_doc_sampler` samples: the active layer's pixels, else the composite.
     let target = d.active_layer.filter(|id| !all_layers && d.doc.layer(*id).and_then(Layer::surface).is_some());
+    // The hair tier asks first. It never touches the subject cache (its answer is a different
+    // tier's), and when it cannot run the standard line takes over with a `"matting": false`
+    // note the caller can surface.
+    if b(p, "matting", false) {
+        let doc = std::sync::Arc::clone(&d.doc);
+        if let Some(matte) = subject_matte(&doc, target, all_layers) {
+            return apply_surface(s, "Select Subject (Hair)", &matte, mode(p, "replace"));
+        }
+        let mut out = standard_subject(s, target, all_layers, mode(p, "replace"))?;
+        if let Value::Object(map) = &mut out {
+            map.insert("matting".into(), false.into());
+        }
+        return Ok(out);
+    }
+    standard_subject(s, target, all_layers, mode(p, "replace"))
+}
+
+/// The standard subject line over `target` (the cached seed + min-cut region), as one edit.
+fn standard_subject(s: &mut Session, target: Option<LayerId>, all_layers: bool, m: SelectionMode) -> Result<Value> {
+    let d = s.active().ok_or(EngineError::NoDocument)?;
     let c = &s.subject_cache;
     let hit = c.target == target && c.doc.upgrade().is_some_and(|old| crate::layer_multi_cmds::same_pixels(&old, &d.doc));
     let region = if hit {
@@ -497,7 +559,7 @@ fn select_subject(s: &mut Session, p: &Value) -> Result<Value> {
         s.subject_cache = SubjectCache { doc: std::sync::Arc::downgrade(&doc), doc_id: Some(doc.id), target, region: region.clone() };
         region
     };
-    let out = apply(s, "Select Subject", region.as_deref(), mode(p, "replace"))?;
+    let out = apply(s, "Select Subject", region.as_deref(), m)?;
     // Follow the document past the selection edit just made (same pixels), so a short history
     // dropping the older state doesn't turn the next repeat into a miss.
     if let Some(d) = s.active()
@@ -712,7 +774,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.subject",
             "Subject",
             ["Select"],
-            r##"{"sampleAllLayers":bool=false,"mode":"replace|add|subtract|intersect"="replace"} (samples the selected layer; the composite when no pixel layer is selected)"##,
+            r##"{"sampleAllLayers":bool=false,"mode":"replace|add|subtract|intersect"="replace","matting":bool=false} (samples the selected layer; the composite when no pixel layer is selected. matting: the FeyNoBg hair tier — feature `ort` plus `feynobg.onnx` and `ORT_DYLIB_PATH` — its alpha becomes a live soft selection, no min-cut; when it cannot run the standard line answers with `"matting": false` so the caller can say so)"##,
             has_doc,
             select_subject
         ),

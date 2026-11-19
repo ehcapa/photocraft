@@ -711,3 +711,48 @@ fn refine_edge_rejects_excessive_scratch_before_changing_selection() {
     assert!(error.to_string().contains("not enough memory"), "{error}");
     assert_eq!(s.active().unwrap().doc.selection, before);
 }
+
+/// The matte tier's soft selection: `apply_surface` keeps the alpha's fractional values and
+/// combines by mode. The command-level fallback is covered below; the surface path is driven
+/// directly because it needs the ort build to answer.
+#[test]
+fn apply_surface_keeps_soft_alpha_and_combines_by_mode() {
+    let (mut s, _) = disc(8);
+    let (w, h) = (200u32, 160u32);
+    let mut vals = vec![0.0f32; (w * h) as usize];
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            vals[(y * w as i32 + x) as usize] = match x {
+                0..=100 => 0.75,
+                101..=105 => 0.3,
+                _ => 0.0,
+            };
+        }
+    }
+    let mut matte = photocraft_raster::Surface::with_default(photocraft_color::PixelFormat::GRAY8, &[0.0]);
+    matte.write_region(photocraft_geom::Rect::new(0, 0, w as i32, h as i32), &vals);
+    let r = apply_surface(&mut s, "Select Subject (Hair)", &matte, SelectionMode::Replace).unwrap();
+    assert_eq!(r["changed"], true);
+    assert!((cov(&s, 50, 80) - 0.75).abs() < 1e-3, "the soft value survives as selection alpha");
+    assert_eq!(cov(&s, 150, 80), 0.0, "outside stays unselected");
+    // Subtract cancels the covered half; add brings it back.
+    apply_surface(&mut s, "Select Subject (Hair)", &matte, SelectionMode::Subtract).unwrap();
+    assert!(cov(&s, 50, 80) < 1e-3, "0.75 − 0.75");
+    apply_surface(&mut s, "Select Subject (Hair)", &matte, SelectionMode::Add).unwrap();
+    assert!((cov(&s, 50, 80) - 0.75).abs() < 1e-3, "max(0, 0.75)");
+}
+
+/// `matting: true` without the ort tier falls back to the standard subject line and says so
+/// in the result; with the tier answering (an ort build with the model placed) any changed
+/// answer is as asked.
+#[test]
+fn subject_matting_falls_back_to_the_standard_line_with_a_note() {
+    let (mut s, inside) = disc(8);
+    let r = s.execute("select.subject", json!({"matting": true})).unwrap();
+    match r.get("matting") {
+        Some(serde_json::Value::Bool(false)) => {
+            assert!(sel_iou(&s, 200, 160, |x, y| inside(x, y)) >= 0.75, "the standard line selected the disc");
+        }
+        _ => assert_eq!(r["changed"], true, "the matte tier answered"),
+    }
+}
