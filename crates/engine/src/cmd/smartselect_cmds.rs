@@ -571,6 +571,45 @@ fn standard_subject(s: &mut Session, target: Option<LayerId>, all_layers: bool, 
     Ok(out)
 }
 
+/// `select.region`: one region of the person analysis as a soft selection. The analysis is
+/// Smart Portrait's own (the subject line, the mesh, the face parsing, the whole-body
+/// segmentation) — the first ask pays it (seconds, the standard subject line), and the
+/// pixel-keyed cache then serves every other region instantly, Smart Portrait included. The
+/// selection keeps the mask's fractional values: hair edges arrive as live alpha.
+fn select_region(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = p.get("region").and_then(Value::as_str).ok_or_else(|| bad("select.region", "needs a region: skin, face, hair, eyes, eyelids, lips, cheeks or clothes"))?;
+    let region = match name {
+        "skin" => photocraft_portrait::Region::Skin,
+        "face" => photocraft_portrait::Region::Face,
+        "hair" => photocraft_portrait::Region::Hair,
+        "eyes" => photocraft_portrait::Region::Eyes,
+        "eyelids" => photocraft_portrait::Region::Eyelids,
+        "lips" => photocraft_portrait::Region::Lips,
+        "cheeks" => photocraft_portrait::Region::Cheeks,
+        "clothes" => photocraft_portrait::Region::Clothes,
+        other => return Err(bad("select.region", &format!("unknown region {other:?}"))),
+    };
+    let all_layers = b(p, "sampleAllLayers", false);
+    // The document Arc outlives the state borrow so the cache store can take the session.
+    let (doc, analysis) = {
+        let d = s.active().ok_or(EngineError::NoDocument)?;
+        let target = d.active_layer.filter(|id| !all_layers && d.doc.layer(*id).and_then(Layer::surface).is_some());
+        match s.portrait_cache.get(&d.doc, crate::layer_multi_cmds::same_pixels) {
+            Some(hit) => (std::sync::Arc::clone(&d.doc), hit),
+            None => {
+                // A detached job context: the stages run, their progress goes nowhere —
+                // Select Subject's precedent of a synchronous, progress-less ML selection.
+                let ctx = crate::jobs::JobCtx::new();
+                let analysis = crate::portrait_cmds::analyze_person(&d.doc, target, all_layers, None, &ctx)?;
+                (std::sync::Arc::clone(&d.doc), analysis)
+            }
+        }
+    };
+    s.portrait_cache.store(&doc, (*analysis).clone());
+    let mask = analysis.mask(region).ok_or_else(|| EngineError::Other(format!("no {name} region — no person found")))?;
+    apply_surface(s, "Select Region", mask, mode(p, "replace"))
+}
+
 fn focus_area(s: &mut Session, p: &Value) -> Result<Value> {
     let (range, noise) = (f(p, "range", 0.5).clamp(0.0, 1.0), f(p, "noise", 0.0).clamp(0.0, 1.0));
     let region = with_sampler(s, b(p, "sampleAllLayers", true), |smp, doc| focus::focus_area(smp, doc.bounds(), range, noise))?;
@@ -785,6 +824,14 @@ pub fn specs() -> Vec<CommandSpec> {
             r##"{"radius":px=0,"smartRadius":bool=false,"smooth":0..100=0,"feather":px=0,"contrast":0..100=0,"shiftEdge":-100..100=0,"decontaminate":bool=false,"amount":0..100=100,"output":"selection|layerMask|newLayer|newLayerWithMask|newDocument|newDocumentWithMask"="selection","sampleAllLayers":bool=false,"refineStrokes":[{"points":[[x,y],…],"size":px=30,"mode":"add|subtract"="add"},…]=[],"edits":[{"tool":"quick","points":[[x,y],…],"size":px=30,"mode":"add|subtract"="add","sampleAllLayers":bool=false} | {"tool":"brush","points":[[x,y],…],"size":px=30,"hardness":0..100=100,"mode":"add|subtract"="add"} | {"tool":"lasso","points":[[x,y],…≥3],"mode":"add|subtract"="add"} | {"tool":"object","rect":[x,y,w,h] | "point":[x,y],"mode":"add|subtract"="add","sampleAllLayers":bool=false} | {"tool":"subject","mode":"replace|add|subtract"="replace","sampleAllLayers":bool=true} | {"tool":"clear"} | {"tool":"invert"},…]=[]} (refineStrokes: the Refine Edge Brush, in painting order: add refines the painted area from the image, subtract keeps the original edge there; edits: the workspace's Quick Selection, Brush, Lasso, Object Selection, Select Subject, Clear Selection and Invert, applied in order to the selection before its edge is refined)"##,
             has_selection_or_mask,
             refine_edge
+        ),
+        spec!(
+            "select.region",
+            "Region…",
+            ["Select"],
+            r##"{"region":"skin|face|hair|eyes|eyelids|lips|cheeks|clothes","mode":"replace|add|subtract|intersect"="replace","sampleAllLayers":bool=false} (one region of the person analysis — the same analysis Smart Portrait builds: the subject line, the mesh, the face parsing, the whole-body segmentation — as a soft selection whose fractional values stay live. The first ask pays the analysis; the pixel-keyed cache then serves every other region instantly)"##,
+            has_doc,
+            select_region
         ),
         spec!(
             "select.focusArea",

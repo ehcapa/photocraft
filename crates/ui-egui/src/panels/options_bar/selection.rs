@@ -6,7 +6,7 @@ use craft::behavior::PixelSize;
 use craft::behavior::geometry::{Constraint, SelectionOperation};
 use craft::imaging::ui::select::{SelectionOpWords, selection_operations};
 use craft::ui::bars::ConstraintFields;
-use craft::ui::buttons::{Button, ToggleButton};
+use craft::ui::buttons::{Button, SplitButton, ToggleButton};
 use craft::ui::choice::{Checkbox, Segmented};
 use craft::ui::contract::{Bind, Entry, Props as _, Show as _, ShowContainer as _, SideLabel, Sizing, clicked};
 use craft::ui::display::{Divider, Shade, Text};
@@ -308,6 +308,33 @@ fn smart_selection(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) {
             app.ui.status = error;
             app.ui.status_error = true;
         }
+    }
+    // The person regions, the same analysis Smart Portrait builds, as quick selections: the
+    // main part reruns the last-picked region, the arrow lists them all. The first ask pays
+    // the analysis; the pixel cache then serves the rest instantly.
+    let regions: [Entry<&'static str>; 8] = [
+        Entry::new("skin", label("Skin")),
+        Entry::new("face", label("Face")),
+        Entry::new("hair", label("Hair")),
+        Entry::new("eyes", label("Eyes")),
+        Entry::new("eyelids", label("Eyelids")),
+        Entry::new("lips", label("Lips")),
+        Entry::new("cheeks", label("Cheeks")),
+        Entry::new("clothes", label("Clothes")),
+    ];
+    let picked = SplitButton::new(label("Select Region"), &regions).arrow_label(label("Person regions")).show(ui);
+    let run_region = |app: &mut PhotocraftApp, region: String| {
+        let mode = crate::tool_feedback::click_mode(app, Tool::MagicWand, app.ui.selection_mode, app.ctx().input(|i| i.modifiers));
+        let result = app.run("select.region", serde_json::json!({ "region": region, "mode": mode }));
+        crate::retouch_ui::report_smart_result(app, result, tl!("No person region found — try Select Subject first"));
+    };
+    if let Some(region) = picked.chosen {
+        app.ui.tool_options.region_pick = region.to_owned();
+        let region = app.ui.tool_options.region_pick.clone();
+        run_region(app, region);
+    } else if clicked(&picked.response) {
+        let region = app.ui.tool_options.region_pick.clone();
+        run_region(app, region);
     }
 }
 

@@ -402,6 +402,160 @@ fn person_gated(mask: &photocraft_raster::Surface, person: &photocraft_raster::S
     Some(out)
 }
 
+/// The person analysis of `doc` — the portrait pipeline's own stages, extracted so the
+/// selection tools can consume the same regions: the subject/matte, the mesh (the `roi`'s
+/// box or the detector's, else the whole document), the face-crop parsing and the
+/// whole-body segmentation. `ctx` carries the progress; `select.region` passes a fresh
+/// detached one, whose stages run silently. The drawn-`roi` failure is loud (the user asked
+/// for that face); with `roi` absent every stage degrades quietly.
+pub(crate) fn analyze_person(
+    doc: &Arc<Document>,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    roi: Option<photocraft_geom::Rect>,
+    ctx: &crate::jobs::JobCtx,
+) -> Result<Arc<photocraft_portrait::Analysis>> {
+    // The ort matte (feature "ort" + feynobg.onnx in the models dir) replaces the
+    // whole subject line when it answers: direct hair-edge alpha at 1024², no
+    // seed/GrabCut. Without it (the default build, or no model placed) the
+    // subject line runs as before.
+    let matte = ctx.stage(0.05, 0.25, "Matting person", |_| {
+        with_doc_sampler(doc, target, sample_all, |smp, d| {
+            let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::MATTING_SIDE * photocraft_ml::MATTING_SIDE);
+            let img = smp.rgb_scaled(d.bounds(), step);
+            photocraft_ml::person_matte(&img.px, img.w, img.h)
+        })
+    });
+    let person = if let Some(matte) = matte {
+        ctx.check().map_err(|_| EngineError::Cancelled)?;
+        let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
+        let up = photocraft_ml::resize_mask(&matte.px, matte.w, matte.h, dw, dh).ok_or_else(|| EngineError::Other("the matte would not resample".into()))?;
+        let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+        surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
+        surface
+    } else {
+        // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
+        let found = ctx
+            .stage(0.25, 0.4, "Finding person", |ctl| {
+                with_doc_sampler(doc, target, sample_all, |smp, d| {
+                    let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
+                    subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
+                })
+            })
+            .map_err(|_| EngineError::Cancelled)?;
+        let region = found.ok_or_else(|| EngineError::Other("no person found".into()))?;
+        matting::region_surface(&region)
+    };
+    let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
+    analysis.set(photocraft_portrait::Region::Person, person.clone());
+    let (dw, dh) = (doc.size.width, doc.size.height);
+    // The box the mesh and parsing crop to: the user's `roi` wins; without one
+    // the detector (SCRFD, `facedetector.onnx` in the models dir) supplies the
+    // largest face's box — the automatic sibling of the drawn one. Neither a
+    // model nor a face leaves `None` and the legacy whole-document mesh runs.
+    let face_box = roi.or_else(|| {
+        ctx.stage(0.4, 0.45, "Finding faces", |_| {
+            with_doc_sampler(doc, target, sample_all, |smp, d| {
+                let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::detect::DETECT_SIDE * photocraft_ml::detect::DETECT_SIDE);
+                let img = smp.rgb_scaled(d.bounds(), step);
+                let face = photocraft_ml::detect::detect_faces(&img.px, img.w, img.h)?.first().copied()?;
+                let (sw, sh) = (img.w as f32, img.h as f32);
+                Some(photocraft_geom::Rect::new(
+                    (face.x0 / sw * dw as f32) as i32,
+                    (face.y0 / sh * dh as f32) as i32,
+                    (face.x1 / sw * dw as f32).ceil() as i32,
+                    (face.y1 / sh * dh as f32).ceil() as i32,
+                ))
+            })
+        })
+    });
+    // The box path's mesh runs first: its oval ring defines the crop the parsing
+    // stage then reads (both models want the face-dominant crop — see `roi`). Two
+    // passes, because a box is only a guess at the face: the first over the box
+    // margin-expanded, the second over the ring's box, so a loose box still hands
+    // the mesh a face-dominant crop. A drawn box that fails the gate errors the
+    // run (the user asked for that face); the automatic one falls back to the
+    // legacy whole-document mesh — the box stages are an improvement, not a
+    // requirement.
+    let boxed = match face_box {
+        Some(r) => {
+            let no_face = || EngineError::Other("no face found in the box — draw it tighter around the face".into());
+            let first = expanded(r, dw, dh, BOX_MARGIN);
+            let pts = ctx.stage(0.45, 0.55, "Finding landmarks", |_| mesh_over(doc, target, sample_all, first));
+            let ring = pts.and_then(|pts| {
+                let ring = expanded(oval_box(&pts)?, dw, dh, RING_MARGIN);
+                (ring.width() >= MIN_FACE_SIDE as u32 && ring.height() >= MIN_FACE_SIDE as u32).then_some(ring)
+            });
+            match ring {
+                Some(ring) => match ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)) {
+                    Some(pts) => Some((pts, ring)),
+                    None if roi.is_some() => return Err(no_face()),
+                    None => None,
+                },
+                None if roi.is_some() => return Err(no_face()),
+                None => None,
+            }
+        }
+        None => None,
+    };
+    // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
+    // skin/hair/clothes masks join the person mask; without one the slice is the
+    // person alone and every layer but the first stays out. The whole-body
+    // segmentation (`selfiemulticlass.onnx`, ~50ms) runs over the document — no
+    // crop; its nature is full-image — and its classes UNION into the regions the
+    // face-crop parsing set: body-skin and face-skin into Skin (so the smoothing
+    // layer covers the arms and neck, not only the face), hair and clothes into
+    // their regions.
+    let (parse_lo, parse_hi) = if boxed.is_some() { (0.6, 0.65) } else { (0.4, 0.65) };
+    let (regions, body) = ctx.stage(parse_lo, parse_hi, "Parsing regions", |_| {
+        let regions = parsing_regions(doc, target, sample_all, &person, boxed.as_ref().map(|(_, r)| *r));
+        let body = body_regions(doc, target, sample_all, &person);
+        (regions, body)
+    });
+    for (region, mask) in regions {
+        analysis.set(region, mask);
+    }
+    for (region, mask) in body {
+        analysis.union(region, mask);
+    }
+    // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
+    // region comes from the landmark ring's hull, gated by the person like the
+    // parsing regions. The box path already ran its mesh; the whole-document
+    // path samples toward 256² and rides the points to document pixels.
+    let mesh = match &boxed {
+        Some((pts, _)) => Some(pts.clone()),
+        None => ctx.stage(0.65, 0.7, "Finding landmarks", |_| mesh_over(doc, target, sample_all, doc.bounds())),
+    };
+    if let Some(pts) = mesh {
+        analysis.landmarks = pts;
+        if let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
+        {
+            analysis.set(photocraft_portrait::Region::Face, gated);
+        }
+        // The eye and lip rings: the parsing export reads them as skin, so the
+        // landmark rings are their regions (person-gated like every other).
+        if let Some((eyes, lips)) = photocraft_portrait::face::feature_masks(&analysis.landmarks, dw, dh) {
+            for (region, mask) in [(photocraft_portrait::Region::Eyes, eyes), (photocraft_portrait::Region::Lips, lips)] {
+                if let Some(gated) = person_gated(&mask, &person, dw, dh) {
+                    analysis.set(region, gated);
+                }
+            }
+        }
+        // The makeup geometry: cheek ellipses and scaled eye rings, feathered.
+        for (region, mask) in [
+            (photocraft_portrait::Region::Cheeks, photocraft_portrait::face::blush_mask(&analysis.landmarks, dw, dh)),
+            (photocraft_portrait::Region::Eyelids, photocraft_portrait::face::eyeshadow_mask(&analysis.landmarks, dw, dh)),
+        ] {
+            if let Some(mask) = mask
+                && let Some(gated) = person_gated(&mask, &person, dw, dh)
+            {
+                analysis.set(region, gated);
+            }
+        }
+    }
+    Ok(Arc::new(analysis))
+}
+
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let recipe = recipe(p);
     let sample_all = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
@@ -424,146 +578,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             let analysis = if let Some(analysis) = cached {
                 analysis
             } else {
-                // The ort matte (feature "ort" + feynobg.onnx in the models dir) replaces the
-                // whole subject line when it answers: direct hair-edge alpha at 1024², no
-                // seed/GrabCut. Without it (the default build, or no model placed) the
-                // subject line runs as before.
-                let matte = ctx.stage(0.05, 0.25, "Matting person", |_| {
-                    with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::MATTING_SIDE * photocraft_ml::MATTING_SIDE);
-                        let img = smp.rgb_scaled(d.bounds(), step);
-                        photocraft_ml::person_matte(&img.px, img.w, img.h)
-                    })
-                });
-                let person = if let Some(matte) = matte {
-                    ctx.check().map_err(|_| EngineError::Cancelled)?;
-                    let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
-                    let up = photocraft_ml::resize_mask(&matte.px, matte.w, matte.h, dw, dh)
-                        .ok_or_else(|| EngineError::Other("the matte would not resample".into()))?;
-                    let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
-                    surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
-                    surface
-                } else {
-                    // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
-                    let found = ctx
-                        .stage(0.25, 0.4, "Finding person", |ctl| {
-                            with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                                let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
-                                subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
-                            })
-                        })
-                        .map_err(|_| EngineError::Cancelled)?;
-                    let region = found.ok_or_else(|| EngineError::Other("no person found".into()))?;
-                    matting::region_surface(&region)
-                };
-                let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
-                analysis.set(photocraft_portrait::Region::Person, person.clone());
-                let (dw, dh) = (doc.size.width, doc.size.height);
-                // The box the mesh and parsing crop to: the user's `roi` wins; without one
-                // the detector (SCRFD, `facedetector.onnx` in the models dir) supplies the
-                // largest face's box — the automatic sibling of the drawn one. Neither a
-                // model nor a face leaves `None` and the legacy whole-document mesh runs.
-                let face_box = roi.or_else(|| {
-                    ctx.stage(0.4, 0.45, "Finding faces", |_| {
-                        with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                            let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::detect::DETECT_SIDE * photocraft_ml::detect::DETECT_SIDE);
-                            let img = smp.rgb_scaled(d.bounds(), step);
-                            let face = photocraft_ml::detect::detect_faces(&img.px, img.w, img.h)?.first().copied()?;
-                            let (sw, sh) = (img.w as f32, img.h as f32);
-                            Some(photocraft_geom::Rect::new(
-                                (face.x0 / sw * dw as f32) as i32,
-                                (face.y0 / sh * dh as f32) as i32,
-                                (face.x1 / sw * dw as f32).ceil() as i32,
-                                (face.y1 / sh * dh as f32).ceil() as i32,
-                            ))
-                        })
-                    })
-                });
-                // The box path's mesh runs first: its oval ring defines the crop the parsing
-                // stage then reads (both models want the face-dominant crop — see `roi`). Two
-                // passes, because a box is only a guess at the face: the first over the box
-                // margin-expanded, the second over the ring's box, so a loose box still hands
-                // the mesh a face-dominant crop. A drawn box that fails the gate errors the
-                // run (the user asked for that face); the automatic one falls back to the
-                // legacy whole-document mesh — the box stages are an improvement, not a
-                // requirement.
-                let boxed = match face_box {
-                    Some(r) => {
-                        let no_face = || EngineError::Other("no face found in the box — draw it tighter around the face".into());
-                        let first = expanded(r, dw, dh, BOX_MARGIN);
-                        let pts = ctx.stage(0.45, 0.55, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, first));
-                        let ring = pts.and_then(|pts| {
-                            let ring = expanded(oval_box(&pts)?, dw, dh, RING_MARGIN);
-                            (ring.width() >= MIN_FACE_SIDE as u32 && ring.height() >= MIN_FACE_SIDE as u32).then_some(ring)
-                        });
-                        match ring {
-                            Some(ring) => match ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)) {
-                                Some(pts) => Some((pts, ring)),
-                                None if roi.is_some() => return Err(no_face()),
-                                None => None,
-                            },
-                            None if roi.is_some() => return Err(no_face()),
-                            None => None,
-                        }
-                    }
-                    None => None,
-                };
-                // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
-                // skin/hair/clothes masks join the person mask; without one the slice is the
-                // person alone and every layer but the first stays out. The whole-body
-                // segmentation (`selfiemulticlass.onnx`, ~50ms) runs over the document — no
-                // crop; its nature is full-image — and its classes UNION into the regions the
-                // face-crop parsing set: body-skin and face-skin into Skin (so the smoothing
-                // layer covers the arms and neck, not only the face), hair and clothes into
-                // their regions.
-                let (parse_lo, parse_hi) = if boxed.is_some() { (0.6, 0.65) } else { (0.4, 0.65) };
-                let (regions, body) = ctx.stage(parse_lo, parse_hi, "Parsing regions", |_| {
-                    let regions = parsing_regions(&doc, target, sample_all, &person, boxed.as_ref().map(|(_, r)| *r));
-                    let body = body_regions(&doc, target, sample_all, &person);
-                    (regions, body)
-                });
-                for (region, mask) in regions {
-                    analysis.set(region, mask);
-                }
-                for (region, mask) in body {
-                    analysis.union(region, mask);
-                }
-                // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
-                // region comes from the landmark ring's hull, gated by the person like the
-                // parsing regions. The box path already ran its mesh; the whole-document
-                // path samples toward 256² and rides the points to document pixels.
-                let mesh = match &boxed {
-                    Some((pts, _)) => Some(pts.clone()),
-                    None => ctx.stage(0.65, 0.7, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, doc.bounds())),
-                };
-                if let Some(pts) = mesh {
-                    analysis.landmarks = pts;
-                    if let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
-                    {
-                        analysis.set(photocraft_portrait::Region::Face, gated);
-                    }
-                    // The eye and lip rings: the parsing export reads them as skin, so the
-                    // landmark rings are their regions (person-gated like every other).
-                    if let Some((eyes, lips)) = photocraft_portrait::face::feature_masks(&analysis.landmarks, dw, dh) {
-                        for (region, mask) in [(photocraft_portrait::Region::Eyes, eyes), (photocraft_portrait::Region::Lips, lips)] {
-                            if let Some(gated) = person_gated(&mask, &person, dw, dh) {
-                                analysis.set(region, gated);
-                            }
-                        }
-                    }
-                    // The makeup geometry: cheek ellipses and scaled eye rings, feathered.
-                    for (region, mask) in [
-                        (photocraft_portrait::Region::Cheeks, photocraft_portrait::face::blush_mask(&analysis.landmarks, dw, dh)),
-                        (photocraft_portrait::Region::Eyelids, photocraft_portrait::face::eyeshadow_mask(&analysis.landmarks, dw, dh)),
-                    ] {
-                        if let Some(mask) = mask
-                            && let Some(gated) = person_gated(&mask, &person, dw, dh)
-                        {
-                            analysis.set(region, gated);
-                        }
-                    }
-                }
-                Arc::new(analysis)
+                analyze_person(&doc, target, sample_all, roi, ctx)?
             };
             // The restoration first: the GAN redraws skin texture, so the smoothing below
             // runs on the enhanced composite when both are asked for (the DAG's

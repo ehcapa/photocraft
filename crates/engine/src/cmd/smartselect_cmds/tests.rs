@@ -756,3 +756,17 @@ fn subject_matting_falls_back_to_the_standard_line_with_a_note() {
         _ => assert_eq!(r["changed"], true, "the matte tier answered"),
     }
 }
+
+/// `select.region`: the person analysis' regions as selections. Without models the landmark
+/// regions still answer (the mesh is embedded); the second ask reads the pixel cache; an
+/// unmapped region name refuses.
+#[test]
+fn select_region_reads_the_person_analysis() {
+    let (mut s, _) = disc(8);
+    let r = s.execute("select.region", json!({"region": "eyes"})).unwrap();
+    assert_eq!(r["changed"], true, "the eye rings become a selection");
+    let face = s.execute("select.region", json!({"region": "face"})).unwrap();
+    assert_eq!(face["changed"], true, "the face hull becomes a selection");
+    assert!(s.execute("select.region", json!({"region": "nose"})).is_err(), "unmapped regions refuse");
+    assert!(s.execute("select.region", json!({})).is_err(), "a region is required");
+}

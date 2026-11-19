@@ -128,6 +128,23 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
         }
         return result;
     }
+    // Select › Person ▸ …: the menu's stateless region rows, `select.region` with the row's
+    // region and the held modifiers' selection mode.
+    if let Some(region) = id.strip_prefix("select.region.")
+        && matches!(region, "skin" | "face" | "hair" | "eyes" | "eyelids" | "lips" | "cheeks" | "clothes")
+    {
+        let mut mode = None;
+        if let Some(m) = smart_selection_mode(ctx.input(|i| i.modifiers)) {
+            mode = Some(m);
+        }
+        let mut params = json!({ "region": region });
+        if let Some(m) = mode {
+            params["mode"] = json!(m);
+        }
+        let result = app.run("select.region", params);
+        crate::retouch_ui::report_smart_result(app, result.clone(), tl!("No person region found — try Select Subject first"));
+        return result;
+    }
     let revealed = crate::layer_reveal::mark(app);
     let history = crate::panels::history::mark(app);
     let result = invoke_unguarded(app, ctx, id, params);

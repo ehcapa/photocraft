@@ -24,6 +24,9 @@ pub struct ToolOptions {
     /// tier (ort builds with the model placed; ~10s and GB-scale memory, hence an explicit
     /// choice, never the default).
     pub subject_hair: bool,
+    /// Selection tools › Select Region: the region the split button's main part reruns
+    /// (the arrow picks another and it becomes this).
+    pub region_pick: String,
     /// Remove tool: the fill goes to a new layer above the target (Photoshop's Create a new layer).
     pub remove_new_layer: bool,
     /// Remove tool: each stroke is filled when released (Photoshop's default). Off, the strokes
@@ -418,6 +421,7 @@ impl Default for ToolOptions {
             object_finder: true,
             object_hard_edge: true,
             subject_hair: false,
+            region_pick: "skin".into(),
             remove_new_layer: false,
             remove_after_each_stroke: true,
             feather: 0.0,
