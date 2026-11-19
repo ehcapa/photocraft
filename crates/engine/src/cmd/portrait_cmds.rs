@@ -214,28 +214,115 @@ fn reference(p: &Value) -> Option<Either> {
     p.get("reference").and_then(Value::as_str).map(|s| Either::Path(s.into()))
 }
 
+/// How far the two box stages grow their rect: the user's box gets a little slack, and the
+/// mesh's re-run crops the oval ring by more — the mesh wants the face with its context
+/// (MediaPipe's own pipeline crops its detection box about this loose).
+const BOX_MARGIN: f32 = 1.3;
+const RING_MARGIN: f32 = 1.6;
+
+/// A face smaller than this in the tightened crop is not worth layers: the mesh's 256²
+/// input would be almost all upsample, and a garbage answer that passes the plausibility
+/// gate on a speck crop still builds nothing useful.
+const MIN_FACE_SIDE: i32 = 24;
+
+/// The user-drawn face box `[x, y, w, h]` (document pixels): the mesh and parsing stages run
+/// inside it instead of over the whole document. Both models were trained on face-dominant
+/// crops (CelebAMask-HQ is face close-ups; FaceMesh assumes the face fills the frame), so a
+/// face that is a small fraction of the frame collapses — the box is the crop stage the
+/// models are missing, drawn by the one observer who knows where the face is. `None`
+/// without the param, or when the box clips away to nothing.
+fn roi(p: &Value, size: photocraft_geom::Size) -> Option<photocraft_geom::Rect> {
+    let v = p.get("roi")?.as_array()?;
+    let mut n = v.iter().filter_map(Value::as_f64);
+    let (x, y, w, h) = (n.next()?, n.next()?, n.next()?, n.next()?);
+    let r = photocraft_geom::Rect::from_xywh(x.round() as i32, y.round() as i32, w.max(0.0).round() as u32, h.max(0.0).round() as u32)
+        .intersect(&photocraft_geom::Rect::from_size(size));
+    (!r.is_empty()).then_some(r)
+}
+
+/// `r` grown by `factor` about its centre, clamped into `0..w × 0..h` and never empty.
+fn expanded(r: photocraft_geom::Rect, w: u32, h: u32, factor: f32) -> photocraft_geom::Rect {
+    let (cx, cy) = ((r.x0 as f32 + r.x1 as f32) * 0.5, (r.y0 as f32 + r.y1 as f32) * 0.5);
+    let (hw, hh) = (r.width() as f32 * factor * 0.5, r.height() as f32 * factor * 0.5);
+    let (x0, y0) = ((cx - hw).floor().max(0.0) as i32, (cy - hh).floor().max(0.0) as i32);
+    let (x1, y1) = ((cx + hw).ceil().min(w as f32) as i32, (cy + hh).ceil().min(h as f32) as i32);
+    photocraft_geom::Rect::new(x0, y0, x1.max(x0 + 1), y1.max(y0 + 1))
+}
+
+/// The FACE_OVAL ring's bounding box in document pixels — what the first mesh pass says the
+/// face actually is. `None` when the landmarks are too short for the ring.
+fn oval_box(landmarks: &[[f32; 3]]) -> Option<photocraft_geom::Rect> {
+    let mut x0 = f32::MAX;
+    let mut y0 = f32::MAX;
+    let (mut x1, mut y1) = (f32::MIN, f32::MIN);
+    for &i in photocraft_portrait::face::FACE_OVAL {
+        let p = landmarks.get(i)?;
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    (!landmarks.is_empty()).then(|| photocraft_geom::Rect::new(x0 as i32, y0 as i32, x1.max(0.0) as i32, y1.max(0.0) as i32))
+}
+
+/// Whether the mesh's answer looks like a face inside `over`: the oval ring leaves ≥5%
+/// margins on every side (a mesh that found nothing, or a face clipped at the crop's edge,
+/// hugs the border) and spans ≥10% of the crop's larger side (a collapsed answer is a
+/// speck). The box path reports a wrong box loudly instead of building layers from garbage.
+fn plausible(landmarks: &[[f32; 3]], over: photocraft_geom::Rect) -> bool {
+    let Some(b) = oval_box(landmarks) else { return false };
+    let (w, h) = (over.width() as f32, over.height() as f32);
+    let margins = [
+        (b.x0 - over.x0) as f32 / w,
+        (over.x1 - b.x1) as f32 / w,
+        (b.y0 - over.y0) as f32 / h,
+        (over.y1 - b.y1) as f32 / h,
+    ];
+    margins.iter().all(|&m| m >= 0.05) && (b.width() as f32).max(b.height() as f32) / w.max(h) >= 0.1
+}
+
+/// FaceMesh over `area`, the landmarks mapped back to document pixels (the sample is `area`
+/// box-downsampled toward 256²; the mapping is the proportional one the whole-document path
+/// used, generalised to an offset rect). `None` when the mesh does not answer.
+fn mesh_over(doc: &Document, target: Option<photocraft_doc::LayerId>, sample_all: bool, area: photocraft_geom::Rect) -> Option<Vec<[f32; 3]>> {
+    with_doc_sampler(doc, target, sample_all, |smp, _| {
+        let step = photocraft_algo::segment::scale_for(area, photocraft_ml::LANDMARK_SIDE * photocraft_ml::LANDMARK_SIDE);
+        let img = smp.rgb_scaled(area, step);
+        let pts = photocraft_ml::face_landmarks(&img.px, img.w, img.h)?;
+        let (rw, rh) = (area.width() as f32, area.height() as f32);
+        Some(pts.into_iter().map(|p| [p.x / img.w as f32 * rw + area.x0 as f32, p.y / img.h as f32 * rh + area.y0 as f32, p.z]).collect())
+    })
+}
+
 /// The parsing regions of `doc`, upsampled to document resolution and intersected with the
 /// person: the model's per-class probabilities grouped into regions
 /// (`photocraft_portrait::parsing`), each resampled like the subject mask rides back and
 /// clipped to the person the pipeline is about (hair, skin and clothes belong to the
 /// person; on off-distribution input the gate also suppresses stray predictions). Empty
 /// masks stay out — a region with no support anywhere must not produce a layer.
+///
+/// `over` crops the model's input: the box path hands the mesh's tightened face box (the
+/// export's CelebAMask-HQ training set is face close-ups, so the same crop argument as the
+/// mesh's applies). The mask rides back to the crop's size and lands in a full-document
+/// surface at its offset — outside the crop the region is unknown and stays 0.
 fn parsing_regions(
     doc: &Document,
     target: Option<photocraft_doc::LayerId>,
     sample_all: bool,
     person: &photocraft_raster::Surface,
+    over: Option<photocraft_geom::Rect>,
 ) -> Vec<(photocraft_portrait::Region, photocraft_raster::Surface)> {
-    let Some(found) = with_doc_sampler(doc, target, sample_all, |smp, d| {
-        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::PARSING_SIDE * photocraft_ml::PARSING_SIDE);
-        let img = smp.rgb_scaled(d.bounds(), step);
-        photocraft_ml::parsing_probs(&img.px, img.w, img.h)
+    let Some((found, area)) = with_doc_sampler(doc, target, sample_all, |smp, d| {
+        let area = over.unwrap_or_else(|| d.bounds());
+        let step = photocraft_algo::segment::scale_for(area, photocraft_ml::PARSING_SIDE * photocraft_ml::PARSING_SIDE);
+        let img = smp.rgb_scaled(area, step);
+        photocraft_ml::parsing_probs(&img.px, img.w, img.h).map(|p| (p, area))
     }) else {
         return Vec::new();
     };
-    let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
     // Read the person gate per pixel through a LayerMask (that is where `value` lives).
     let person = photocraft_doc::LayerMask { surface: person.clone(), ..photocraft_doc::LayerMask::reveal_all() };
+    let (aw, ah) = (area.width() as usize, area.height() as usize);
     photocraft_portrait::parsing::region_planes(&found.planes, found.w, found.h)
         .into_iter()
         .filter_map(|(region, mask)| {
@@ -243,14 +330,14 @@ fn parsing_regions(
             if support < 0.5 {
                 return None;
             }
-            let mut up = photocraft_ml::resize_mask(&mask, found.w, found.h, dw, dh)?;
-            for y in 0..dh {
-                for x in 0..dw {
-                    up[y * dw + x] *= person.value(x as i32, y as i32);
+            let mut up = photocraft_ml::resize_mask(&mask, found.w, found.h, aw, ah)?;
+            for y in 0..ah {
+                for x in 0..aw {
+                    up[y * aw + x] *= person.value(x as i32 + area.x0, y as i32 + area.y0);
                 }
             }
             let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
-            surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
+            surface.write_region(area, &up);
             Some((region, surface))
         })
         .collect()
@@ -277,7 +364,11 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let recipe = recipe(p);
     let sample_all = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
     let st = s.active().ok_or(EngineError::NoDocument)?;
-    let cached = s.portrait_cache.get(&st.doc, crate::layer_multi_cmds::same_pixels);
+    let roi = roi(p, st.doc.size);
+    // The box path never reads the pixel-keyed cache — a cached analysis is
+    // whole-document (or another box's) — and stores nothing: the next unboxed run must not
+    // inherit this box's crop.
+    let cached = if roi.is_none() { s.portrait_cache.get(&st.doc, crate::layer_multi_cmds::same_pixels) } else { None };
     let doc = Arc::clone(&st.doc);
     let target = st.active_layer;
     let reference = reference(p);
@@ -325,29 +416,45 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 };
                 let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
                 analysis.set(photocraft_portrait::Region::Person, person.clone());
+                let (dw, dh) = (doc.size.width, doc.size.height);
+                // The box path's mesh runs first: its oval ring defines the crop the parsing
+                // stage then reads (both models want the face-dominant crop — see `roi`). Two
+                // passes, because the user's box is only a guess at the face: the first over
+                // the box margin-expanded, the second over the ring's box, so a loose box
+                // still hands the mesh a face-dominant crop. A wrong box fails loudly here
+                // rather than building layers from a garbage mesh.
+                let boxed = match roi {
+                    Some(r) => {
+                        let no_face = || EngineError::Other("no face found in the box — draw it tighter around the face".into());
+                        let first = expanded(r, dw, dh, BOX_MARGIN);
+                        let pts = ctx.stage(0.4, 0.55, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, first)).ok_or_else(no_face)?;
+                        let ring = expanded(oval_box(&pts).ok_or_else(no_face)?, dw, dh, RING_MARGIN);
+                        if ring.width() < MIN_FACE_SIDE as u32 || ring.height() < MIN_FACE_SIDE as u32 {
+                            return Err(no_face());
+                        }
+                        let pts = ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)).ok_or_else(no_face)?;
+                        Some((pts, ring))
+                    }
+                    None => None,
+                };
                 // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
                 // skin/hair/clothes masks join the person mask; without one the slice is the
                 // person alone and every layer but the first stays out.
-                let regions = ctx.stage(0.4, 0.65, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person));
+                let (parse_lo, parse_hi) = if boxed.is_some() { (0.6, 0.65) } else { (0.4, 0.65) };
+                let regions = ctx.stage(parse_lo, parse_hi, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person, boxed.as_ref().map(|(_, r)| *r)));
                 for (region, mask) in regions {
                     analysis.set(region, mask);
                 }
                 // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
                 // region comes from the landmark ring's hull, gated by the person like the
-                // parsing regions. The mesh answers on the sampled image; the points ride to
-                // document pixels before the hull is taken.
-                let mesh = ctx.stage(0.65, 0.7, "Finding landmarks", |_| {
-                    with_doc_sampler(&doc, target, sample_all, |smp, d| {
-                        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::LANDMARK_SIDE * photocraft_ml::LANDMARK_SIDE);
-                        let img = smp.rgb_scaled(d.bounds(), step);
-                        let pts = photocraft_ml::face_landmarks(&img.px, img.w, img.h)?;
-                        let (sw, sh) = (img.w as f32, img.h as f32);
-                        Some((pts, sw, sh))
-                    })
-                });
-                if let Some((pts, sw, sh)) = mesh {
-                    analysis.landmarks = pts.iter().map(|p| [p.x / sw * doc.size.width as f32, p.y / sh * doc.size.height as f32, p.z]).collect();
-                    let (dw, dh) = (doc.size.width, doc.size.height);
+                // parsing regions. The box path already ran its mesh; the whole-document
+                // path samples toward 256² and rides the points to document pixels.
+                let mesh = match &boxed {
+                    Some((pts, _)) => Some(pts.clone()),
+                    None => ctx.stage(0.65, 0.7, "Finding landmarks", |_| mesh_over(&doc, target, sample_all, doc.bounds())),
+                };
+                if let Some(pts) = mesh {
+                    analysis.landmarks = pts;
                     if let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
                     {
                         analysis.set(photocraft_portrait::Region::Face, gated);
@@ -418,7 +525,10 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             let group = materialize(s, &plan, &analysis, &products)?;
             // Keyed to the post-edit document, past this edit's own cache reset (the same
             // re-point Select Subject does); an intervening edit still invalidates by pixels.
-            if let Some(doc) = s.active().map(|st| Arc::clone(&st.doc)) {
+            // The box path stays out: its analysis is box-scoped, not the document's.
+            if roi.is_none()
+                && let Some(doc) = s.active().map(|st| Arc::clone(&st.doc))
+            {
                 s.portrait_cache.store(&doc, (*analysis).clone());
             }
             Ok(json!({ "group": group.0 }))
@@ -504,7 +614,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Smart Portrait…",
             menu: &["Layer", "New Adjustment Layer"],
             shortcut: None,
-            params: r##"{"sampleAllLayers":bool=false,"skinRadius":1..100=10,"skinThreshold":2..255=18,"enhanceFace":bool=false,"hairHue":-180..180=0,"hairSaturation":-100..100=0,"lipHue":0..360=330,"lipSaturation":0..100=30,"eyeBrighten":0..50=12,"blushHue":0..360=350,"blushSaturation":0..100=20,"shadowHue":0..360=30,"shadowSaturation":0..100=25,"hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions and the GFPGAN restoration — then adds a named group of standard adjustment layers masked to them: smoothing, hair and lip colour, eye brighten, the person grade; one history step. The colour-match `reference` path and `referenceStats` are protocol-only, not dialog rows)"##,
+            params: r##"{"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none,"skinRadius":1..100=10,"skinThreshold":2..255=18,"enhanceFace":bool=false,"hairHue":-180..180=0,"hairSaturation":-100..100=0,"lipHue":0..360=330,"lipSaturation":0..100=30,"eyeBrighten":0..50=12,"blushHue":0..360=350,"blushSaturation":0..100=20,"shadowHue":0..360=30,"shadowSaturation":0..100=25,"hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions and the GFPGAN restoration — then adds a named group of standard adjustment layers masked to them: smoothing, hair and lip colour, eye brighten, the person grade; one history step. `roi` is the user-drawn face box (document pixels): the mesh and parsing stages run inside it — the face-dominant crop both models assume — and a box too small or whose clipped/degenerate mesh answer fails the gate errors with `no face found in the box` (a textured non-face still passes geometrically; rejecting that is a detector's job). The colour-match `reference` path and `referenceStats` are protocol-only, not dialog rows)"##,
             enabled,
             run,
             journal: true,
@@ -639,6 +749,77 @@ mod tests {
         // The store survived its own edit's cache reset (it runs after the edit), so the
         // session holds an entry for this document.
         assert!(s.active().is_some() && s.portrait_cache.get(&s.active().unwrap().doc, |_, _| true).is_some());
+    }
+
+    #[test]
+    fn roi_rounds_clamps_and_drops_empties() {
+        let size = photocraft_geom::Size::new(200, 160);
+        assert_eq!(roi(&json!({"roi": [10.4, 20.5, 50, 40]}), size), Some(Rect::new(10, 21, 60, 61)));
+        // Overshoot clips to the document; outside drops to None.
+        assert_eq!(roi(&json!({"roi": [-30, -30, 500, 500]}), size), Some(Rect::new(0, 0, 200, 160)));
+        assert_eq!(roi(&json!({"roi": [300, 300, 10, 10]}), size), None);
+        assert_eq!(roi(&json!({}), size), None);
+        assert_eq!(roi(&json!({"roi": "nope"}), size), None);
+    }
+
+    #[test]
+    fn expanded_grows_about_the_centre_and_clamps_to_the_document() {
+        assert_eq!(expanded(Rect::new(40, 40, 60, 60), 100, 80, 2.0), Rect::new(30, 30, 70, 70));
+        assert_eq!(expanded(Rect::new(0, 0, 20, 20), 100, 80, 2.0), Rect::new(0, 0, 30, 30));
+        assert_eq!(expanded(Rect::new(90, 70, 100, 80), 100, 80, 2.0), Rect::new(85, 65, 100, 80));
+        // Never empty, even for a degenerate one-pixel input.
+        assert!(!expanded(Rect::new(50, 40, 51, 41), 100, 80, 1.5).is_empty());
+    }
+
+    #[test]
+    fn oval_box_binds_the_ring_and_plausibility_gates_it() {
+        let mut pts = vec![[0.0f32; 3]; 478];
+        for (i, &idx) in photocraft_portrait::face::FACE_OVAL.iter().enumerate() {
+            pts[idx] = [100.0 + i as f32 * 2.0, 120.0 + (i % 20) as f32 * 2.0, 0.0];
+        }
+        let b = oval_box(&pts).unwrap();
+        // 36 ring points: x spans 100..=170, y 120..=158.
+        assert_eq!(b, Rect::new(100, 120, 170, 158));
+        assert!(plausible(&pts, Rect::new(0, 0, 400, 400)), "a centred ring of sane size passes");
+        // The same ring pushed against the crop's edge fails, and a collapsed one is a speck.
+        for p in &mut pts {
+            p[0] += 300.0;
+        }
+        assert!(!plausible(&pts, Rect::new(0, 0, 400, 400)), "an edge-hugging ring fails");
+        for p in &mut pts {
+            p[0] = 200.0;
+            p[1] = 200.0;
+        }
+        assert!(!plausible(&pts, Rect::new(0, 0, 400, 400)), "a collapsed ring fails");
+        // Too few landmarks for the ring: no box, not a panic.
+        assert!(oval_box(&pts[..10]).is_none());
+    }
+
+    #[test]
+    fn a_too_small_box_fails_loudly_and_builds_nothing() {
+        // The textured disc carries the person stage; an 8×8 box cannot hold a face past
+        // the mesh (even a full-span answer stays under MIN_FACE_SIDE after the margins),
+        // so the floor is what the run meets — whatever the mesh answers on it.
+        let (mut s, _) = disc();
+        let steps = s.active().unwrap().history.past_len();
+        let err = s.execute(CMD, json!({"roi": [96, 76, 8, 8]})).unwrap_err();
+        assert!(err.to_string().contains("no face found in the box"), "was {err}");
+        assert_eq!(s.active().unwrap().history.past_len(), steps, "no history step");
+        assert_eq!(s.active().unwrap().doc.layers.len(), 1, "no group added");
+        // The failed box run must not poison the cache a later unboxed run reads.
+        assert!(s.portrait_cache.get(&s.active().unwrap().doc, |_, _| true).is_none());
+    }
+
+    #[test]
+    fn a_box_run_stays_out_of_the_analysis_cache() {
+        // A mesh is a regressor: on the disc's texture it answers a structurally
+        // face-shaped ring (span ≈0.5, margins ≈0.2 — measured), so the geometric gate
+        // cannot and must not reject it; that rejection is a detector's job. What is
+        // deterministic here: the box-scoped run never lands in the pixel-keyed cache,
+        // success or not.
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"roi": [50, 40, 100, 80]})).unwrap();
+        assert!(s.portrait_cache.get(&s.active().unwrap().doc, |_, _| true).is_none(), "a box run stored its box-scoped analysis");
     }
 
     #[test]
