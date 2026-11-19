@@ -184,7 +184,7 @@ fn marquee(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) {
     divider(ui);
     // A single row or column has no style or size: Photoshop greys them.
     constraint_fields(app, ui, matches!(tool, Tool::RectMarquee | Tool::EllipseMarquee));
-    divider(ui);
+    smart_selection(app, ui, tool);
     select_and_mask(ui);
 }
 
@@ -205,6 +205,7 @@ fn lasso(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) {
         magnetic_settings(app, ui);
         divider(ui);
     }
+    smart_selection(app, ui, tool);
     select_and_mask(ui);
     let enter = crate::shortcuts::pretty("Enter");
     // The framework's selection tools own the open outline the hints follow.
@@ -269,6 +270,47 @@ fn magnetic_settings(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     }
 }
 
+/// The ML selection actions every selection tool's bar shares: Select Subject with its tier
+/// segment, and Select Face. Subject is one action whose tier is a parameter (the Photoshop
+/// Select Subject precedent) — the standard U²-Netᵖ line, or the FeyNoBg hair tier, which is
+/// heavy on purpose (~10s, GB-scale memory, ort builds with the model placed only) and never
+/// the default. Face is the portrait pipeline's entry: the drawn selection — any selection
+/// tool's — scopes the recipe dialog, and its OK builds the layers.
+fn smart_selection(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) {
+    divider(ui);
+    let subject = Button::new(label("Select Subject")).show(ui);
+    if clicked(&subject.response) {
+        let mode = crate::tool_feedback::click_mode(app, tool, app.ui.selection_mode, ui.ctx().input(|i| i.modifiers));
+        let matting = app.ui.tool_options.subject_hair;
+        let result = app.run("select.subject", serde_json::json!({ "mode": mode, "matting": matting }));
+        if matting
+            && let Ok(ref v) = result
+            && v.get("matting") == Some(&serde_json::Value::Bool(false))
+        {
+            app.ui.status = tl!("Hair tier unavailable — used the standard model (needs the ort build with feynobg.onnx)").to_string();
+            app.ui.status_error = false;
+        }
+        crate::retouch_ui::report_smart_result(app, result, tl!("No subject found — try Object Selection or the Lasso"));
+    }
+    let tiers = [Entry::new(false, label("Standard")), Entry::new(true, label("Hair"))];
+    let picked = Segmented::new(label("Subject tier"), Bind::given(app.ui.tool_options.subject_hair), &tiers).show(ui).value().copied();
+    if let Some(hair) = picked {
+        app.ui.tool_options.subject_hair = hair;
+    }
+    divider(ui);
+    let face = Button::new(label("Select Face")).show(ui);
+    if clicked(&face.response) {
+        let mut scoped = serde_json::Map::new();
+        if let Some(box_) = app.session.active().and_then(|st| st.doc.selection.as_ref()).map(|m| m.content_bounds()) {
+            scoped.insert("roi".into(), serde_json::json!([box_.x0, box_.y0, box_.width(), box_.height()]));
+        }
+        if let Err(error) = crate::filter_dialog::open_with_values(app, "portrait.create", scoped) {
+            app.ui.status = error;
+            app.ui.status_error = true;
+        }
+    }
+}
+
 /// The Magic Wand: operations, Tolerance, Anti-alias, Contiguous, Sample All Layers, Select Subject
 /// and Select and Mask.
 fn wand(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
@@ -284,43 +326,7 @@ fn wand(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     if let Some(next) = check(ui, label("Sample All Layers"), app.ui.tool_options.sample_all.magic_wand, true) {
         app.ui.tool_options.sample_all.magic_wand = next;
     }
-    divider(ui);
-    let subject = Button::new(label("Select Subject")).show(ui);
-    if clicked(&subject.response) {
-        let mode = crate::tool_feedback::click_mode(app, Tool::MagicWand, app.ui.selection_mode, ui.ctx().input(|i| i.modifiers));
-        let result = app.run("select.subject", serde_json::json!({ "mode": mode }));
-        crate::retouch_ui::report_smart_result(app, result, tl!("No subject found — try Object Selection or the Lasso"));
-    }
-    // The hair tier: FeyNoBg's alpha as a live soft selection (ort builds with the model
-    // placed only; ~10s and GB-scale memory, hence its own ask, never the default). When the
-    // tier cannot run the standard line answers with "matting": false and the status says so.
-    let hair = Button::new(label("Select Subject (Hair)")).show(ui);
-    if clicked(&hair.response) {
-        let mode = crate::tool_feedback::click_mode(app, Tool::MagicWand, app.ui.selection_mode, ui.ctx().input(|i| i.modifiers));
-        let result = app.run("select.subject", serde_json::json!({ "mode": mode, "matting": true }));
-        if let Ok(ref v) = result
-            && v.get("matting") == Some(&serde_json::Value::Bool(false))
-        {
-            app.ui.status = tl!("Hair tier unavailable — used the standard model (needs the ort build with feynobg.onnx)").to_string();
-            app.ui.status_error = false;
-        }
-        crate::retouch_ui::report_smart_result(app, result, tl!("No subject found — try Object Selection or the Lasso"));
-    }
-    // The face entry: the drawn selection — any selection tool's — is the face box the
-    // portrait pipeline crops its mesh and parsing stages to; with no selection the detector
-    // finds the face itself. It opens the recipe dialog scoped to that box (the `roi` rides
-    // along without a row, like a fixed param), and the dialog's OK builds the layers.
-    let face = Button::new(label("Select Face")).show(ui);
-    if clicked(&face.response) {
-        let mut scoped = serde_json::Map::new();
-        if let Some(box_) = app.session.active().and_then(|st| st.doc.selection.as_ref()).map(|m| m.content_bounds()) {
-            scoped.insert("roi".into(), serde_json::json!([box_.x0, box_.y0, box_.width(), box_.height()]));
-        }
-        if let Err(error) = crate::filter_dialog::open_with_values(app, "portrait.create", scoped) {
-            app.ui.status = error;
-            app.ui.status_error = true;
-        }
-    }
+    smart_selection(app, ui, Tool::MagicWand);
     select_and_mask(ui);
 }
 

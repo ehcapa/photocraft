@@ -115,6 +115,19 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
             None => params = json!({ "mode": mode }),
         }
     }
+    // Select › Subject (Hair) is the menu's stateless hair-tier row: `select.subject` with the
+    // matte on, plus the fallback note the options bar's tier segment also shows.
+    if id == "select.subject.hair" {
+        let params = json!({ "matting": true });
+        let result = app.run("select.subject", params);
+        if let Ok(ref v) = result
+            && v.get("matting") == Some(&Value::Bool(false))
+        {
+            app.ui.status = tl!("Hair tier unavailable — used the standard model (needs the ort build with feynobg.onnx)").to_string();
+            app.ui.status_error = false;
+        }
+        return result;
+    }
     let revealed = crate::layer_reveal::mark(app);
     let history = crate::panels::history::mark(app);
     let result = invoke_unguarded(app, ctx, id, params);

@@ -553,6 +553,7 @@ pub static CATALOG: &[(&[&str], &str, Option<&str>, &str)] = &[
     (&["Select"], "Color Range…", None, "select.colorRange"),
     (&["Select"], "Focus Area…", None, "select.focusArea"),
     (&["Select"], "Subject", None, "select.subject"),
+    (&["Select"], "Subject (Hair)", None, "select.subject.hair"),
     (&["Select"], "Sky", None, "select.sky"),
     (&["Select"], "Select and Mask…", None, "select.selectAndMask"),
     (&["Select"], "---", None, "---"),
