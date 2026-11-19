@@ -343,6 +343,48 @@ fn parsing_regions(
         .collect()
 }
 
+/// The whole-body regions of `doc` (`selfiemulticlass.onnx`, the whole document by design —
+/// no crop): the model's five person classes mapped onto the pipeline's regions
+/// (body-skin ∪ face-skin → `Skin`, hair → `Hair`, clothes → `Clothes`), each gated by the
+/// person like the face-parsing regions. Empty when the model is not placed — the caller's
+/// regions then stay whatever the face parsing found.
+fn body_regions(
+    doc: &Document,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    person: &photocraft_raster::Surface,
+) -> Vec<(photocraft_portrait::Region, photocraft_raster::Surface)> {
+    let Some((planes, sw, sh)) = with_doc_sampler(doc, target, sample_all, |smp, d| {
+        let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::body::BODY_SIDE * photocraft_ml::body::BODY_SIDE);
+        let img = smp.rgb_scaled(d.bounds(), step);
+        let (sw, sh) = (img.w, img.h);
+        photocraft_ml::body::body_probs(&img.px, sw, sh).map(|p| (p, sw, sh))
+    }) else {
+        return Vec::new();
+    };
+    let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
+    let gate = photocraft_doc::LayerMask { surface: person.clone(), ..photocraft_doc::LayerMask::reveal_all() };
+    let mut out = Vec::new();
+    for (class, region) in [
+        (photocraft_ml::body::BODY_SKIN, photocraft_portrait::Region::Skin),
+        (photocraft_ml::body::FACE_SKIN, photocraft_portrait::Region::Skin),
+        (photocraft_ml::body::HAIR, photocraft_portrait::Region::Hair),
+        (photocraft_ml::body::CLOTHES, photocraft_portrait::Region::Clothes),
+    ] {
+        // The planes ride back at the sample's size; the gate and the document want doc pixels.
+        let Some(mut vals) = planes.get(class).and_then(|p| photocraft_ml::resize_mask(p, sw, sh, dw, dh)) else { continue };
+        for y in 0..dh {
+            for x in 0..dw {
+                vals[y * dw + x] *= gate.value(x as i32, y as i32);
+            }
+        }
+        let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
+        surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &vals);
+        out.push((region, surface));
+    }
+    out
+}
+
 /// A copy of `mask` clipped by `person` (per-pixel multiply), the hull's share of the gate
 /// the parsing regions ride. `None` when the read-back fails.
 fn person_gated(mask: &photocraft_raster::Surface, person: &photocraft_raster::Surface, w: u32, h: u32) -> Option<photocraft_raster::Surface> {
@@ -468,11 +510,23 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 };
                 // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
                 // skin/hair/clothes masks join the person mask; without one the slice is the
-                // person alone and every layer but the first stays out.
+                // person alone and every layer but the first stays out. The whole-body
+                // segmentation (`selfiemulticlass.onnx`, ~50ms) runs over the document — no
+                // crop; its nature is full-image — and its classes UNION into the regions the
+                // face-crop parsing set: body-skin and face-skin into Skin (so the smoothing
+                // layer covers the arms and neck, not only the face), hair and clothes into
+                // their regions.
                 let (parse_lo, parse_hi) = if boxed.is_some() { (0.6, 0.65) } else { (0.4, 0.65) };
-                let regions = ctx.stage(parse_lo, parse_hi, "Parsing regions", |_| parsing_regions(&doc, target, sample_all, &person, boxed.as_ref().map(|(_, r)| *r)));
+                let (regions, body) = ctx.stage(parse_lo, parse_hi, "Parsing regions", |_| {
+                    let regions = parsing_regions(&doc, target, sample_all, &person, boxed.as_ref().map(|(_, r)| *r));
+                    let body = body_regions(&doc, target, sample_all, &person);
+                    (regions, body)
+                });
                 for (region, mask) in regions {
                     analysis.set(region, mask);
+                }
+                for (region, mask) in body {
+                    analysis.union(region, mask);
                 }
                 // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
                 // region comes from the landmark ring's hull, gated by the person like the
@@ -849,6 +903,23 @@ mod tests {
         let (mut s, _) = disc();
         s.execute(CMD, json!({"roi": [50, 40, 100, 80]})).unwrap();
         assert!(s.portrait_cache.get(&s.active().unwrap().doc, |_, _| true).is_none(), "a box run stored its box-scoped analysis");
+    }
+
+    /// The whole-body segmentation (`selfiemulticlass.onnx`) rides inside the parsing stage
+    /// and unions into the regions: with the model placed the run succeeds and the smoothing
+    /// layer lands. A smoke over the stage wiring — the union's max semantics live in
+    /// photocraft-portrait's own tests, and the real-photo A/B in docs/fork.
+    #[test]
+    fn body_segmentation_smokes_when_the_model_is_placed() {
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_none_or(|d| !std::path::Path::new(&d).join("selfiemulticlass.onnx").is_file()) {
+            eprintln!("skipping: no selfiemulticlass.onnx in PHOTOCRAFT_MODELS_DIR");
+            return;
+        }
+        let (mut s, _) = disc();
+        s.execute(CMD, json!({"skinRadius": 10})).unwrap();
+        let layer = s.active().unwrap().active_layer.map(|id| s.active().unwrap().doc.layer(id).unwrap()).unwrap();
+        let LayerContent::Group(group) = &layer.content else { panic!("not a group") };
+        assert!(group.children.iter().any(|l| l.name == "Skin Smoothing"), "the skin layer lands with the body stage in the run");
     }
 
     #[test]

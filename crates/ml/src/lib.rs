@@ -177,6 +177,10 @@ pub mod parsing;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod detect;
 
+/// The whole-body six-class segmentation (native only, tract tier).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod body;
+
 mod resample;
 
 #[cfg(test)]
