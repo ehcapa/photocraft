@@ -103,3 +103,10 @@ rmeta。`--workspace` 与 `-p` 选中的单元不同,不是代码问题。
 消费的 rmeta 路径,再对 `ls -la target/debug/build/photocraft-ml/` 的日期。
 方向性口诀:**与坑 1(feature 统一)相反**——坑 1 是 `-p` 失败 `--workspace`
 通过,本坑是 `--workspace` 失败 `-p` 通过,先分清再动手。
+
+## 6. ui-egui 的 kittest 无头测试在 macOS 找不到菜单节点(2026-11-20 发现)
+
+`input::touch_twins::tests::a_tap_opens_a_menu_title_every_time` 在无头
+kittest harness 里以 `No nodes found matching the query: By { label: "File" }`
+失败——纯 main 上同样失败(git stash 对照验证过),与本机改动无关。跑 ui-egui
+单测见到它失败时按预存基线忽略;需要菜单交互测试时在真机窗口环境跑。

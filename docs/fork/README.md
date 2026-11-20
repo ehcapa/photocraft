@@ -41,3 +41,15 @@ ehcapa/photocraft（方向：像素蛋糕式 AI 修图）的 **fork 级**文档�
   `select.region` + 族共用段 UI;FASHN 因许可不引入
 - [2026-11-19: faceparser 导出的类语义不可信](decisions.md) —— class_probe 判决
   自相矛盾(左右眼环各被不同类占据),区域集封顶八类,脖/耳/眉/鼻不可给
+- [2026-11-20: 服装细类解封(SCHP ATR-18)+ Pose 基础层](decisions.md) —— 优先级链
+  替代 union(0.908 围巾错误随 selfie 不跑而消失)、arm/leg 只烧裸皮的判决、
+  `Analysis.pose` 无消费者落地
+- [2026-11-20: `filter.bodySculpt` —— 关键点驱动身体塑形](decisions.md) —— 解析写场
+  四原语(不走 dab 链/不用 freeze,行级证据)、锚点嵌入 params 保回放、折叠守护
+  首跑抓 6.4px 叠加、footprint 验收;五批补齐至对标 19/19(AI塑形/天鹅颈组合滑杆、
+  直角肩/双下巴/胸位提升、身型流畅、L/R、对称液化、实拍校准)
+- [2026-11-20: `filter.faceSculpt` —— 面板化面部重塑](decisions.md) —— 第二张部件表
+  只加行不加机器(四原语共享)、47+48 滑杆五组、7 脸型预设、五官对称、3D塑颜
+  (mesh z 旋转投影;`sin_cos` 顺序坑)、AI 面部流畅、面部 gain 校准 + 家族化折叠预算
+- [2026-11-20: 塑形面板的定制 UI](decisions.md) —— 分区面板窗口 + 预设一键行 +
+  L/R 链锁控件 + 应用不关面板;词条 86×2 入 craft-i18n;实时预览的修复路径记录待做

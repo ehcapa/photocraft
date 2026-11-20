@@ -114,12 +114,19 @@ PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models \
 Layer › New Adjustment Layer › Smart Portrait… → 对话框调参 → OK →
 进度条(Esc 可取消)→ 图层面板出现 "Portrait" 组,逐层可调。
 
+塑形/面部面板(2026-11-20):同一张人像 → Filter ▸ Body Sculpt…(或 Face
+Sculpt…)→ 左侧分区切换,右侧滑杆,L/R 的 🔗 可解锁两侧,面部顶部 7 预设一键 →
+[应用] 后面板保持打开,每次应用一步 Undo;首次分析数秒(缓存),此后秒回。
+
 ## 8. 已知等待项(测试时留意)
 
 - 2026-11-19 数值验收:默认配方下六个层蒙版解剖学正确(人物/皮肤/眼/唇/腮红/眼睑),
   输出与原图差 ~1/255;GFPGAN/磨皮/发色的**真人观感**目检仍待做
 - 19 类里 14(neck)等未映射;眼/唇区域来自 landmark 环(此导出不分眼/唇)
 - matte(ort 档)~10s/张、峰值内存 ~5GB;批量全开 ~15–20s/张
+- 2026-11-20 塑形面板:各 gain 已按 footprint 实拍校准(轮廓 ±100 ≈ 6% 脸宽),
+  但**真人观感目检未做**(预设七件的数值同样待实拍微调);实时预览未实现
+  (分析每 tick 重跑 + 代理缩放锚点错位,修复路径在 decisions.md)
 - **对话框会记住每个命令上次的值**(`~/.config/photocraft/config.toml` 的
   `[sections.remembered]`)。2026-11-19 的"处理后全图青灰不可用"导出即前一晚实验
   滑杆残值(hue 164/sat -61/light +43 + 绿腮红 91),管线本身无罪;
