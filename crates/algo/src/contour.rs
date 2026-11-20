@@ -92,6 +92,91 @@ pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength:
     relax(field, 2);
 }
 
+/// Reflects `p` about the line through `a` along unit `u`.
+fn reflect(p: [f64; 2], a: [f64; 2], u: [f64; 2]) -> [f64; 2] {
+    let d = [p[0] - a[0], p[1] - a[1]];
+    let along = d[0] * u[0] + d[1] * u[1];
+    let perp = [d[0] - along * u[0], d[1] - along * u[1]];
+    [a[0] + along * u[0] - perp[0], a[1] + along * u[1] - perp[1]]
+}
+
+/// 对称液化: aligns landmark `pairs` toward symmetry about the line (`axis` point, `dir`
+/// unit direction) — each pair's two points move toward each other's mirror by `strength`
+/// (0..100; 100 is full alignment, at both ends simultaneously), each correction stamped on
+/// a falloff disc of `reach`. Pure geometry of the points and the axis: a stored filter
+/// replays it from the anchors alone, no extra data.
+pub fn align_pairs(field: &mut LiquifyField, pts: &[[f64; 2]], pairs: &[(usize, usize)], axis: [f64; 2], dir: [f64; 2], strength: f64, reach: f64) {
+    let n = len_unit(dir);
+    if n < 1e-9 || pairs.is_empty() || pts.len() < 8 {
+        return;
+    }
+    let u = [dir[0] / n, dir[1] / n];
+    let t = strength.clamp(0.0, 100.0) / 100.0;
+    if t <= 0.0 {
+        return;
+    }
+    let mut items: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(2 * pairs.len());
+    for &(i, j) in pairs {
+        let (pi, pj) = (pts[i], pts[j]);
+        let (mi, mj) = (reflect(pi, axis, u), reflect(pj, axis, u));
+        // At strength 100 the two points land on each other's mirror: symmetric by
+        // construction, whichever side was off.
+        items.push((pi, [(mj[0] - pi[0]) * t, (mj[1] - pi[1]) * t]));
+        items.push((pj, [(mi[0] - pj[0]) * t, (mi[1] - pj[1]) * t]));
+    }
+    stamp_deltas(field, &items, reach);
+}
+
+/// Stamps explicit `(point, correction)` pairs — the forward motion is the correction, the
+/// inverse-map displacement points against it — as a falloff-weighted mean with one
+/// relaxation pass, the contour stamp's own rules.
+pub fn stamp_deltas(field: &mut LiquifyField, items: &[([f64; 2], [f64; 2])], reach: f64) {
+    if items.is_empty() || reach < 4.0 {
+        return;
+    }
+    let inv = 1.0 / field.cell;
+    let (bx, by) = (f64::from(field.bounds.x0) + 0.5, f64::from(field.bounds.y0) + 0.5);
+    let mut num = vec![[0.0f64; 2]; field.w * field.h];
+    let mut den = vec![0.0f64; field.w * field.h];
+    for &(p, delta) in items {
+        let mag0 = delta[0].hypot(delta[1]);
+        if mag0 < 1e-9 {
+            continue;
+        }
+        let (i0, j0, i1, j1) = (
+            (((p[0] - reach - bx) * inv).floor().max(0.0)) as usize,
+            (((p[1] - reach - by) * inv).floor().max(0.0)) as usize,
+            (((p[0] + reach - bx) * inv).ceil().min(field.w as f64 - 1.0)).max(0.0) as usize,
+            (((p[1] + reach - by) * inv).ceil().min(field.h as f64 - 1.0)).max(0.0) as usize,
+        );
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let n = field.node_pos(i, j);
+                let rho = (n[0] - p[0]).hypot(n[1] - p[1]);
+                if rho >= reach {
+                    continue;
+                }
+                let lat = falloff((rho / reach) * (rho / reach), 0.6);
+                let idx = j * field.w + i;
+                num[idx][0] += delta[0] * lat;
+                num[idx][1] += delta[1] * lat;
+                den[idx] += lat;
+            }
+        }
+    }
+    for (d, (nv, w)) in field.d.iter_mut().zip(num.iter().zip(&den)) {
+        if *w > 1e-9 {
+            d[0] -= (nv[0] / w) as f32;
+            d[1] -= (nv[1] / w) as f32;
+        }
+    }
+    relax(field, 1);
+}
+
+fn len_unit(d: [f64; 2]) -> f64 {
+    d[0].hypot(d[1])
+}
+
 /// Relaxes the field toward its 8-neighbour mean — Liquify's Smooth brush over the stamped
 /// corrections, whose own gradient (a bump's correction curve) can step past the cell even
 /// when every correction is small.

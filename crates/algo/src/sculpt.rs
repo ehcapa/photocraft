@@ -28,6 +28,10 @@ use serde::{Deserialize, Serialize};
 /// crate stays independent of the ml one — the layering rule).
 pub const POSE_COUNT: usize = 33;
 
+/// The body's symmetry pairs (left joint, right joint) 对称液化 aligns about the torso
+/// axis: shoulders, elbows, wrists, hips, knees, ankles.
+pub const SYMMETRY_PAIRS: &[(usize, usize)] = &[(11, 12), (13, 14), (15, 16), (23, 24), (25, 26), (27, 28)];
+
 /// The joints that must be visible (the model's sigmoidged confidence) for a part to run.
 const VISIBILITY: f64 = 0.5;
 

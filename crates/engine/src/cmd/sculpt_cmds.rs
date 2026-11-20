@@ -12,7 +12,7 @@
 
 use photocraft_algo::contour;
 use photocraft_algo::liquify::{apply_liquify, auto_cell};
-use photocraft_algo::sculpt::{SculptAnchors, SculptHead, SculptSliders, SculptSpec, sculpt_field};
+use photocraft_algo::sculpt::{SYMMETRY_PAIRS, SculptAnchors, SculptHead, SculptSliders, SculptSpec, sculpt_field};
 use photocraft_doc::LayerContent;
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
@@ -155,6 +155,11 @@ fn person_contour(mask: &Surface) -> Option<Vec<[f64; 2]>> {
     Some(left)
 }
 
+/// The symmetry amount (对称液化·上半身, one-directional 0..100).
+fn symmetry_of(p: &Value) -> f32 {
+    p.get("symmetry").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0) as f32
+}
+
 /// The smoothing amount (身型流畅, one-directional 0..100).
 fn smooth_of(p: &Value) -> f32 {
     p.get("smooth").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0) as f32
@@ -179,7 +184,8 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let canvas = d.doc.bounds();
     let id = crate::commands::layer_param(s, p)?;
     let smooth = smooth_of(p);
-    if values == SculptSliders::default() && smooth <= 0.0 {
+    let symmetry = symmetry_of(p);
+    if values == SculptSliders::default() && smooth <= 0.0 && symmetry <= 0.0 {
         return Ok(json!({"layer": id.0, "changed": false}));
     }
     let cell = cell(p, canvas)?;
@@ -207,6 +213,24 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let t0 = Stopwatch::start();
     let spec = SculptSpec { sliders: values, anchors };
     let (mut field, mut report) = sculpt_field(&spec, canvas, cell);
+    // 对称液化·上半身: the paired joints align toward each other's mirror about the
+    // torso axis — pure geometry of the stored joints, replayed for free.
+    if symmetry > 0.0 {
+        let pts: Vec<[f64; 2]> = spec.anchors.pose.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
+        let shoulder_mid = [(pts[11][0] + pts[12][0]) * 0.5, (pts[11][1] + pts[12][1]) * 0.5];
+        let hip_mid = [(pts[23][0] + pts[24][0]) * 0.5, (pts[23][1] + pts[24][1]) * 0.5];
+        let reach = ((pts[11][0] - pts[12][0]).hypot(pts[11][1] - pts[12][1]) * 0.5).max(8.0);
+        contour::align_pairs(
+            &mut field,
+            &pts,
+            SYMMETRY_PAIRS,
+            shoulder_mid,
+            [hip_mid[0] - shoulder_mid[0], hip_mid[1] - shoulder_mid[1]],
+            f64::from(symmetry),
+            reach,
+        );
+        report.applied.push("symmetry");
+    }
     // 身型流畅: the silhouette's own contour, low-passed and stamped over the parts. The
     // contour rides the stored params like the anchors, so the re-render replays it with
     // no mask and no analysis.
@@ -271,6 +295,22 @@ fn parts(report: &photocraft_algo::sculpt::SculptReport) -> Value {
 pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> Option<Surface> {
     let (spec, cell) = stored_spec(params, canvas)?;
     let (mut field, _) = sculpt_field(&spec, canvas, cell);
+    let symmetry = symmetry_of(params);
+    if symmetry > 0.0 {
+        let pts: Vec<[f64; 2]> = spec.anchors.pose.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
+        let shoulder_mid = [(pts[11][0] + pts[12][0]) * 0.5, (pts[11][1] + pts[12][1]) * 0.5];
+        let hip_mid = [(pts[23][0] + pts[24][0]) * 0.5, (pts[23][1] + pts[24][1]) * 0.5];
+        let reach = ((pts[11][0] - pts[12][0]).hypot(pts[11][1] - pts[12][1]) * 0.5).max(8.0);
+        contour::align_pairs(
+            &mut field,
+            &pts,
+            SYMMETRY_PAIRS,
+            shoulder_mid,
+            [hip_mid[0] - shoulder_mid[0], hip_mid[1] - shoulder_mid[1]],
+            f64::from(symmetry),
+            reach,
+        );
+    }
     if let Some(pts) = contour_of(params) {
         stamp_contour(&mut field, &pts, smooth_of(params));
     }
@@ -278,7 +318,7 @@ pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> 
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action: Waist narrows, Hips rounds, Leg Length lengthens; the analysis runs first — cached like Select Region, seconds the first time),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"symmetry":0..100=0 (对称液化·上半身: the paired joints align toward each other's mirror about the torso axis),"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action: Waist narrows, Hips rounds, Leg Length lengthens; the analysis runs first — cached like Select Region, seconds the first time),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: SCULPT,
         label: "Body Sculpt…",

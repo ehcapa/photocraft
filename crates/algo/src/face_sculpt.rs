@@ -291,6 +291,26 @@ mod mesh {
     pub const LOWER_LIP_LOW: usize = 17;
 }
 
+/// The symmetry pairs (left index, right index) 对称液化 aligns: the eye corners and
+/// rims, the brows, the mouth corners, the nose wings, the cheekbones, the temples, the
+/// jaw — every paired feature the mesh names.
+pub const SYMMETRY_PAIRS: &[(usize, usize)] = &[
+    (263, 33),
+    (362, 133),
+    (374, 145),
+    (336, 70),
+    (334, 105),
+    (300, 107),
+    (285, 55),
+    (296, 63),
+    (293, 66),
+    (291, 61),
+    (358, 129),
+    (457, 227),
+    (251, 21),
+    (397, 172),
+];
+
 /// The face's derived geometry: named anchors and the feature scales the table's widths
 /// and gains hang on, resolved once per build from the mesh.
 struct FaceFrame {
@@ -888,6 +908,31 @@ mod tests {
         let (sl, sr) = (left(&split), right(&split));
         assert!(sl < bl * 0.6, "the overridden side reads its own value: {sl:?} vs {bl:?}");
         assert!((sr - br).abs() < 0.2, "the other side follows the base: {sr:?} vs {br:?}");
+    }
+
+    #[test]
+    fn symmetry_levels_the_uneven_eyes() {
+        use crate::contour::align_pairs;
+        let mut pts = vec![[256.0f64, 240.0f64]; MESH_COUNT];
+        // Both eyes at 232, but the left one sits 8 px lower — the pair's asymmetry.
+        pts[263] = [321.0, 240.0];
+        pts[33] = [191.0, 232.0];
+        let (l, r) = (pts[263], pts[33]);
+        let axis = [256.0, 240.0];
+        let mut field = LiquifyField::new(bounds(), CELL);
+        align_pairs(&mut field, &pts, &[(263, 33)], axis, [0.0, -1.0], 100.0, 40.0);
+        let dl = field.sample(l[0], l[1]);
+        let dr = field.sample(r[0], r[1]);
+        // The lower eye moves up, the higher one moves down: both dipoles oppose the
+        // 8 px gap, closing it at strength 100 (4 px of correction each, inverse-mapped).
+        assert!(dl[1] > 2.0, "the low eye reads lifted: {dl:?}");
+        assert!(dr[1] < -2.0, "the high eye reads lowered: {dr:?}");
+        // A straight run: the perfectly mirrored pair corrects nothing.
+        pts[263] = [321.0, 240.0];
+        pts[33] = [191.0, 240.0];
+        let mut flat = LiquifyField::new(bounds(), CELL);
+        align_pairs(&mut flat, &pts, &[(263, 33)], axis, [0.0, -1.0], 100.0, 40.0);
+        assert!(flat.is_identity(), "a symmetric pair needs no correction");
     }
 
     #[test]
