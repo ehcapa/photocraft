@@ -292,7 +292,7 @@ fn invoke_shell_commands(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str,
     if let Some(r) = crate::view_cmds::invoke(app, ctx, id, params) {
         return Some(r);
     }
-    // Liquify dialog, Puppet Warp and Perspective Warp modes, Filter Gallery and Vanishing Point (and their control params).
+    // Liquify dialog, Puppet Warp and Perspective Warp modes, Filter Gallery, Vanishing Point (and their control params), the Sculpt panels.
     if let Some(r) = crate::distort_ui::menu(app, ctx, id, params) {
         return Some(r);
     }

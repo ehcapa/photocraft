@@ -1432,7 +1432,7 @@ fn sweep_params(app: &mut PhotocraftApp, command: &str) -> Vec<(String, Value)> 
 fn previewed_cases() -> Vec<(&'static str, String, Value)> {
     let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
     let ids: Vec<&'static str> =
-        photocraft_engine::command_specs().iter().map(|c| c.id).filter(|id| has_dialog(id) && (id.starts_with("filter.") || PREVIEWED.contains(id))).collect();
+        photocraft_engine::command_specs().iter().map(|c| c.id).filter(|id| has_dialog(id) && previews(id)).collect();
     ids.into_iter().flat_map(|id| sweep_params(&mut app, id).into_iter().map(move |(label, p)| (id, label, p))).collect()
 }
 
@@ -1906,4 +1906,19 @@ fn indexed_matte_other_shows_the_color_row_and_none_hides_it() {
     harness.run_steps(3);
     assert_eq!(fields_of(harness.state(), id).text("matte"), Some("none"));
     assert!(try_set(harness.state_mut(), id, "matteColor", json!([0.0, 0.0, 1.0])).is_err(), "None hides the colour row");
+}
+
+/// The sculpt commands' optional `meshSize` (`px?`) must not become a schema row: the parse
+/// would default it to 0, which the engine refuses (1..64), so confirming the dialog (a
+/// smart-filter re-edit) errored instead of applying. Absent, the engine resolves the canvas
+/// default itself.
+#[test]
+fn the_sculpt_schema_dialog_has_no_mesh_size_row() {
+    let mut app = new_app();
+    for command in ["filter.bodySculpt", "filter.faceSculpt"] {
+        let spec = photocraft_engine::commands::find(command).expect("registered").params;
+        let rows = params(&mut app, command, spec);
+        assert!(rows.iter().any(|p| p.key == "waist" || p.key == "faceSlim"), "{command} keeps its slider rows");
+        assert!(!rows.iter().any(|p| p.key == "meshSize"), "{command} must not offer meshSize");
+    }
 }

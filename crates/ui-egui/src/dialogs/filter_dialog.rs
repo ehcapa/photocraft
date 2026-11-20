@@ -294,6 +294,10 @@ pub(crate) fn params(app: &mut PhotocraftApp, command: &str, spec: &str) -> Vec<
                 command,
                 "edit.fade" | "edit.findAndReplaceText" | "edit.defineBrushPreset" | "edit.defineCustomShape" | "edit.autoAlignLayers" | "edit.autoBlendLayers"
             ) && matches!(p.key.as_str(), "reference" | "path"))
+                // The sculpt commands' optional `meshSize` (`px?`) parses as an int defaulting
+                // to 0, which the engine refuses (1..64) — a smart-filter re-edit would error
+                // on OK. Absent, the engine resolves the canvas default, so the row stays out.
+                && !(matches!(command, "filter.bodySculpt" | "filter.faceSculpt") && p.key == "meshSize")
         })
         .map(|mut p| {
             // Edit › Fade's Mode is the blend list with the modes the document can't fade with greyed (#13852).

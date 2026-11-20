@@ -299,6 +299,14 @@ pub fn menu(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: &Val
         "filter.vanishingPoint" if empty => Some(crate::vp_ui::begin(app, ctx).map(|_| json!({"vanishingPoint": crate::vp_ui::describe(app)}))),
         #[cfg(not(target_arch = "wasm32"))]
         "filter.vanishingPoint" if ui.is_some() && workspace_open(app, id) => Some(hosted(app, id, ui.unwrap_or(&Value::Null))),
+        // The Sculpt panels are bespoke Filter-menu surfaces too: an empty-params invocation
+        // opens the panel, never the schema dialog (whose `meshSize` row would send the 0 the
+        // engine refuses — absent, it resolves the canvas default itself).
+        crate::sculpt_ui::BODY | crate::sculpt_ui::FACE if empty => {
+            let command = if id == crate::sculpt_ui::FACE { crate::sculpt_ui::FACE } else { crate::sculpt_ui::BODY };
+            crate::sculpt_ui::open(app, command);
+            Some(Ok(json!({"sculpt": "open"})))
+        }
         // Workspace controls must not fall through to engine edits when no workspace is open.
         "filter.filterGallery" | "filter.liquify" | "filter.vanishingPoint" if ui.is_some() => Some(Err(format!("{id} is not open"))),
         _ => None,
@@ -491,5 +499,27 @@ mod tests {
         let past = app.session.active().unwrap().history.past_len();
         app.session.execute("edit.undo", json!({})).unwrap();
         assert_eq!(app.session.active().unwrap().history.past_len(), past - 1);
+    }
+
+    /// An empty-params menu invocation of the Sculpt commands opens the bespoke panel, not the
+    /// schema dialog — whose `meshSize` row would send the 0 the engine refuses, so the filter
+    /// errored instead of applying. Replays with params (Last Filter, the control channel) still
+    /// fall through to the engine.
+    #[test]
+    fn sculpt_menu_invocations_open_the_panel_and_replays_fall_through() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        let ctx = app.ctx().clone();
+        app.session.execute("file.new", json!({"width": 64, "height": 64, "depth": 8})).unwrap();
+        for (id, command) in [(crate::sculpt_ui::BODY, crate::sculpt_ui::BODY), (crate::sculpt_ui::FACE, crate::sculpt_ui::FACE)] {
+            app.sculpt = None;
+            let reply = menu(&mut app, &ctx, id, &json!({}));
+            let opened = matches!(reply, Some(Ok(_)));
+            assert!(opened, "{id}: {reply:?}");
+            assert_eq!(app.sculpt.as_ref().map(|p| p.command), Some(command), "{id} must open the panel");
+        }
+        // A params-carrying invocation is a replay, not an opener: the engine runs it.
+        app.sculpt = None;
+        assert!(menu(&mut app, &ctx, crate::sculpt_ui::BODY, &json!({"slimBody": 10})).is_none());
+        assert!(app.sculpt.is_none());
     }
 }
