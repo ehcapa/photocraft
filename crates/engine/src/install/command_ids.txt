@@ -297,6 +297,7 @@ select.focusArea
 layer.removeBackground
 portrait.create
 portrait.saveRecipe
+portrait.analyze
 paint.setSymmetry
 paint.symmetryFromPath
 paint.symmetryDisable

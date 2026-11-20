@@ -1,13 +1,15 @@
 //! Filter › Face Sculpt: the face panel over FaceMesh — the body panel's twin
-//! ([`crate::sculpt_cmds`]), down to the plumbing: the same portrait-cache analysis, the
-//! same params-embedded anchors (the 478 mesh points, so a stored smart filter re-renders
-//! with no analysis at composite time), the same run_on_layer ride for a linked mask, the
-//! same opt-out of the live preview and the remembered values. The parts table lives in
-//! [`photocraft_algo::face_sculpt`] over the four primitives the body table defined.
+//! ([`crate::sculpt_cmds`]), down to the plumbing: `portrait.analyze`'s anchors skip the
+//! analysis on Apply (without them one lightweight face-mesh run answers; a detected face
+//! box needs no person stage, and only the no-detector fallback asks it for presence), the
+//! anchors embed into the stored params (the 478 mesh points, so a stored smart filter
+//! re-renders with no analysis at composite time), and the run_on_layer ride is the same.
+//! The parts table lives in [`photocraft_algo::face_sculpt`] over the four primitives the
+//! body table defined.
 
 use photocraft_algo::contour;
-use photocraft_algo::face_sculpt::{FaceAnchors, FacePreset, FaceSides, FaceSliders, FaceSpec, SYMMETRY_PAIRS, face_field};
-use photocraft_algo::liquify::{apply_liquify, auto_cell};
+use photocraft_algo::face_sculpt::{FaceAnchors, FacePreset, FaceReport, FaceSides, FaceSliders, FaceSpec, SYMMETRY_PAIRS, face_field};
+use photocraft_algo::liquify::{LiquifyField, apply_liquify, auto_cell};
 use photocraft_doc::LayerContent;
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
@@ -18,6 +20,9 @@ use crate::photo_cmds::Stopwatch;
 use crate::{EngineError, Result, Session};
 
 pub const FACE_SCULPT: &str = "filter.faceSculpt";
+
+/// The refusal a run without usable anchors answers (`portrait.analyze` reports it too).
+pub(crate) const NO_FACE: &str = "no face found — Face Sculpt needs the face-mesh landmarks";
 
 fn bad(msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: FACE_SCULPT.into(), msg: msg.into() }
@@ -156,6 +161,21 @@ fn stored_spec(p: &Value, canvas: Rect) -> Option<(FaceSpec, f64)> {
     Some((FaceSpec { sliders: sliders(p).ok()?, anchors }, cell(p, canvas).ok()?))
 }
 
+/// The params' own anchors — the panel's one analysis (`portrait.analyze`), or a script's.
+/// `None` when absent: the lightweight analysis answers instead. Present but malformed is
+/// refused by its shape rather than warping from garbage — the field builders index every
+/// point, so nothing downstream may see a short or non-finite mesh.
+fn anchors_from_params(p: &Value) -> Result<Option<FaceAnchors>> {
+    let Some(raw) = p.get("anchors") else { return Ok(None) };
+    let anchors: FaceAnchors =
+        serde_json::from_value(raw.clone()).map_err(|e| bad(format!("`anchors` must be the anchors `portrait.analyze` returns: {e}")))?;
+    let finite = anchors.doc.iter().all(|v| v.is_finite()) && anchors.pts.iter().flatten().all(|v| v.is_finite());
+    if anchors.pts.len() != photocraft_algo::face_sculpt::MESH_COUNT || !finite {
+        return Err(bad("`anchors` must carry the 478 finite face-mesh points [x, y, z] and the document size"));
+    }
+    Ok(Some(anchors))
+}
+
 /// The mesh anchors of an analysis: the 478 points as `x, y` document pixels. `None` when
 /// the mesh stage never answered (no face found).
 pub(crate) fn anchors_from_analysis(a: &photocraft_portrait::Analysis) -> Option<FaceAnchors> {
@@ -198,41 +218,27 @@ fn stamp_ring(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64; 2
     contour::stamp(field, pts, len / pts.len() as f64, f64::from(smooth));
 }
 
-fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
-    let values = sliders(p)?;
-    let d = s.active().ok_or(EngineError::NoDocument)?;
-    let canvas = d.doc.bounds();
-    let id = crate::commands::layer_param(s, p)?;
-    let smooth = smooth_of(p);
-    let symmetry = symmetry_of(p);
-    let poses = angle_of(p, "poseYaw", 8.0) + angle_of(p, "posePitch", 8.0) + angle_of(p, "poseRoll", 6.0);
-    if values == FaceSliders::default() && smooth <= 0.0 && symmetry <= 0.0 && poses.abs() < 1e-6 && values.preset == FacePreset::None {
-        return Ok(json!({"layer": id.0, "changed": false}));
-    }
-    let cell = cell(p, canvas)?;
-    let all_layers = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
-    let (doc, analysis) = {
-        let d = s.active().ok_or(EngineError::NoDocument)?;
-        let target = d.active_layer.filter(|l| !all_layers && d.doc.layer(*l).and_then(photocraft_doc::Layer::surface).is_some());
-        match s.portrait_cache.get(&d.doc, crate::layer_multi_cmds::same_pixels) {
-            Some(hit) => (std::sync::Arc::clone(&d.doc), hit),
-            None => {
-                let ctx = crate::jobs::JobCtx::new();
-                let analysis = crate::portrait_cmds::analyze_person(&d.doc, target, all_layers, None, &ctx)?;
-                (std::sync::Arc::clone(&d.doc), analysis)
-            }
-        }
-    };
-    s.portrait_cache.store(&doc, (*analysis).clone());
-    let Some(anchors) = anchors_from_analysis(&analysis) else {
-        return Err(EngineError::Other("no face found — Face Sculpt needs the face-mesh landmarks".into()));
-    };
-    let t0 = Stopwatch::start();
-    let ring = oval_ring(&anchors);
-    let spec = FaceSpec { sliders: values, anchors };
+/// 3D塑颜's three angles in degrees: the slider's ±100 maps to ±8° (yaw, pitch) or ±6°
+/// (roll).
+fn angles(p: &Value) -> (f64, f64, f64) {
+    (angle_of(p, "poseYaw", 8.0), angle_of(p, "posePitch", 8.0), angle_of(p, "poseRoll", 6.0))
+}
+
+/// The field every path builds: the slider warp, the 3D塑颜 rotation, the symmetry pair
+/// alignment and the contour relaxation. Apply, the smart-filter replay and the panel's
+/// live preview all call it with the same values, so the field they show cannot drift from
+/// the one they commit.
+fn field_with(
+    spec: FaceSpec,
+    contour: Option<&[[f64; 2]]>,
+    symmetry: f32,
+    smooth: f32,
+    (yaw, pitch, roll): (f64, f64, f64),
+    canvas: Rect,
+    cell: f64,
+) -> (LiquifyField, FaceReport) {
     let (mut field, mut report) = face_field(&spec, canvas, cell);
     // 3D塑颜: the mesh's own depth rotates — the far side compresses, the near opens.
-    let (yaw, pitch, roll) = (angle_of(p, "poseYaw", 8.0), angle_of(p, "posePitch", 8.0), angle_of(p, "poseRoll", 6.0));
     if yaw.abs() + pitch.abs() + roll.abs() > 1e-6 {
         let pts3: Vec<[f64; 3]> = spec.anchors.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64]).collect();
         let eye_w = (pts3[263][0] - pts3[362][0]).abs().max(8.0);
@@ -249,24 +255,72 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
         contour::align_pairs(&mut field, &pts, SYMMETRY_PAIRS, axis, up, f64::from(symmetry), eye_w * 2.0);
         report.applied.push("symmetry");
     }
-    // AI 面部流畅: the face oval's own contour, low-passed and stamped over the parts.
+    // AI 面部流畅: the face oval's own contour, low-passed and stamped over the parts. The
+    // ring comes from the anchors, so the re-render replays it with no analysis.
     if smooth > 0.0 {
-        match contour_of(p).or_else(|| Some(ring.clone())) {
-            Some(pts) => {
-                stamp_ring(&mut field, &pts, smooth);
-                report.applied.push("smooth");
-            }
-            None => report.skipped.push(("smooth", "no face contour to relax")),
-        }
+        let ring = oval_ring(&spec.anchors);
+        let pts = contour.unwrap_or(&ring);
+        stamp_ring(&mut field, pts, smooth);
+        report.applied.push("smooth");
     }
+    (field, report)
+}
+
+/// The field `params` alone describe — exactly the one Apply builds, from the anchors
+/// `portrait.analyze` found. The panel's live preview calls it with the params Apply will
+/// send, so what is shown is what is committed.
+pub fn field_for(p: &Value, canvas: Rect) -> Result<(LiquifyField, FaceReport)> {
+    let values = sliders(p)?;
+    let anchors = anchors_from_params(p)?.ok_or_else(|| bad("`anchors` are required here — `portrait.analyze` supplies them"))?;
+    let cell = cell(p, canvas)?;
+    Ok(field_with(FaceSpec { sliders: values, anchors }, contour_of(p).as_deref(), symmetry_of(p), smooth_of(p), angles(p), canvas, cell))
+}
+
+/// The one lightweight analysis a run without anchors needs: SCRFD's box when a detector
+/// model is placed, the FaceMesh landmarks either way, no parsing. A detected box needs no
+/// person stage; the no-detector fallback asks the subject line only for presence.
+fn lightweight(s: &Session, all_layers: bool) -> Result<std::sync::Arc<photocraft_portrait::Analysis>> {
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let target = d.active_layer.filter(|l| !all_layers && d.doc.layer(*l).and_then(photocraft_doc::Layer::surface).is_some());
+    let ctx = crate::jobs::JobCtx::new();
+    crate::portrait_cmds::analyze_sculpt(&d.doc, target, all_layers, crate::portrait_cmds::SculptKind::Face, &ctx)
+}
+
+fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
+    let values = sliders(p)?;
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let canvas = d.doc.bounds();
+    let id = crate::commands::layer_param(s, p)?;
+    let smooth = smooth_of(p);
+    let symmetry = symmetry_of(p);
+    let poses = angle_of(p, "poseYaw", 8.0) + angle_of(p, "posePitch", 8.0) + angle_of(p, "poseRoll", 6.0);
+    if values == FaceSliders::default() && smooth <= 0.0 && symmetry <= 0.0 && poses.abs() < 1e-6 && values.preset == FacePreset::None {
+        return Ok(json!({"layer": id.0, "changed": false}));
+    }
+    let cell = cell(p, canvas)?;
+    let all_layers = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
+    let t0 = Stopwatch::start();
+    // The anchors the panel analysed are the fast path: Apply is a field build and a warp.
+    // Without them (a script, an action) one lightweight face-mesh analysis answers; with a
+    // detected face box it needs no person stage, so a photo the subject line cannot
+    // segment still works.
+    let anchors = match anchors_from_params(p)? {
+        Some(anchors) => anchors,
+        None => {
+            let analysis = lightweight(s, all_layers)?;
+            anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other(NO_FACE.into()))?
+        }
+    };
+    let (field, report) =
+        field_with(FaceSpec { sliders: values, anchors: anchors.clone() }, contour_of(p).as_deref(), symmetry, smooth, angles(p), canvas, cell);
     let smart = matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Smart(_)));
     if field.is_identity() && !smart {
         return Ok(json!({"layer": id.0, "changed": false, "parts": parts(&report)}));
     }
-    let stored_contour = if smooth > 0.0 { Some(contour_of(p).unwrap_or_else(|| ring.clone())) } else { None };
+    let stored_contour = if smooth > 0.0 { Some(contour_of(p).unwrap_or_else(|| oval_ring(&anchors))) } else { None };
     let mut stored = p.clone();
     if let Value::Object(m) = &mut stored {
-        m.insert("anchors".into(), serde_json::to_value(&spec.anchors).map_err(|e| bad(format!("the anchors would not serialise: {e}")))?);
+        m.insert("anchors".into(), serde_json::to_value(&anchors).map_err(|e| bad(format!("the anchors would not serialise: {e}")))?);
         if let Some(pts) = &stored_contour {
             m.insert("contour".into(), serde_json::to_value(pts).map_err(|e| bad(format!("the contour would not serialise: {e}")))?);
         }
@@ -303,29 +357,12 @@ fn parts(report: &photocraft_algo::face_sculpt::FaceReport) -> Value {
 /// Smart-filter hook: re-applies a stored Face Sculpt to a rendered smart object.
 pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> Option<Surface> {
     let (spec, cell) = stored_spec(params, canvas)?;
-    let (mut field, _) = face_field(&spec, canvas, cell);
-    let (yaw, pitch, roll) = (angle_of(params, "poseYaw", 8.0), angle_of(params, "posePitch", 8.0), angle_of(params, "poseRoll", 6.0));
-    if yaw.abs() + pitch.abs() + roll.abs() > 1e-6 {
-        let pts3: Vec<[f64; 3]> = spec.anchors.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64]).collect();
-        let eye_w = (pts3[263][0] - pts3[362][0]).abs().max(8.0);
-        contour::pose_stamp(&mut field, &pts3, yaw, pitch, roll, eye_w * 1.5);
-    }
-    let symmetry = symmetry_of(params);
-    if symmetry > 0.0 {
-        let pts: Vec<[f64; 2]> = spec.anchors.pts.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
-        let axis = [(pts[454][0] + pts[234][0]) * 0.5, (pts[10][1] + pts[152][1]) * 0.5];
-        let up = [pts[10][0] - pts[152][0], pts[10][1] - pts[152][1]];
-        let eye_w = (pts[263][0] - pts[362][0]).abs().max(8.0);
-        contour::align_pairs(&mut field, &pts, SYMMETRY_PAIRS, axis, up, f64::from(symmetry), eye_w * 2.0);
-    }
-    if let Some(pts) = contour_of(params) {
-        stamp_ring(&mut field, &pts, smooth_of(params));
-    }
+    let (field, _) = field_with(spec, contour_of(params).as_deref(), symmetry_of(params), smooth_of(params), angles(params), canvas, cell);
     Some(apply_liquify(surf, &field))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0,"templesLeft":-100..100=0,"templesRight":-100..100=0,"cheekbonesLeft":-100..100=0,"cheekbonesRight":-100..100=0,"eyeSizeLeft":-100..100=0,"eyeSizeRight":-100..100=0,"pupilSizeLeft":-100..100=0,"pupilSizeRight":-100..100=0,"eyeHeightLeft":-100..100=0,"eyeHeightRight":-100..100=0,"eyeWidthLeft":-100..100=0,"eyeWidthRight":-100..100=0,"eyeSpacingLeft":-100..100=0,"eyeSpacingRight":-100..100=0,"innerCornerLeft":-100..100=0,"innerCornerRight":-100..100=0,"outerCornerLeft":-100..100=0,"outerCornerRight":-100..100=0,"lowerLidLeft":-100..100=0,"lowerLidRight":-100..100=0,"eyeTiltLeft":-100..100=0,"eyeTiltRight":-100..100=0,"eyePositionLeft":-100..100=0,"eyePositionRight":-100..100=0,"browHeadLeft":-100..100=0,"browHeadRight":-100..100=0,"browTailLeft":-100..100=0,"browTailRight":-100..100=0,"browThicknessLeft":-100..100=0,"browThicknessRight":-100..100=0,"browSpacingLeft":-100..100=0,"browSpacingRight":-100..100=0,"browTiltLeft":-100..100=0,"browTiltRight":-100..100=0,"browShapeLeft":-100..100=0,"browShapeRight":-100..100=0,"browHeightLeft":-100..100=0,"browHeightRight":-100..100=0,"mouthWidthLeft":-100..100=0,"mouthWidthRight":-100..100=0,"lipTiltLeft":-100..100=0,"lipTiltRight":-100..100=0,"preset":"none|classic|youthful|heroic|juvenile|round|long|square"="none","presetStrength":0..100=60 (a named bundle of the sliders, stacked with the manual ones; each Left/Right pair stays linked until one side is given its own value — the lock, without the widget),"poseYaw":-100..100=0,"posePitch":-100..100=0,"poseRoll":-100..100=0 (3D塑颜: the mesh's own depth rotates — ±100 is ±8° yaw/pitch, ±6° roll),"symmetry":0..100=0 (对称液化·五官: the paired features align toward each other's mirror about the face's axis),"smooth":0..100=0 (AI 面部流畅: the face oval contour, low-passed and relaxed; the ring is embedded from the mesh at apply time, like the anchors) (the face-mesh analysis runs first — cached like Select Region, seconds the first time; each slider's positive direction is its label's action),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0,"templesLeft":-100..100=0,"templesRight":-100..100=0,"cheekbonesLeft":-100..100=0,"cheekbonesRight":-100..100=0,"eyeSizeLeft":-100..100=0,"eyeSizeRight":-100..100=0,"pupilSizeLeft":-100..100=0,"pupilSizeRight":-100..100=0,"eyeHeightLeft":-100..100=0,"eyeHeightRight":-100..100=0,"eyeWidthLeft":-100..100=0,"eyeWidthRight":-100..100=0,"eyeSpacingLeft":-100..100=0,"eyeSpacingRight":-100..100=0,"innerCornerLeft":-100..100=0,"innerCornerRight":-100..100=0,"outerCornerLeft":-100..100=0,"outerCornerRight":-100..100=0,"lowerLidLeft":-100..100=0,"lowerLidRight":-100..100=0,"eyeTiltLeft":-100..100=0,"eyeTiltRight":-100..100=0,"eyePositionLeft":-100..100=0,"eyePositionRight":-100..100=0,"browHeadLeft":-100..100=0,"browHeadRight":-100..100=0,"browTailLeft":-100..100=0,"browTailRight":-100..100=0,"browThicknessLeft":-100..100=0,"browThicknessRight":-100..100=0,"browSpacingLeft":-100..100=0,"browSpacingRight":-100..100=0,"browTiltLeft":-100..100=0,"browTiltRight":-100..100=0,"browShapeLeft":-100..100=0,"browShapeRight":-100..100=0,"browHeightLeft":-100..100=0,"browHeightRight":-100..100=0,"mouthWidthLeft":-100..100=0,"mouthWidthRight":-100..100=0,"lipTiltLeft":-100..100=0,"lipTiltRight":-100..100=0,"preset":"none|classic|youthful|heroic|juvenile|round|long|square"="none","presetStrength":0..100=60 (a named bundle of the sliders, stacked with the manual ones; each Left/Right pair stays linked until one side is given its own value — the lock, without the widget),"poseYaw":-100..100=0,"posePitch":-100..100=0,"poseRoll":-100..100=0 (3D塑颜: the mesh's own depth rotates — ±100 is ±8° yaw/pitch, ±6° roll),"symmetry":0..100=0 (对称液化·五官: the paired features align toward each other's mirror about the face's axis),"smooth":0..100=0 (AI 面部流畅: the face oval contour, low-passed and relaxed; the ring is embedded from the mesh at apply time, like the anchors) (with `anchors` the analysis never runs on Apply; each slider's positive direction is its label's action),"anchors":{…}? (`portrait.analyze`'s document-pixel mesh — the panel supplies them so Apply is a field build and a warp; without them one lightweight face-mesh analysis runs, a detected face box needing no person stage, the no-detector fallback asking the subject line only for presence. Stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: FACE_SCULPT,
         label: "Face Sculpt…",
@@ -345,6 +382,69 @@ mod tests {
     use super::*;
     use crate::Session;
 
+    /// A checkerboard the warp's resampling visibly changes (a flat fill would not).
+    fn patterned(w: u32, h: u32) -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": w, "height": h})).unwrap();
+        s.edit("paint", |doc, _| {
+            let bg = doc.layers[0].surface_mut().unwrap();
+            let n = bg.channels();
+            let mut data = Vec::with_capacity((w * h) as usize * n);
+            for y in 0..h {
+                for x in 0..w {
+                    let t = ((x + y) % 2) as f32;
+                    data.extend_from_slice(&[t, 1.0 - t, 0.5][..n.min(3)]);
+                    if n == 4 {
+                        data.push(1.0);
+                    }
+                }
+            }
+            bg.write_region(Rect::new(0, 0, w as i32, h as i32), &data);
+            Ok(())
+        })
+        .unwrap();
+        s
+    }
+
+    /// A 478-point mesh on a 512² document: the chin, the forehead and the two cheek edges
+    /// placed, every other point at the mesh's middle (enough for the eye and face fields).
+    fn anchors_on() -> FaceAnchors {
+        let mut pts = vec![[256.0f32, 240.0f32, 0.0f32]; photocraft_algo::face_sculpt::MESH_COUNT];
+        for &(i, x, y) in &[(10usize, 256.0, 96.0), (152, 256.0, 392.0), (454, 376.0, 248.0), (234, 136.0, 248.0)] {
+            pts[i] = [x as f32, y as f32, 0.0];
+        }
+        FaceAnchors { doc: [512.0, 512.0], pts }
+    }
+
+    fn pixels(s: &Session, w: i32, h: i32) -> Vec<f32> {
+        s.active().unwrap().doc.layers[0].surface().unwrap().read_region(Rect::new(0, 0, w, h))
+    }
+
+    /// The panel's fast path: Apply warps from the params' own mesh — no person stage, no
+    /// analysis (this document has neither a face nor a person to find).
+    #[test]
+    fn explicit_anchors_apply_without_a_person_analysis() {
+        let mut s = patterned(512, 512);
+        let before = pixels(&s, 512, 512);
+        let steps = s.active().unwrap().history.past_len();
+        let r = s.execute(FACE_SCULPT, json!({"eyeSize": -25.0, "faceSlim": 40.0, "anchors": serde_json::to_value(anchors_on()).unwrap()})).unwrap();
+        assert_eq!(r["changed"], json!(true));
+        assert!(r["maxDisplacement"].as_f64().unwrap_or_default() > 0.0);
+        assert_ne!(before, pixels(&s, 512, 512), "the warp must move pixels");
+        assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "one history step");
+    }
+
+    #[test]
+    fn malformed_anchors_are_refused_not_analysed() {
+        let mut s = patterned(64, 64);
+        let steps = s.active().unwrap().history.past_len();
+        let mut anchors = serde_json::to_value(anchors_on()).unwrap();
+        anchors["pts"] = serde_json::Value::Array(vec![json!([32.0, 32.0, 0.0]); 3]);
+        let err = s.execute(FACE_SCULPT, json!({"eyeSize": 30.0, "anchors": anchors})).unwrap_err().to_string();
+        assert!(err.contains("478"), "{err}");
+        assert_eq!(s.active().unwrap().history.past_len(), steps, "a refused run edits nothing");
+    }
+
     #[test]
     fn zero_sliders_change_nothing_without_an_analysis() {
         let mut s = Session::new();
@@ -353,24 +453,21 @@ mod tests {
         assert_eq!(r, json!({"layer": s.active().unwrap().active_layer.unwrap().0, "changed": false}));
     }
 
+    /// Face no longer runs the person line to decide whether a face exists: with no detector
+    /// the subject line is only the whole-document mesh's liveness gate, and its answer is
+    /// the Face wording, not the person line's.
     #[test]
     fn a_personless_photo_reports_no_face() {
         let mut s = Session::new();
         s.execute("file.new", json!({"width": 96, "height": 128, "background": "white"})).unwrap();
         let err = s.execute(FACE_SCULPT, json!({"eyeSize": 30})).unwrap_err().to_string();
-        // A blank image the analysis refuses before its mesh stage ("no person"); a photo
-        // with a person but no detectable face would answer the mesh stage's own wording.
-        assert!(err.contains("no person") || err.contains("no face"), "{err}");
+        assert!(err.contains("no face"), "{err}");
         assert!(s.execute("edit.undo", json!({})).is_err());
     }
 
     #[test]
     fn stored_params_replay_the_same_field() {
-        let mut pts = vec![[256.0f32, 240.0f32, 0.0f32]; photocraft_algo::face_sculpt::MESH_COUNT];
-        for &(i, x, y) in &[(10usize, 256.0, 96.0), (152, 256.0, 392.0), (454, 376.0, 248.0), (234, 136.0, 248.0)] {
-            pts[i] = [x as f32, y as f32, 0.0];
-        }
-        let anchors = FaceAnchors { doc: [512.0, 512.0], pts };
+        let anchors = anchors_on();
         let params = json!({"eyeSize": -25.0, "faceSlim": 40.0, "anchors": serde_json::to_value(&anchors).unwrap(), "meshSize": 4});
         let bounds = Rect::new(0, 0, 512, 512);
         let (spec, _) = stored_spec(&params, bounds).unwrap();
@@ -379,6 +476,8 @@ mod tests {
         let f2 = face_field(&stored_spec(&params, bounds).unwrap().0, bounds, 4.0).0;
         assert!(!f1.is_identity());
         assert_eq!(f1, f2, "the same params must rebuild the same field");
+        // The live preview and Apply share this builder, so all three must agree.
+        assert_eq!(f1, field_for(&params, bounds).unwrap().0, "field_for and the stored replay must build the same field");
         assert!(stored_spec(&json!({"eyeSize": -25.0}), bounds).is_none());
     }
 
@@ -494,7 +593,7 @@ mod tests {
             let (params, source) = {
                 let d = s.active().ok_or(EngineError::NoDocument)?;
                 let id = d.active_layer.ok_or(EngineError::Other("no active layer".into()))?;
-                let photocraft_doc::LayerContent::Smart(sm) = &d.doc.layer(id).ok_or(EngineError::NoLayer(id))?.content else { unreachable!("just converted") };
+                let photocraft_doc::LayerContent::Smart(sm) = &d.doc.layer(id).ok_or(EngineError::NoLayer(id))?.content else { panic!("just converted") };
                 (sm.smart_filters[0].params.clone(), sm.cache.clone().ok_or_else(|| EngineError::Other("no rendered source".into()))?)
             };
             assert!(params.get("anchors").is_some(), "the mesh must ride the stored params");

@@ -657,13 +657,15 @@ fn cheeks_from_parsing(
 /// whole-body segmentation. `ctx` carries the progress; `select.region` passes a fresh
 /// detached one, whose stages run silently. The drawn-`roi` failure is loud (the user asked
 /// for that face); with `roi` absent every stage degrades quietly.
-pub(crate) fn analyze_person(
+/// The person matte (the ort tier when the feature and its model are present) or Select
+/// Subject's seeded min cut, at document resolution — the Person region every person-based
+/// stage reads. `None` when neither can find a person.
+fn person_surface(
     doc: &Arc<Document>,
     target: Option<photocraft_doc::LayerId>,
     sample_all: bool,
-    roi: Option<photocraft_geom::Rect>,
     ctx: &crate::jobs::JobCtx,
-) -> Result<Arc<photocraft_portrait::Analysis>> {
+) -> Result<Option<photocraft_raster::Surface>> {
     // The ort matte (feature "ort" + feynobg.onnx in the models dir) replaces the
     // whole subject line when it answers: direct hair-edge alpha at 1024², no
     // seed/GrabCut. Without it (the default build, or no model placed) the
@@ -675,80 +677,196 @@ pub(crate) fn analyze_person(
             photocraft_ml::person_matte(&img.px, img.w, img.h)
         })
     });
-    let person = if let Some(matte) = matte {
+    if let Some(matte) = matte {
         ctx.check().map_err(|_| EngineError::Cancelled)?;
         let (dw, dh) = (doc.size.width as usize, doc.size.height as usize);
         let up = photocraft_ml::resize_mask(&matte.px, matte.w, matte.h, dw, dh).ok_or_else(|| EngineError::Other("the matte would not resample".into()))?;
         let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
         surface.write_region(photocraft_geom::Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32), &up);
-        surface
-    } else {
-        // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
-        let found = ctx
-            .stage(0.25, 0.4, "Finding person", |ctl| {
-                with_doc_sampler(doc, target, sample_all, |smp, d| {
-                    let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
-                    subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
-                })
+        return Ok(Some(surface));
+    }
+    // Cancel reaches the min cuts inside Select Subject, so Esc doesn't wait for them.
+    let found = ctx
+        .stage(0.25, 0.4, "Finding person", |ctl| {
+            with_doc_sampler(doc, target, sample_all, |smp, d| {
+                let seed = crate::smartselect_cmds::subject_seed(smp, d.bounds());
+                subject::select_subject_seeded_with(smp, d.bounds(), seed.as_ref(), ctl)
             })
-            .map_err(|_| EngineError::Cancelled)?;
-        let region = found.ok_or_else(|| EngineError::Other("no person found".into()))?;
-        matting::region_surface(&region)
+        })
+        .map_err(|_| EngineError::Cancelled)?;
+    Ok(found.map(|region| matting::region_surface(&region)))
+}
+
+/// SCRFD's box about the largest face, in document pixels. `None` without the detector
+/// model (`facedetector.onnx` in the models dir) or a face — the caller keeps its
+/// whole-document fallback.
+fn detected_face_box(
+    doc: &Arc<Document>,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    ctx: &crate::jobs::JobCtx,
+) -> Option<photocraft_geom::Rect> {
+    ctx.stage(0.4, 0.45, "Finding faces", |_| {
+        with_doc_sampler(doc, target, sample_all, |smp, d| {
+            let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::detect::DETECT_SIDE * photocraft_ml::detect::DETECT_SIDE);
+            let img = smp.rgb_scaled(d.bounds(), step);
+            let face = photocraft_ml::detect::detect_faces(&img.px, img.w, img.h)?.first().copied()?;
+            let (sw, sh) = (img.w as f32, img.h as f32);
+            let (dw, dh) = (d.size.width as f32, d.size.height as f32);
+            Some(photocraft_geom::Rect::new(
+                (face.x0 / sw * dw) as i32,
+                (face.y0 / sh * dh) as i32,
+                (face.x1 / sw * dw).ceil() as i32,
+                (face.y1 / sh * dh).ceil() as i32,
+            ))
+        })
+    })
+}
+
+/// The box path's two-pass FaceMesh: the first over the margin-expanded box, the second
+/// over the oval ring's box, so a loose box still hands the mesh a face-dominant crop. A
+/// drawn box (`drawn`) that fails the gate errors the run — the user asked for that face;
+/// the automatic one answers `None` and the caller falls back to the whole-document mesh.
+fn boxed_mesh(
+    doc: &Arc<Document>,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    face_box: Option<photocraft_geom::Rect>,
+    drawn: bool,
+    ctx: &crate::jobs::JobCtx,
+) -> Result<Option<(Vec<[f32; 3]>, photocraft_geom::Rect)>> {
+    let Some(r) = face_box else { return Ok(None) };
+    let (dw, dh) = (doc.size.width, doc.size.height);
+    let no_face = || EngineError::Other("no face found in the box — draw it tighter around the face".into());
+    let first = expanded(r, dw, dh, BOX_MARGIN);
+    let pts = ctx.stage(0.45, 0.55, "Finding landmarks", |_| mesh_over(doc, target, sample_all, first));
+    let ring = pts.and_then(|pts| {
+        let ring = expanded(oval_box(&pts)?, dw, dh, RING_MARGIN);
+        (ring.width() >= MIN_FACE_SIDE as u32 && ring.height() >= MIN_FACE_SIDE as u32).then_some(ring)
+    });
+    match ring {
+        Some(ring) => match ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)) {
+            Some(pts) => Ok(Some((pts, ring))),
+            None if drawn => Err(no_face()),
+            None => Ok(None),
+        },
+        None if drawn => Err(no_face()),
+        None => Ok(None),
+    }
+}
+
+/// Which landmark set a sculpt panel needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SculptKind {
+    Body,
+    Face,
+}
+
+impl SculptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SculptKind::Body => "body",
+            SculptKind::Face => "face",
+        }
+    }
+}
+
+/// The lightweight analysis a sculpt command needs — no Smart Portrait parsing, body or
+/// fashion stages. Body: the person mask and the pose, with a boxed mesh when a detector
+/// finds a face. Face: SCRFD's box and the FaceMesh when the detector answers, so a photo
+/// the subject line cannot segment still gets its face; without a box the whole-document
+/// mesh runs, with the subject line only as the liveness gate the embedded mesh lacks.
+///
+/// Never stored in `portrait_cache`: the partial `Analysis` lacks the regions
+/// `portrait.create` and Select Region read.
+pub(crate) fn analyze_sculpt(
+    doc: &Arc<Document>,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    kind: SculptKind,
+    ctx: &crate::jobs::JobCtx,
+) -> Result<Arc<photocraft_portrait::Analysis>> {
+    let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
+    let person = match kind {
+        SculptKind::Body => Some(person_surface(doc, target, sample_all, ctx)?.ok_or_else(|| EngineError::Other(crate::sculpt_cmds::NO_PERSON.into()))?),
+        SculptKind::Face => None,
     };
+    if let Some(person) = &person {
+        analysis.set(photocraft_portrait::Region::Person, person.clone());
+    }
+    let face_box = detected_face_box(doc, target, sample_all, ctx);
+    let boxed = boxed_mesh(doc, target, sample_all, face_box, false, ctx)?;
+    analysis.landmarks = match boxed {
+        Some((pts, _)) => pts,
+        None => {
+            // The whole-document mesh is the no-detector fallback, and the embedded model has no
+            // presence output: on anything without a face it answers an average-face template
+            // (a blank canvas included). The subject line's answer is the liveness gate then —
+            // it is what the pre-sculpt pipeline required of every Face run anyway — so a
+            // faceless document reports no face instead of warping an invented one. With a
+            // detected box none of this runs: Face never needs the person stage there.
+            if kind == SculptKind::Face && person_surface(doc, target, sample_all, ctx)?.is_none() {
+                return Err(EngineError::Other(crate::face_sculpt_cmds::NO_FACE.into()));
+            }
+            ctx.stage(0.65, 0.7, "Finding landmarks", |_| mesh_over(doc, target, sample_all, doc.bounds())).unwrap_or_default()
+        }
+    };
+    if let SculptKind::Body = kind {
+        analysis.pose = ctx
+            .stage(0.7, 0.75, "Finding pose", |_| {
+                let bounds = person.as_ref().map(photocraft_raster::Surface::content_bounds).unwrap_or_default();
+                (!bounds.is_empty()).then(|| pose_over(doc, target, sample_all, bounds)).flatten()
+            })
+            .unwrap_or_default();
+    }
+    Ok(Arc::new(analysis))
+}
+
+/// The anchors and contour `portrait.analyze` reports, straight from a document — the
+/// command's own body, callable by the sculpt panels' background worker with its own
+/// cancellable [`crate::jobs::JobCtx`]. One lightweight run and never cached, like the
+/// command; the command adds only the reply framing.
+pub fn analyze_anchors(
+    doc: &Arc<Document>,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    kind: SculptKind,
+    ctx: &crate::jobs::JobCtx,
+) -> Result<(Value, Option<Vec<[f64; 2]>>)> {
+    let analysis = analyze_sculpt(doc, target, sample_all, kind, ctx)?;
+    match kind {
+        SculptKind::Body => {
+            let anchors = crate::sculpt_cmds::anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other(crate::sculpt_cmds::NO_PERSON.into()))?;
+            let contour = analysis.mask(photocraft_portrait::Region::Person).and_then(crate::sculpt_cmds::person_contour);
+            Ok((serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?, contour))
+        }
+        SculptKind::Face => {
+            let anchors =
+                crate::face_sculpt_cmds::anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other(crate::face_sculpt_cmds::NO_FACE.into()))?;
+            Ok((serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?, None))
+        }
+    }
+}
+
+pub(crate) fn analyze_person(
+    doc: &Arc<Document>,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    roi: Option<photocraft_geom::Rect>,
+    ctx: &crate::jobs::JobCtx,
+) -> Result<Arc<photocraft_portrait::Analysis>> {
+    let person = person_surface(doc, target, sample_all, ctx)?.ok_or_else(|| EngineError::Other("no person found".into()))?;
     let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
     analysis.set(photocraft_portrait::Region::Person, person.clone());
     let (dw, dh) = (doc.size.width, doc.size.height);
     // The box the mesh and parsing crop to: the user's `roi` wins; without one
-    // the detector (SCRFD, `facedetector.onnx` in the models dir) supplies the
-    // largest face's box — the automatic sibling of the drawn one. Neither a
-    // model nor a face leaves `None` and the legacy whole-document mesh runs.
-    let face_box = roi.or_else(|| {
-        ctx.stage(0.4, 0.45, "Finding faces", |_| {
-            with_doc_sampler(doc, target, sample_all, |smp, d| {
-                let step = photocraft_algo::segment::scale_for(d.bounds(), photocraft_ml::detect::DETECT_SIDE * photocraft_ml::detect::DETECT_SIDE);
-                let img = smp.rgb_scaled(d.bounds(), step);
-                let face = photocraft_ml::detect::detect_faces(&img.px, img.w, img.h)?.first().copied()?;
-                let (sw, sh) = (img.w as f32, img.h as f32);
-                Some(photocraft_geom::Rect::new(
-                    (face.x0 / sw * dw as f32) as i32,
-                    (face.y0 / sh * dh as f32) as i32,
-                    (face.x1 / sw * dw as f32).ceil() as i32,
-                    (face.y1 / sh * dh as f32).ceil() as i32,
-                ))
-            })
-        })
-    });
-    // The box path's mesh runs first: its oval ring defines the crop the parsing
-    // stage then reads (both models want the face-dominant crop — see `roi`). Two
-    // passes, because a box is only a guess at the face: the first over the box
-    // margin-expanded, the second over the ring's box, so a loose box still hands
-    // the mesh a face-dominant crop. A drawn box that fails the gate errors the
-    // run (the user asked for that face); the automatic one falls back to the
-    // legacy whole-document mesh — the box stages are an improvement, not a
-    // requirement.
-    let boxed = match face_box {
-        Some(r) => {
-            let no_face = || EngineError::Other("no face found in the box — draw it tighter around the face".into());
-            let first = expanded(r, dw, dh, BOX_MARGIN);
-            let pts = ctx.stage(0.45, 0.55, "Finding landmarks", |_| mesh_over(doc, target, sample_all, first));
-            let ring = pts.and_then(|pts| {
-                let ring = expanded(oval_box(&pts)?, dw, dh, RING_MARGIN);
-                (ring.width() >= MIN_FACE_SIDE as u32 && ring.height() >= MIN_FACE_SIDE as u32).then_some(ring)
-            });
-            match ring {
-                Some(ring) => {
-                    match ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)) {
-                        Some(pts) => Some((pts, ring)),
-                        None if roi.is_some() => return Err(no_face()),
-                        None => None,
-                    }
-                }
-                None if roi.is_some() => return Err(no_face()),
-                None => None,
-            }
-        }
-        None => None,
-    };
+    // the detector (SCRFD) supplies the largest face's box — the automatic
+    // sibling of the drawn one. Neither a model nor a face leaves `None` and the
+    // legacy whole-document mesh runs.
+    let face_box = roi.or_else(|| detected_face_box(doc, target, sample_all, ctx));
+    // The box path's mesh runs first: its oval ring defines the crop the parsing stage
+    // then reads (both models want the face-dominant crop — see `roi`).
+    let boxed = boxed_mesh(doc, target, sample_all, face_box, roi.is_some(), ctx)?;
     // The parsing stage when a model is handed in (`PHOTOCRAFT_MODELS_DIR`):
     // skin/hair/clothes masks join the person mask; without one the slice is the
     // person alone and every layer but the first stays out. The whole-body
@@ -1007,6 +1125,44 @@ fn save_recipe(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "action": name }))
 }
 
+/// `portrait.analyze`: the anchors that let the sculpt commands skip analysis on Apply — one
+/// lightweight run, Body (person mask + pose, plus the person contour) or Face (the face mesh;
+/// the person stage only gates the no-detector fallback). Read-only: no history step, and
+/// nothing goes into `portrait_cache` (a partial analysis would poison `portrait.create` and
+/// Select Region).
+fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
+    let kind = match p.get("kind").and_then(Value::as_str).unwrap_or("body") {
+        "body" => SculptKind::Body,
+        "face" => SculptKind::Face,
+        other => return Err(EngineError::BadParams { cmd: "portrait.analyze".into(), msg: format!("`kind` is \"body\" or \"face\", not {other:?}") }),
+    };
+    let sample_all = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let mut target = st.active_layer;
+    if p.get("layer").is_some() {
+        target = Some(crate::commands::layer_param(s, p)?);
+    }
+    // As the sculpt commands resolve it: a layer that is not a raster surface has no pixels
+    // of its own to sample, so the sampler reads the flattened document instead.
+    let target = target.filter(|l| !sample_all && st.doc.layer(*l).and_then(photocraft_doc::Layer::surface).is_some());
+    let doc = Arc::clone(&st.doc);
+    let (width, height) = (doc.size.width, doc.size.height);
+    let t0 = crate::photo_cmds::Stopwatch::start();
+    crate::jobs::run(
+        s,
+        "Analyze Portrait",
+        false,
+        move |ctx| analyze_anchors(&doc, target, sample_all, kind, ctx),
+        move |_, (anchors, contour)| {
+            let mut r = json!({"kind": kind.as_str(), "width": width, "height": height, "layer": target.map(|l| l.0), "anchors": anchors, "ms": t0.ms()});
+            if let Some(contour) = contour {
+                r["contour"] = json!(contour);
+            }
+            Ok(r)
+        },
+    )
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec {
@@ -1028,6 +1184,16 @@ pub fn specs() -> Vec<CommandSpec> {
             enabled: |_| Ok(()),
             run: save_recipe,
             journal: true,
+        },
+        CommandSpec {
+            id: "portrait.analyze",
+            label: "Analyze Portrait",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"kind":"body"|"face"="body","layer":id?,"sampleAllLayers":bool=false} → {kind,width,height,layer,anchors,contour?,ms} (the anchors the sculpt panels hand `filter.bodySculpt`/`filter.faceSculpt`: Body = person mask + pose + the silhouette contour, Face = the face mesh — a detected face box needs no person stage; without one the subject line only gates presence. One lightweight run — no parsing/body/fashion stages, no history step, nothing cached — and Apply with these anchors never analyses again)"##,
+            enabled,
+            run: analyze,
+            journal: false,
         },
     ]
 }
@@ -1847,6 +2013,52 @@ mod tests {
         assert_eq!(mask.value(16, 14), 0.0, "below the mouth line is chin");
         assert!(mask.value(8, 9) > 0.9, "the left cheek survives");
         assert!(mask.value(24, 9) > 0.9, "the right cheek survives");
+    }
+
+    /// A blank canvas has no person: Body's analysis says so and neither kind writes history.
+    #[test]
+    fn portrait_analyze_body_on_a_blank_document_reports_no_person() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 96, "height": 128})).unwrap();
+        let steps = s.active().unwrap().history.past_len();
+        let err = s.execute("portrait.analyze", json!({"kind": "body"})).unwrap_err().to_string();
+        assert!(err.contains("no person"), "{err}");
+        assert_eq!(s.active().unwrap().history.past_len(), steps, "analysis is not an edit");
+    }
+
+    /// The Face path never runs the person stage when a detector finds the face; without one
+    /// the subject line is only the liveness gate for the whole-document mesh (the embedded
+    /// model has no presence output and answers an average face on anything), so a blank
+    /// document reports no face — not the person line's `no person`.
+    #[test]
+    fn portrait_analyze_face_on_a_blank_document_reports_no_face() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 96, "height": 128})).unwrap();
+        let steps = s.active().unwrap().history.past_len();
+        let err = s.execute("portrait.analyze", json!({"kind": "face"})).unwrap_err().to_string();
+        assert!(err.contains("no face"), "{err}");
+        assert!(!err.contains("no person"), "Face no longer needs the person stage: {err}");
+        assert_eq!(s.active().unwrap().history.past_len(), steps, "analysis is not an edit");
+    }
+
+    #[test]
+    fn portrait_analyze_refuses_an_unknown_kind() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 64, "height": 64})).unwrap();
+        let err = s.execute("portrait.analyze", json!({"kind": "bodyy"})).unwrap_err().to_string();
+        assert!(err.contains("kind"), "{err}");
+    }
+
+    /// The sculpt panels consume only landmarks; the analysis that produced them lacks the
+    /// parsing/body/fashion regions, so it must never land in `portrait_cache`, which
+    /// `portrait.create` and Select Subject read as a whole-document analysis.
+    #[test]
+    fn portrait_analyze_does_not_store_a_partial_analysis() {
+        let (mut s, _) = disc();
+        let r = s.execute("portrait.analyze", json!({"kind": "face"})).unwrap();
+        assert_eq!(r["anchors"]["pts"].as_array().map(Vec::len), Some(478));
+        let doc = std::sync::Arc::clone(&s.active().unwrap().doc);
+        assert!(s.portrait_cache.get(&doc, |_, _| true).is_none(), "a partial analysis was stored");
     }
 
     #[test]
