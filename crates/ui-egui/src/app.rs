@@ -50,6 +50,7 @@ impl PhotocraftApp {
             session,
             ui: UiState::default(),
             sculpt: None,
+            sculpt_live: None,
             services,
             canvases: HashMap::new(),
             raster_logs: HashMap::new(),

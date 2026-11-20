@@ -309,6 +309,8 @@ pub struct PhotocraftApp {
     /// The open Body/Face Sculpt panel, when there is one (sculpt_ui). Plain app state,
     /// not UiState: the control channel does not drive this panel.
     pub sculpt: Option<sculpt_ui::Panel>,
+    /// The open panel's one portrait analysis and its live canvas preview (sculpt_ui::live).
+    pub sculpt_live: Option<sculpt_ui::Live>,
     pub services: Services,
     /// Canvas caches per (document, display): CPU textures hold monitor values; the GPU
     /// canvas state is shared (`canvas::GPU_OUTPUT`).

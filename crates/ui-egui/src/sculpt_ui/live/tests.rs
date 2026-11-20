@@ -1,0 +1,313 @@
+//! The panel's runtime: the one analysis at open, Apply with its anchors, and the live proxy
+//! preview — what it shows, what it hides and where it refuses.
+
+use egui_kittest::Harness;
+use egui_kittest::kittest::{NodeT as _, Queryable};
+use photocraft_geom::Rect;
+use serde_json::{Value, json};
+
+use super::{Live, display_doc};
+use crate::PhotocraftApp;
+use crate::sculpt_ui::{BODY, FACE, Panel};
+
+/// A document whose pixels move visibly under a warp, so an unchanged preview is not just a
+/// uniform image.
+fn patterned(w: u32, h: u32) -> photocraft_engine::Session {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": w, "height": h})).unwrap();
+    s.edit("paint", |doc, _| {
+        let bg = doc.layers[0].surface_mut().unwrap();
+        let n = bg.channels();
+        let mut data = Vec::with_capacity((w * h) as usize * n);
+        for y in 0..h {
+            for x in 0..w {
+                // Blocks, not single pixels: the proxy downsamples, and a one-pixel checker
+                // averages to flat grey at a scale above 1 — a warp of a flat image moves nothing.
+                let t = (((x / 8) + (y / 8)) % 2) as f32;
+                data.extend_from_slice(&[t, 1.0 - t, 0.5][..n.min(3)]);
+                if n == 4 {
+                    data.push(1.0);
+                }
+            }
+        }
+        bg.write_region(Rect::new(0, 0, w as i32, h as i32), &data);
+        Ok(())
+    })
+    .unwrap();
+    s
+}
+
+/// A blank document: no person and no face for an analysis to find.
+fn blank(w: u32, h: u32) -> photocraft_engine::Session {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": w, "height": h, "background": "white"})).unwrap();
+    s
+}
+
+fn app(session: photocraft_engine::Session) -> Box<PhotocraftApp> {
+    PhotocraftApp::new(session, crate::Services::default())
+}
+
+/// A full 33-joint pose on a `w × h` document (the engine tests' shape): shoulders, hips and
+/// ankles bracketing the torso the shaping sliders move.
+fn body_anchors(w: f32, h: f32) -> Value {
+    let mut pose = vec![json!([0.0, 0.0, 0.0]); 33];
+    let (sx, sy) = (w / 512.0, h / 768.0);
+    for &(i, x, y) in
+        &[(0usize, 256.0, 92.0), (11, 204.0, 180.0), (12, 308.0, 180.0), (23, 222.0, 400.0), (24, 292.0, 400.0), (27, 230.0, 680.0), (28, 284.0, 680.0)]
+    {
+        pose[i] = json!([x * sx, y * sy, 1.0]);
+    }
+    json!({"doc": [w, h], "pose": pose, "head": {"centre": [w * 0.5, 88.0 * sy], "radius": 52.0 * sx}, "chin": [w * 0.5, 138.0 * sy]})
+}
+
+/// The 478-point mesh the face tests' sliders shape.
+fn face_anchors() -> Value {
+    let mut pts = vec![json!([256.0, 240.0, 0.0]); 478];
+    for &(i, x, y) in &[(10usize, 256.0, 96.0), (152, 256.0, 392.0), (454, 376.0, 248.0), (234, 136.0, 248.0)] {
+        pts[i] = json!([x, y, 0.0]);
+    }
+    json!({"doc": [512.0, 512.0], "pts": pts})
+}
+
+fn panel(command: &'static str) -> Panel {
+    Panel { command, preset: "none".into(), ..Panel::default() }
+}
+
+fn harness(session: photocraft_engine::Session, size: egui::Vec2) -> Harness<'static, Box<PhotocraftApp>> {
+    let app = app(session);
+    let h =
+        Harness::builder().with_context(app.ctx().clone()).with_size(size).build_ui_state(|ui, app: &mut Box<PhotocraftApp>| crate::dialogs::run(app, ui), app);
+    PhotocraftApp::setup_context(&h.ctx, crate::theme::AppTheme::pro());
+    h
+}
+
+/// A document with no person keeps the analysis's refusal inline: the panel opens with the
+/// translated note, Apply disabled, no alert, and no history step.
+#[test]
+fn opening_a_body_panel_without_a_person_keeps_the_error_inline() {
+    let mut app = app(blank(64, 64));
+    let steps = app.session.active().unwrap().history.past_len();
+    let mut live = Live::open(&mut app, BODY);
+    assert!(live.busy(), "the analysis starts in the background, not on the open call");
+    live.analysis_now(&mut app);
+    assert!(!live.busy());
+    let notice = live.notice_text().expect("the refusal is shown inline");
+    assert!(notice.contains("No person"), "{notice}");
+    assert!(!live.ready(), "Apply has no anchors to send");
+    assert!(!app.ui.status_error, "the panel must not alert");
+    assert_eq!(app.session.active().unwrap().history.past_len(), steps);
+}
+
+/// Face Sculpt needs the face mesh only: a document without a face reports exactly that, never
+/// that no person was found — the person stage is not part of Face Sculpt.
+#[test]
+fn opening_a_face_panel_without_a_face_keeps_the_error_inline() {
+    let mut app = app(blank(64, 64));
+    let mut live = Live::open(&mut app, FACE);
+    live.analysis_now(&mut app);
+    let notice = live.notice_text().expect("the refusal is shown inline");
+    assert!(notice.contains("No face"), "{notice}");
+    assert!(!notice.contains("person"), "Face Sculpt does not need the person stage: {notice}");
+    assert!(!live.ready());
+    assert!(!app.ui.status_error);
+}
+
+/// Without anchors Apply is greyed out, and even a direct apply call edits nothing.
+#[test]
+fn apply_is_disabled_until_anchors_exist() {
+    let mut h = harness(blank(64, 64), egui::vec2(700.0, 700.0));
+    crate::sculpt_ui::open(h.state_mut(), BODY);
+    h.run_steps(3);
+    assert!(h.get_by_label("Apply").accesskit_node().is_disabled(), "Apply is greyed out without anchors");
+    let steps = h.state().session.active().unwrap().history.past_len();
+    let panel = h.state().sculpt.clone().expect("panel open");
+    super::apply(h.state_mut(), &panel);
+    assert_eq!(h.state().session.active().unwrap().history.past_len(), steps, "a refused Apply edits nothing");
+    assert!(h.state().sculpt.is_some(), "the panel stays open");
+}
+
+/// The panel's fast path through the UI: one click is one history step, the panel stays open,
+/// and the preview is gone so the canvas shows the committed warp.
+#[test]
+fn apply_with_anchors_is_one_step_and_keeps_the_panel_open() {
+    let mut h = harness(patterned(256, 384), egui::vec2(700.0, 900.0));
+    h.state_mut().sculpt = Some(panel(BODY));
+    let live = Live::test(h.state_mut(), BODY, body_anchors(256.0, 384.0));
+    h.state_mut().sculpt_live = Some(live);
+    h.state_mut().sculpt.as_mut().expect("panel open").values.insert("waist".into(), -60.0);
+    h.run_steps(2);
+    let steps = h.state().session.active().unwrap().history.past_len();
+    h.get_by_label("Apply").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.active().unwrap().history.past_len(), steps + 1, "one history step");
+    assert!(h.state().sculpt.is_some(), "Apply keeps the panel open");
+    assert!(h.state().sculpt_live.as_ref().is_some_and(|live| !live.has_preview()), "the preview gives way to the commit");
+}
+
+/// Apply's warp is already on the canvas: unchanged values must not start a preview that would
+/// draw the warp a second time over the committed pixels.
+#[test]
+fn an_applied_panel_does_not_preview_the_same_values_again() {
+    let mut app = app(patterned(256, 384));
+    let mut p = panel(BODY);
+    p.values.insert("waist".into(), -60.0);
+    let mut live = Live::test(&mut app, BODY, body_anchors(256.0, 384.0));
+    assert!(live.render_now(&mut app, &p).is_some(), "a frame is drawn");
+    app.sculpt_live = Some(live);
+    let steps = app.session.active().unwrap().history.past_len();
+    super::apply(&mut app, &p);
+    assert_eq!(app.session.active().unwrap().history.past_len(), steps + 1, "Apply added the document's one step");
+    let mut live = app.sculpt_live.take().expect("Apply keeps the runtime");
+    assert!(!live.has_preview(), "Apply drops the shown frame");
+    let generation = live.generation;
+    let ctx = app.ctx().clone();
+    live.tick(&mut app, &p, &ctx);
+    assert_eq!(live.generation, generation, "the applied values are not requested again");
+    assert!(!live.has_preview(), "no second warp is drawn over the commit");
+    app.sculpt_live = Some(live);
+}
+
+/// The canvas shows the document without the target layer while the proxy is drawn over it;
+/// the session's document is untouched, and closing the runtime brings the layer back.
+#[test]
+fn the_preview_hides_only_the_bound_layer_and_clears_with_it() {
+    let mut session = patterned(64, 64);
+    session.execute("layer.new.layer", json!({})).unwrap();
+    let target = session.active().unwrap().active_layer.expect("the new layer");
+    let below = session.active().unwrap().doc.layers[0].id;
+    let mut app = app(session);
+    let index = app.session.active_index().expect("active document");
+    let p = panel(BODY);
+    let mut live = Live::test(&mut app, BODY, body_anchors(64.0, 64.0));
+    assert!(live.render_now(&mut app, &p).is_some());
+    app.sculpt_live = Some(live);
+    let (shown, _) = display_doc(&app, index).expect("the canvas shows the preview document");
+    assert!(!shown.layer(target).expect("target").visible, "the target is hidden behind its proxy");
+    assert!(shown.layer(below).expect("the layer below").visible, "other layers stay");
+    assert!(app.session.active().unwrap().doc.layer(target).expect("target").visible, "the session document is not edited");
+    app.sculpt_live = None;
+    assert!(display_doc(&app, index).is_none(), "no runtime, no preview document");
+}
+
+/// The proxy covers the whole document within the side cap, derives from the layer's own
+/// pixels at zero sliders, and moves pixels when a slider asks.
+#[test]
+fn the_proxy_covers_the_document_within_the_side_cap() {
+    let mut app = app(patterned(1800, 1200));
+    let mut p = panel(BODY);
+    let mut live = Live::test(&mut app, BODY, body_anchors(1800.0, 1200.0));
+    let identity = live.render_now(&mut app, &p).expect("a frame");
+    let proxy = live.proxy.as_ref().expect("a cached proxy");
+    assert!(proxy.proxy.w <= 1600 && proxy.proxy.h <= 1600, "the long side is capped: {}×{}", proxy.proxy.w, proxy.proxy.h);
+    assert!(proxy.proxy.w as f64 * proxy.proxy.scale >= 1800.0, "the proxy covers the document width");
+    assert!(proxy.proxy.h as f64 * proxy.proxy.scale >= 1200.0, "the proxy covers the document height");
+    assert_eq!(proxy.proxy.bounds, app.session.active().unwrap().doc.bounds());
+    // Zero sliders displace nothing: the frame is the proxy's own pixels.
+    assert_eq!(identity.size, [proxy.proxy.w, proxy.proxy.h]);
+    for (i, (px, source)) in identity.pixels.iter().zip(&proxy.proxy.px).enumerate() {
+        let got = px.to_array();
+        for k in 0..4 {
+            let want = (source[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            assert!(got[k].abs_diff(want) <= 1, "proxy pixel {i} channel {k}: {got:?} vs {source:?}");
+        }
+    }
+    p.values.insert("waist".into(), -60.0);
+    let warped = live.render_now(&mut app, &p).expect("a frame");
+    assert!(
+        warped.pixels.iter().zip(&identity.pixels).any(|(a, b)| a.to_array().iter().zip(b.to_array()).any(|(x, y)| x.abs_diff(y) > 1)),
+        "a slider warps the proxy"
+    );
+}
+
+/// The face panel previews through the face field: its own sliders move the mesh's pixels.
+#[test]
+fn the_face_panel_previews_through_the_face_field() {
+    let mut app = app(patterned(512, 512));
+    let mut p = panel(FACE);
+    let mut live = Live::test(&mut app, FACE, face_anchors());
+    let identity = live.render_now(&mut app, &p).expect("a frame");
+    p.values.insert("eyeSize".into(), -25.0);
+    p.values.insert("faceSlim".into(), 40.0);
+    let warped = live.render_now(&mut app, &p).expect("a frame");
+    assert!(
+        warped.pixels.iter().zip(&identity.pixels).any(|(a, b)| a.to_array().iter().zip(b.to_array()).any(|(x, y)| x.abs_diff(y) > 1)),
+        "the face field warps the proxy"
+    );
+}
+
+/// A slider change after the anchors are in previews through the worker: `tick` starts the
+/// job, the frame lands on a later tick, and the canvas gets a preview to draw. Both the
+/// analysis path and the preview path share that one worker, so this guards the second half.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_slider_change_previews_through_the_worker() {
+    let mut app = app(patterned(256, 384));
+    let mut p = panel(BODY);
+    p.values.insert("waist".into(), -60.0);
+    let mut live = Live::test(&mut app, BODY, body_anchors(256.0, 384.0));
+    let ctx = app.ctx().clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !live.has_preview() {
+        live.tick(&mut app, &p, &ctx);
+        assert!(std::time::Instant::now() < deadline, "the worker's frame never published");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The analysis lands on a later tick than the panel opened, and the first slider change after
+/// it previews — the panel was already on screen, at values the open call never saw.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_slider_change_after_the_analysis_lands_previews() {
+    let mut app = app(patterned(256, 384));
+    let doc = app.session.active().unwrap().doc.id;
+    let layer = app.session.active().unwrap().active_layer.expect("a layer");
+    let revision = app.session.active().unwrap().revision;
+    let mut live = Live::test(&mut app, BODY, Value::Null);
+    live.anchors = Value::Null;
+    live.sampled = false;
+    live.busy = true;
+    live.analysis_pending = Some((doc, layer, revision));
+    let anchors = body_anchors(256.0, 384.0);
+    live.worker
+        .start(live.serial, app.ctx().clone(), move |_| {
+            Ok(super::worker::Output::Analysis(super::worker::Analysis { anchors, contour: None, layer: Some(layer.0) }))
+        })
+        .unwrap();
+    let ctx = app.ctx().clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while live.busy() {
+        live.tick(&mut app, &panel(BODY), &ctx);
+        assert!(std::time::Instant::now() < deadline, "the analysis never landed");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(live.ready(), "the landed anchors enable Apply");
+    let mut p = panel(BODY);
+    p.values.insert("waist".into(), -60.0);
+    while !live.has_preview() {
+        live.tick(&mut app, &p, &ctx);
+        assert!(std::time::Instant::now() < deadline, "the first slider change never previewed");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Another active layer has its own pose or face: the runtime rebinds to it, drops the old
+/// frame, and the panel's next Apply targets the new layer.
+#[test]
+fn switching_layers_rebinds_and_drops_the_old_preview() {
+    let mut session = patterned(64, 64);
+    session.execute("layer.new.layer", json!({})).unwrap();
+    let below = session.active().unwrap().doc.layers[0].id;
+    let mut app = app(session);
+    let p = panel(BODY);
+    let mut live = Live::test(&mut app, BODY, body_anchors(64.0, 64.0));
+    assert!(live.render_now(&mut app, &p).is_some());
+    app.sculpt_live = Some(live);
+    app.session.execute("layer.select", json!({"layer": below.0})).unwrap();
+    let mut live = app.sculpt_live.take().expect("runtime");
+    let ctx = app.ctx().clone();
+    live.tick(&mut app, &p, &ctx);
+    assert_eq!(live.layer, Some(below), "the runtime follows the active layer");
+    assert!(!live.has_preview(), "the old layer's frame is gone");
+}

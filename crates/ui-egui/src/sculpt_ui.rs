@@ -15,6 +15,11 @@ use serde_json::json;
 
 use crate::PhotocraftApp;
 
+mod live;
+
+pub use live::Live;
+pub(crate) use live::{apply, display_doc, show_in_canvas};
+
 pub const BODY: &str = "filter.bodySculpt";
 pub const FACE: &str = "filter.faceSculpt";
 
@@ -233,32 +238,66 @@ pub fn dialog_id() -> craft::ui::dialog::DialogId {
     craft::ui::dialog::DialogId::NULL
 }
 
-/// Opens the panel for `command` (fresh values, every lock linked, no preset chosen).
+/// Opens the panel for `command` (fresh values, every lock linked, no preset chosen), running
+/// its one `portrait.analyze` for the anchors Apply will carry.
 pub fn open(app: &mut PhotocraftApp, command: &'static str) {
     app.sculpt = Some(Panel { command, preset: "none".into(), ..Panel::default() });
+    app.sculpt_live = Some(Live::open(app, command));
+}
+
+/// The panel's status line — the analysis's progress or its refusal — inline above the rows so
+/// a disabled Apply explains itself. It changes while focus is elsewhere, so it is a polite
+/// live region: a screen reader announces the progress and then the final refusal.
+fn status_line(ui: &mut egui::Ui, text: &str, color: Option<egui::Color32>) {
+    let mut text = egui::RichText::new(text);
+    if let Some(color) = color {
+        text = text.color(color);
+    }
+    let label = ui.label(text);
+    ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
 }
 
 /// Draws the open panel. Kept open across Apply — the point of a panel.
 pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
-    let Some(panel) = app.sculpt.clone() else { return };
+    let Some(mut panel) = app.sculpt.clone() else {
+        // No panel, no runtime: a closed panel's preview must not outlive it.
+        app.sculpt_live = None;
+        return;
+    };
+    // The panel belongs to the document it analysed: switching tabs closes it, rather than
+    // applying one photo's anchors to another. The menu reopens it on the new document.
+    let bound = app.sculpt_live.as_ref().and_then(Live::document);
+    if let Some(bound) = bound
+        && app.session.active().map(|st| st.doc.id) != Some(bound)
+    {
+        app.sculpt = None;
+        app.sculpt_live = None;
+        return;
+    }
+    // The runtime follows the document, the target layer and the panel's values each frame.
+    if let Some(mut live) = app.sculpt_live.take() {
+        live.tick(app, &panel, ctx);
+        app.sculpt_live = Some(live);
+    }
+    let ready = app.sculpt_live.as_ref().is_some_and(Live::ready);
+    let busy = app.sculpt_live.as_ref().is_some_and(Live::busy);
+    let notice = app.sculpt_live.as_ref().and_then(Live::notice_text);
     let title = if panel.command == FACE { tl!("Face Sculpt") } else { tl!("Body Sculpt") };
     let mut close = false;
-    let mut run: Option<serde_json::Value> = None;
-    let mut panel = panel;
+    let mut confirm = false;
     // The tallest sections (the face's sixteen rows, or the ten eye pairs at three sliders
     // each once unlinked) outgrow a laptop's usable height. Cap the window to the screen and
     // let the rows scroll, so Apply and Close can never be pushed below its bottom edge.
     let max_height = (ctx.content_rect().height() - 48.0).max(240.0);
     egui::Window::new(title).id(egui::Id::unique("photocraft.sculpt")).min_width(360.0).default_size([440.0, 420.0]).max_height(max_height).show(ctx, |ui| {
         let sections = panel.sections();
-        let mut apply = false;
         let mut reset = false;
         // Bottom-up: the actions take the window's bottom edge first and the body fills what
         // is left — so a section taller than the window scrolls instead of hiding them.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
-                if ui.button(tl!("Apply")).clicked() {
-                    apply = true;
+                if ui.add_enabled(ready, egui::Button::new(tl!("Apply"))).clicked() {
+                    confirm = true;
                 }
                 if ui.button(tl!("Close")).clicked() {
                     close = true;
@@ -283,6 +322,15 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     }
                 });
                 ui.separator();
+                // The analysis's progress or refusal, or why the live preview is off: inline,
+                // above the rows, so a disabled Apply explains itself instead of failing
+                // silently.
+                if busy {
+                    status_line(ui, tl!("Analyzing portrait…"), None);
+                } else if let Some(notice) = &notice {
+                    let warning = crate::theme::Tokens::get(ui.ctx()).warning;
+                    status_line(ui, notice, Some(warning));
+                }
                 // The preset row (face only): seven one-clicks, the chosen one held. Wrapped, so
                 // a narrow window takes two lines rather than widening past the screen.
                 if panel.command == FACE {
@@ -302,8 +350,8 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             strength = 60.0; // the dialog's own default, shown rather than sent
                         }
                         ui.horizontal(|ui| {
-                            ui.label(tl!("Preset Strength"));
-                            ui.add(egui::Slider::new(&mut strength, 0.0..=100.0));
+                            let label = ui.label(tl!("Preset Strength"));
+                            ui.add(egui::Slider::new(&mut strength, 0.0..=100.0)).labelled_by(label.id);
                         });
                         panel.set("presetStrength", strength);
                     }
@@ -329,33 +377,35 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             let paired = section.pairs.contains(&row.key);
                             let linked = *panel.locks.get(row.key).unwrap_or(&true);
                             if paired {
-                                ui.horizontal(|ui| {
-                                    if ui.small_button(if linked { "🔗" } else { "⛓" }).clicked() {
-                                        panel.locks.insert(row.key.to_owned(), !linked);
-                                    }
-                                    ui.label(tl!(row.label));
-                                });
+                                let label = ui
+                                    .horizontal(|ui| {
+                                        if ui.small_button(if linked { "🔗" } else { "⛓" }).clicked() {
+                                            panel.locks.insert(row.key.to_owned(), !linked);
+                                        }
+                                        ui.label(tl!(row.label))
+                                    })
+                                    .inner;
                                 let mut base = panel.value(row.key);
-                                ui.add(egui::Slider::new(&mut base, -100.0..=100.0));
+                                ui.add(egui::Slider::new(&mut base, -100.0..=100.0)).labelled_by(label.id);
                                 ui.end_row();
                                 if linked {
                                     edits.push(Edit { key: row.key, base, sides: None });
                                 } else {
                                     let mut l = panel.value(&format!("{}Left", row.key));
                                     let mut rt = panel.value(&format!("{}Right", row.key));
-                                    ui.label("L");
-                                    ui.add(egui::Slider::new(&mut l, -100.0..=100.0));
+                                    let l_label = ui.label("L");
+                                    ui.add(egui::Slider::new(&mut l, -100.0..=100.0)).labelled_by(l_label.id);
                                     ui.end_row();
-                                    ui.label("R");
-                                    ui.add(egui::Slider::new(&mut rt, -100.0..=100.0));
+                                    let r_label = ui.label("R");
+                                    ui.add(egui::Slider::new(&mut rt, -100.0..=100.0)).labelled_by(r_label.id);
                                     ui.end_row();
                                     panel.set(row.key, base);
                                     edits.push(Edit { key: row.key, base, sides: Some((l, rt)) });
                                 }
                             } else {
                                 let mut v = panel.value(row.key);
-                                ui.label(tl!(row.label));
-                                ui.add(egui::Slider::new(&mut v, -100.0..=100.0));
+                                let label = ui.label(tl!(row.label));
+                                ui.add(egui::Slider::new(&mut v, -100.0..=100.0)).labelled_by(label.id);
                                 ui.end_row();
                                 edits.push(Edit { key: row.key, base: v, sides: None });
                             }
@@ -379,16 +429,17 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 panel.set(&format!("{}Right", row.key), 0.0);
             }
         }
-        if apply {
-            run = Some(panel.params());
-        }
     });
-    app.sculpt = (!close).then_some(panel);
-    if let Some(params) = run {
-        let command = app.sculpt.as_ref().map(|p| p.command).unwrap_or(BODY);
-        if let Err(e) = app.run(command, params) {
-            crate::dialogs::alerts::report_error(app, e);
-        }
+    if close {
+        app.sculpt = None;
+        app.sculpt_live = None;
+        return;
+    }
+    app.sculpt = Some(panel.clone());
+    if confirm {
+        // One history step through the engine command, carrying the panel's analysed anchors;
+        // the panel stays open for the next pass.
+        apply(app, &panel);
     }
 }
 

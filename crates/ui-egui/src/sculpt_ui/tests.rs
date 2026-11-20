@@ -3,7 +3,7 @@
 
 use super::*;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT as _, Queryable};
 use serde_json::json;
 
 /// A document to edit and the panel drawn through the app's dialog pass, on a screen no
@@ -35,7 +35,7 @@ fn the_actions_stay_on_screen_where_the_rows_do_not_fit() {
     }
     // The rows are what scrolls: the section's first row is laid out inside the panel, above
     // the actions, and the window as a whole stays inside the screen.
-    let first = h.get_by_label("Eye Size").rect();
+    let first = h.get_by_role_and_label(egui::accesskit::Role::Label, "Eye Size").rect();
     assert!(screen.contains_rect(first), "the first eye row is on screen: {first:?}");
     assert!(first.max.y <= h.get_by_label("Apply").rect().min.y, "the rows sit above the actions");
 }
@@ -59,6 +59,39 @@ fn a_shrunk_window_stays_shrunk() {
     h.run_steps(4);
     let after = h.ctx.memory(|m| m.area_rect(id)).expect("window area");
     assert!(after.height() < rect.height() - 100.0, "the shrink sticks: {rect:?} -> {after:?}");
+}
+
+/// The rows' sliders carry their visible label as their accessible name, so a screen reader
+/// announces "Waist, slider, 0" instead of an unnamed slider; `labelled_by` is the egui pattern
+/// for a text-less slider beside its label.
+#[test]
+fn each_slider_is_named_after_its_row_label() {
+    let mut h = harness(egui::vec2(560.0, 700.0));
+    crate::sculpt_ui::open(h.state_mut(), BODY);
+    h.run_steps(3);
+    let named: Vec<String> =
+        h.query_all_by_role(egui::accesskit::Role::Slider).filter_map(|node| node.accesskit_node().labelled_by().find_map(|label| label.value())).collect();
+    for row in ["Slim Body", "Waist", "Belly"] {
+        assert!(named.iter().any(|name| name == row), "a slider is named {row}: {named:?}");
+    }
+}
+
+/// The analysis's status line appears inline and is a polite live region: it changes while
+/// focus is elsewhere, so a screen reader must announce the refusal — and the progress before
+/// it — rather than leave Apply disabled without a word.
+#[test]
+fn the_analysis_status_is_a_live_region() {
+    let mut h = harness(egui::vec2(560.0, 700.0));
+    crate::sculpt_ui::open(h.state_mut(), BODY);
+    {
+        let app = h.state_mut();
+        let mut live = app.sculpt_live.take().expect("runtime");
+        live.analysis_now(app);
+        app.sculpt_live = Some(live);
+    }
+    h.run_steps(3);
+    let status = h.get_by_label_contains("No person found");
+    assert_eq!(status.accesskit_node().live(), egui::accesskit::Live::Polite, "the status line is announced");
 }
 
 /// Opening the face panel leaves its preset row untouched; Apply must send no preset at all.

@@ -519,6 +519,7 @@ fn canvas_controls(
         shown.rotation = rotation;
     }
     crate::distort_ui::show_in_canvas(app, ui, rect);
+    crate::sculpt_ui::show_in_canvas(app, ui, rect);
     crate::blur_pins::overlay(app, ui, rect);
     let doc = app.session.documents()[host.idx].doc.id;
     if let Some(shown) = crate::vector_ui::overlay::show_paths(app, ui, rect, doc) {

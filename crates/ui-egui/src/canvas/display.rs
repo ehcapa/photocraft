@@ -143,6 +143,10 @@ pub(crate) fn display_doc_live(app: &mut PhotocraftApp, idx: usize, live: LivePr
     if let Some(shown) = crate::distort_ui::display_doc(app, idx) {
         return shown;
     }
+    // Sculpt's live preview hides the target layer; its warped proxy is drawn over the canvas.
+    if let Some(shown) = crate::sculpt_ui::display_doc(app, idx) {
+        return shown;
+    }
     // Image › Adjustments dialog: a temporary adjustment layer clipped to the target.
     if let Some(shown) = crate::adjust_preview::display_doc(app, idx) {
         return shown;
