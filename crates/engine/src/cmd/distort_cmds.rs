@@ -249,8 +249,10 @@ pub fn apply_to_surface(id: &str, params: &Value, surf: &Surface, canvas: Rect) 
             Some(puppet_surface(surf, &puppet_params(id, params).ok()?, interp(params)).unwrap_or_else(|| surf.clone()))
         }
         PERSPECTIVE | PERSPECTIVE_SMART => Some(perspective_surface(surf, &perspective_params(id, params).ok()?, interp(params))),
-        // Body Sculpt's stored form carries its own anchors; the hook is in its own module.
+        // Body/Face Sculpt's stored forms carry their own anchors; the hooks are in their
+        // own modules.
         crate::sculpt_cmds::SCULPT => crate::sculpt_cmds::apply_to_surface(params, surf, canvas),
+        crate::face_sculpt_cmds::FACE_SCULPT => crate::face_sculpt_cmds::apply_to_surface(params, surf, canvas),
         _ => None,
     }
 }

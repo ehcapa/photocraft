@@ -38,6 +38,7 @@ mod distort;
 mod distort2;
 pub mod erase;
 pub mod exif;
+pub mod face_sculpt;
 pub mod faces;
 pub mod features;
 mod fxutil;

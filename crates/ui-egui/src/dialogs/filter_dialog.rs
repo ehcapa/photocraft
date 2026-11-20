@@ -195,7 +195,7 @@ pub const PREVIEWED: &[&str] = &[
 /// the downscaled proxy geometrically wrong. Both are fixable (anchors captured at dialog
 /// open plus a proxy-scale hook, the `blur_pins::scale_for_proxy` precedent); until then
 /// the dialog is OK-applies like Smart Portrait's.
-const NO_PREVIEW: &[&str] = &["filter.bodySculpt"];
+const NO_PREVIEW: &[&str] = &["filter.bodySculpt", "filter.faceSculpt"];
 
 /// Whether the dialog of `command` offers the Preview box and a live preview.
 pub(crate) fn previews(command: &str) -> bool {
@@ -342,7 +342,7 @@ pub(crate) fn params(app: &mut PhotocraftApp, command: &str, spec: &str) -> Vec<
             // and a stale extreme slider from an earlier session presents as the pipeline
             // breaking, not as a starting point (2026-11-19's hue-164/saturation--61 export).
             // Body Sculpt is the same story about a person's body.
-            if command == "portrait.create" || command == "filter.bodySculpt" {
+            if command == "portrait.create" || command == "filter.bodySculpt" || command == "filter.faceSculpt" {
                 p = p.not_remembered();
             }
             // Global Light's Altitude takes whole degrees, as its Angle does (#14980).

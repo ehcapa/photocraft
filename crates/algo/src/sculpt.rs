@@ -251,8 +251,9 @@ impl Frame {
     }
 }
 
-/// One part's resolved geometry.
-enum Shape {
+/// One part's resolved geometry — shared with the face table ([`crate::face_sculpt`]):
+/// the panel's parts are rows over these four primitives, nothing more.
+pub(crate) enum Shape {
     /// Scale the lateral distance to a segment: the displacement grows from nothing on the
     /// axis to the rim pull at the falloff's shoulder, inside a longitudinal window over
     /// `band` (t along the segment) with smoothstep ramps at its ends. `gain` is the rim
@@ -462,12 +463,12 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
     let ramp_sum: f64 = asked.iter().map(|&(_, k, ref s)| ramp_magnitude(s, k)).sum();
     let ramp_scale = if ramp_sum > budget && ramp_sum > 0.0 { budget / ramp_sum } else { 1.0 };
     for (part, k, shape) in asked {
-        match shape {
-            Shape::Contract { a, b, band, width, gain } => write_contract(&mut field, a, b, band, width, gain, k),
-            Shape::Radial { c, radius, gain } => write_radial(&mut field, c, radius, gain, k),
-            Shape::Ramp { a, b, band, width, gain } => write_ramp(&mut field, a, b, band, width, gain, k * ramp_scale),
-            Shape::Shift { a, b, dir, band, width, gain } => write_shift(&mut field, a, b, dir, band, width, gain * k),
-        }
+        let Shape::Ramp { .. } = shape else {
+            write_shape(&mut field, &shape, k);
+            report.applied.push(part.name);
+            continue;
+        };
+        write_shape(&mut field, &shape, k * ramp_scale);
         report.applied.push(part.name);
     }
     (field, report)
@@ -478,6 +479,17 @@ fn ramp_magnitude(s: &Shape, k: f64) -> f64 {
     match s {
         Shape::Ramp { a, b, gain, .. } => gain.abs() * k.abs() * norm(sub(*b, *a)),
         _ => 0.0,
+    }
+}
+
+/// Writes one resolved shape at slider fraction `k` — the whole primitive surface, shared
+/// by both parts tables.
+pub(crate) fn write_shape(field: &mut LiquifyField, shape: &Shape, k: f64) {
+    match *shape {
+        Shape::Contract { a, b, band, width, gain } => write_contract(field, a, b, band, width, gain, k),
+        Shape::Radial { c, radius, gain } => write_radial(field, c, radius, gain, k),
+        Shape::Ramp { a, b, band, width, gain } => write_ramp(field, a, b, band, width, gain, k),
+        Shape::Shift { a, b, dir, band, width, gain } => write_shift(field, a, b, dir, band, width, gain * k),
     }
 }
 

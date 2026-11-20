@@ -598,6 +598,7 @@ pub static CATALOG: &[(&[&str], &str, Option<&str>, &str)] = &[
     (&["Filter"], "Lens Correction…", Some("Cmd+Shift+R"), "filter.lensCorrection"),
     (&["Filter"], "Liquify…", Some("Cmd+Shift+X"), "filter.liquify"),
     (&["Filter"], "Body Sculpt…", None, "filter.bodySculpt"),
+    (&["Filter"], "Face Sculpt…", None, "filter.faceSculpt"),
     (&["Filter"], "Vanishing Point…", Some("Cmd+Alt+V"), "filter.vanishingPoint"),
     (&["Filter"], "---", None, "---"),
     (&["Filter", "Blur"], "Average", None, "filter.blur.average"),

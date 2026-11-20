@@ -94,6 +94,7 @@ pub use cmd::export_preset_cmds;
 pub use cmd::exr_cmds;
 pub use cmd::extra_cmds;
 pub use cmd::face_cmds;
+pub use cmd::face_sculpt_cmds;
 pub use cmd::file_cmds;
 pub use cmd::fill_cmds;
 pub use cmd::fill_key_cmds;

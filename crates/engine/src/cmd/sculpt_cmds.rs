@@ -300,7 +300,7 @@ mod tests {
         let (a, b) = (before.read_region(region), after.read_region(region));
         let n = before.format().channels().min(3);
         let step = 4.0 / 255.0;
-        let ch = a.chunks(n).zip(b.chunks(n)).filter(|(x, y)| (0..n).any(|c| (x[c] - y[c]).abs() > step)).count();
+        let ch = a.chunks_exact(n).zip(b.chunks_exact(n)).filter(|(x, y)| (0..n).any(|c| (x[c] - y[c]).abs() > step)).count();
         ch as f64 / a.len() as f64 * n as f64
     }
 
