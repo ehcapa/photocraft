@@ -85,7 +85,41 @@ pub struct FaceSliders {
     // by `preset_strength`, blended in [`FaceSliders::composed`] before any row runs.
     pub preset: FacePreset,
     pub preset_strength: f32,
+    /// Per-side overrides for the two-sided features: `None` follows the base slider —
+    /// PixCake's lock stays locked until a side is set. The left/right rows below read
+    /// their own side's override.
+    pub sides: FaceSides,
 }
+
+/// The per-side overrides (`None` = follow the base slider).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FaceSides {
+    pub temples: [Option<f32>; 2],
+    pub cheekbones: [Option<f32>; 2],
+    pub eye_size: [Option<f32>; 2],
+    pub pupil_size: [Option<f32>; 2],
+    pub eye_height: [Option<f32>; 2],
+    pub eye_width: [Option<f32>; 2],
+    pub eye_spacing: [Option<f32>; 2],
+    pub inner_corner: [Option<f32>; 2],
+    pub outer_corner: [Option<f32>; 2],
+    pub lower_lid: [Option<f32>; 2],
+    pub eye_tilt: [Option<f32>; 2],
+    pub eye_position: [Option<f32>; 2],
+    pub brow_head: [Option<f32>; 2],
+    pub brow_tail: [Option<f32>; 2],
+    pub brow_thickness: [Option<f32>; 2],
+    pub brow_spacing: [Option<f32>; 2],
+    pub brow_tilt: [Option<f32>; 2],
+    pub brow_shape: [Option<f32>; 2],
+    pub brow_height: [Option<f32>; 2],
+    pub mouth_width: [Option<f32>; 2],
+    pub lip_tilt: [Option<f32>; 2],
+}
+
+/// The side an override slot addresses: 0 = the person's left (image right), 1 = right.
+pub const SIDE_L: usize = 0;
+pub const SIDE_R: usize = 1;
 
 /// The seven face-type presets, PixCake's own list: each is the adjustment its face shape
 /// wants (their wiki's wording), as a bundle of this panel's sliders at strength 100.
@@ -380,10 +414,26 @@ const FACE_PARTS: &[FacePart] = &[
         slider: |s| s.face_slim,
         shape: |f| f.contract_v(f.along_up(mesh::CHIN, 0.30), f.pt(mesh::CHIN), (0.0, 1.0), f.face_w * 0.62, 0.07),
     },
-    FacePart { name: "left temple", slider: |s| s.temples, shape: |f| f.radial(f.pt(mesh::TEMPLE_L), f.face_w * 0.14, 0.06) },
-    FacePart { name: "right temple", slider: |s| s.temples, shape: |f| f.radial(f.pt(mesh::TEMPLE_R), f.face_w * 0.14, 0.06) },
-    FacePart { name: "left cheekbone", slider: |s| s.cheekbones, shape: |f| f.radial(f.pt(mesh::CHEEKBONE_L), f.face_w * 0.13, 0.08) },
-    FacePart { name: "right cheekbone", slider: |s| s.cheekbones, shape: |f| f.radial(f.pt(mesh::CHEEKBONE_R), f.face_w * 0.13, 0.08) },
+    FacePart {
+        name: "left temple",
+        slider: |s| s.sides.temples[SIDE_L].unwrap_or(s.temples),
+        shape: |f| f.radial(f.pt(mesh::TEMPLE_L), f.face_w * 0.14, 0.06),
+    },
+    FacePart {
+        name: "right temple",
+        slider: |s| s.sides.temples[SIDE_R].unwrap_or(s.temples),
+        shape: |f| f.radial(f.pt(mesh::TEMPLE_R), f.face_w * 0.14, 0.06),
+    },
+    FacePart {
+        name: "left cheekbone",
+        slider: |s| s.sides.cheekbones[SIDE_L].unwrap_or(s.cheekbones),
+        shape: |f| f.radial(f.pt(mesh::CHEEKBONE_L), f.face_w * 0.13, 0.08),
+    },
+    FacePart {
+        name: "right cheekbone",
+        slider: |s| s.sides.cheekbones[SIDE_R].unwrap_or(s.cheekbones),
+        shape: |f| f.radial(f.pt(mesh::CHEEKBONE_R), f.face_w * 0.13, 0.08),
+    },
     FacePart { name: "jaw", slider: |s| s.jaw, shape: |f| f.contract_v(f.along_up(mesh::CHIN, 0.55), f.pt(mesh::CHIN), (0.0, 1.0), f.face_w * 0.50, 0.09) },
     FacePart { name: "face size", slider: |s| s.face_size, shape: |f| f.radial(f.face_c, f.face_h * 0.62, 0.08) },
     FacePart {
@@ -444,88 +494,104 @@ const FACE_PARTS: &[FacePart] = &[
         shape: |f| f.shift_band(f.pt(mesh::MOUTH_CORNER_L), f.pt(mesh::CHIN), v(f.up(), 1.0), (0.3, 1.0), f.face_w * 0.45, 0.10),
     },
     // ---------- the eyes (per-side rows share their slider) ----------
-    FacePart { name: "left eye size", slider: |s| s.eye_size, shape: |f| f.radial(f.eye_c(mesh::EYE_RING_L), f.eye_w() * 1.15, -0.12) },
-    FacePart { name: "right eye size", slider: |s| s.eye_size, shape: |f| f.radial(f.eye_c(mesh::EYE_RING_R), f.eye_w() * 1.15, -0.12) },
-    FacePart { name: "left pupil", slider: |s| s.pupil_size, shape: |f| f.radial(f.pt(mesh::IRIS_L), f.eye_w() * 0.45, -0.10) },
-    FacePart { name: "right pupil", slider: |s| s.pupil_size, shape: |f| f.radial(f.pt(mesh::IRIS_R), f.eye_w() * 0.45, -0.10) },
+    FacePart {
+        name: "left eye size",
+        slider: |s| s.sides.eye_size[SIDE_L].unwrap_or(s.eye_size),
+        shape: |f| f.radial(f.eye_c(mesh::EYE_RING_L), f.eye_w() * 1.15, -0.12),
+    },
+    FacePart {
+        name: "right eye size",
+        slider: |s| s.sides.eye_size[SIDE_R].unwrap_or(s.eye_size),
+        shape: |f| f.radial(f.eye_c(mesh::EYE_RING_R), f.eye_w() * 1.15, -0.12),
+    },
+    FacePart {
+        name: "left pupil",
+        slider: |s| s.sides.pupil_size[SIDE_L].unwrap_or(s.pupil_size),
+        shape: |f| f.radial(f.pt(mesh::IRIS_L), f.eye_w() * 0.45, -0.10),
+    },
+    FacePart {
+        name: "right pupil",
+        slider: |s| s.sides.pupil_size[SIDE_R].unwrap_or(s.pupil_size),
+        shape: |f| f.radial(f.pt(mesh::IRIS_R), f.eye_w() * 0.45, -0.10),
+    },
     FacePart {
         name: "left eye height",
-        slider: |s| s.eye_height,
+        slider: |s| s.sides.eye_height[SIDE_L].unwrap_or(s.eye_height),
         shape: |f| Some(Shape::Contract { a: f.pt(mesh::EYE_INNER_L), b: f.pt(mesh::EYE_OUTER_L), band: (0.0, 1.0), width: f.eye_w() * 0.80, gain: -0.10 }),
     },
     FacePart {
         name: "right eye height",
-        slider: |s| s.eye_height,
+        slider: |s| s.sides.eye_height[SIDE_R].unwrap_or(s.eye_height),
         shape: |f| Some(Shape::Contract { a: f.pt(mesh::EYE_INNER_R), b: f.pt(mesh::EYE_OUTER_R), band: (0.0, 1.0), width: f.eye_w() * 0.80, gain: -0.10 }),
     },
     FacePart {
         name: "left eye width",
-        slider: |s| s.eye_width,
+        slider: |s| s.sides.eye_width[SIDE_L].unwrap_or(s.eye_width),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_L), f.pt(mesh::EYE_OUTER_L), v(f.left(), 1.0), (0.0, 1.0), f.eye_w() * 1.4, 0.30),
     },
     FacePart {
         name: "right eye width",
-        slider: |s| s.eye_width,
+        slider: |s| s.sides.eye_width[SIDE_R].unwrap_or(s.eye_width),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_R), f.pt(mesh::EYE_OUTER_R), v(f.left(), -1.0), (0.0, 1.0), f.eye_w() * 1.4, 0.30),
     },
     FacePart {
         name: "left eye spacing",
-        slider: |s| s.eye_spacing,
+        slider: |s| s.sides.eye_spacing[SIDE_L].unwrap_or(s.eye_spacing),
         shape: |f| f.shift_band(f.pt(mesh::EYE_INNER_L), f.eye_c(mesh::EYE_RING_L), v(f.left(), 1.0), (0.0, 1.0), f.eye_w() * 1.6, 0.30),
     },
     FacePart {
         name: "right eye spacing",
-        slider: |s| s.eye_spacing,
+        slider: |s| s.sides.eye_spacing[SIDE_R].unwrap_or(s.eye_spacing),
         shape: |f| f.shift_band(f.pt(mesh::EYE_INNER_R), f.eye_c(mesh::EYE_RING_R), v(f.left(), -1.0), (0.0, 1.0), f.eye_w() * 1.6, 0.30),
     },
     FacePart {
         name: "left inner corner",
-        slider: |s| s.inner_corner,
+        slider: |s| s.sides.inner_corner[SIDE_L].unwrap_or(s.inner_corner),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_L), f.pt(mesh::EYE_INNER_L), v(f.left(), -1.0), (0.0, 1.0), f.eye_w() * 0.9, 0.50),
     },
     FacePart {
         name: "right inner corner",
-        slider: |s| s.inner_corner,
+        slider: |s| s.sides.inner_corner[SIDE_R].unwrap_or(s.inner_corner),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_R), f.pt(mesh::EYE_INNER_R), v(f.left(), 1.0), (0.0, 1.0), f.eye_w() * 0.9, 0.50),
     },
     FacePart {
         name: "left outer corner",
-        slider: |s| s.outer_corner,
+        slider: |s| s.sides.outer_corner[SIDE_L].unwrap_or(s.outer_corner),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_L), f.pt(mesh::EYE_OUTER_L), v(f.left(), 1.0), (0.0, 1.0), f.eye_w() * 0.9, 0.50),
     },
     FacePart {
         name: "right outer corner",
-        slider: |s| s.outer_corner,
+        slider: |s| s.sides.outer_corner[SIDE_R].unwrap_or(s.outer_corner),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_R), f.pt(mesh::EYE_OUTER_R), v(f.left(), -1.0), (0.0, 1.0), f.eye_w() * 0.9, 0.50),
     },
     FacePart {
         name: "left lower lid",
-        slider: |s| s.lower_lid,
+        slider: |s| s.sides.lower_lid[SIDE_L].unwrap_or(s.lower_lid),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_L), f.pt(mesh::EYE_LOW_L), v(f.up(), -1.0), (0.0, 1.0), f.eye_w() * 1.2, 0.40),
     },
     FacePart {
         name: "right lower lid",
-        slider: |s| s.lower_lid,
+        slider: |s| s.sides.lower_lid[SIDE_R].unwrap_or(s.lower_lid),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_R), f.pt(mesh::EYE_LOW_R), v(f.up(), -1.0), (0.0, 1.0), f.eye_w() * 1.2, 0.40),
     },
     FacePart {
         name: "left eye tilt",
-        slider: |s| s.eye_tilt,
+        slider: |s| s.sides.eye_tilt[SIDE_L].unwrap_or(s.eye_tilt),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_L), f.pt(mesh::EYE_OUTER_L), v(f.up(), 1.0), (0.0, 1.0), f.eye_w() * 1.0, 0.30),
     },
     FacePart {
         name: "right eye tilt",
-        slider: |s| s.eye_tilt,
+        slider: |s| s.sides.eye_tilt[SIDE_R].unwrap_or(s.eye_tilt),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_R), f.pt(mesh::EYE_OUTER_R), v(f.up(), 1.0), (0.0, 1.0), f.eye_w() * 1.0, 0.30),
     },
     FacePart {
         name: "left eye position",
-        slider: |s| s.eye_position,
+        slider: |s| s.sides.eye_position[SIDE_L].unwrap_or(s.eye_position),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_L), f.pt(mesh::EYE_OUTER_L), v(f.up(), 1.0), (0.2, 0.8), f.eye_w() * 1.6, 0.30),
     },
     FacePart {
         name: "right eye position",
-        slider: |s| s.eye_position,
+        slider: |s| s.sides.eye_position[SIDE_R].unwrap_or(s.eye_position),
         shape: |f| f.shift_band(f.eye_c(mesh::EYE_RING_R), f.pt(mesh::EYE_OUTER_R), v(f.up(), 1.0), (0.2, 0.8), f.eye_w() * 1.6, 0.30),
     },
     // ---------- the nose ----------
@@ -550,8 +616,16 @@ const FACE_PARTS: &[FacePart] = &[
     FacePart { name: "nose tip", slider: |s| s.nose_tip, shape: |f| f.radial(f.pt(mesh::NOSE_TIP), f.nose_w() * 0.60, 0.10) },
     // ---------- the mouth ----------
     FacePart { name: "mouth size", slider: |s| s.mouth_size, shape: |f| f.radial(f.mouth_c(), f.mouth_w() * 0.65, -0.12) },
-    FacePart { name: "left mouth width", slider: |s| s.mouth_width, shape: |f| f.radial(f.pt(mesh::MOUTH_CORNER_L), f.mouth_w() * 0.25, -0.10) },
-    FacePart { name: "right mouth width", slider: |s| s.mouth_width, shape: |f| f.radial(f.pt(mesh::MOUTH_CORNER_R), f.mouth_w() * 0.25, -0.10) },
+    FacePart {
+        name: "left mouth width",
+        slider: |s| s.sides.mouth_width[SIDE_L].unwrap_or(s.mouth_width),
+        shape: |f| f.radial(f.pt(mesh::MOUTH_CORNER_L), f.mouth_w() * 0.25, -0.10),
+    },
+    FacePart {
+        name: "right mouth width",
+        slider: |s| s.sides.mouth_width[SIDE_R].unwrap_or(s.mouth_width),
+        shape: |f| f.radial(f.pt(mesh::MOUTH_CORNER_R), f.mouth_w() * 0.25, -0.10),
+    },
     FacePart {
         name: "mouth height",
         slider: |s| s.mouth_height,
@@ -569,12 +643,12 @@ const FACE_PARTS: &[FacePart] = &[
     },
     FacePart {
         name: "left lip tilt",
-        slider: |s| s.lip_tilt,
+        slider: |s| s.sides.lip_tilt[SIDE_L].unwrap_or(s.lip_tilt),
         shape: |f| f.shift_band(f.mouth_c(), f.pt(mesh::MOUTH_CORNER_L), v(f.up(), -1.0), (0.0, 1.0), f.mouth_w() * 0.30, 0.30),
     },
     FacePart {
         name: "right lip tilt",
-        slider: |s| s.lip_tilt,
+        slider: |s| s.sides.lip_tilt[SIDE_R].unwrap_or(s.lip_tilt),
         shape: |f| f.shift_band(f.mouth_c(), f.pt(mesh::MOUTH_CORNER_R), v(f.up(), 1.0), (0.0, 1.0), f.mouth_w() * 0.30, 0.30),
     },
     FacePart { name: "upper lip", slider: |s| s.upper_lip, shape: |f| f.radial(f.mid(mesh::UPPER_LIP_TOP, mesh::UPPER_LIP_LOW), f.mouth_w() * 0.22, -0.15) },
@@ -582,64 +656,64 @@ const FACE_PARTS: &[FacePart] = &[
     // ---------- the brows (per-side rows) ----------
     FacePart {
         name: "left brow head",
-        slider: |s| s.brow_head,
+        slider: |s| s.sides.brow_head[SIDE_L].unwrap_or(s.brow_head),
         shape: |f| f.shift_band(f.pt(mesh::BROW_IN_L), f.pt(mesh::BROW_MID_L), v(f.left(), -1.0), (0.0, 1.0), f.face_w * 0.09, 0.30),
     },
     FacePart {
         name: "right brow head",
-        slider: |s| s.brow_head,
+        slider: |s| s.sides.brow_head[SIDE_R].unwrap_or(s.brow_head),
         shape: |f| f.shift_band(f.pt(mesh::BROW_IN_R), f.pt(mesh::BROW_MID_R), v(f.left(), 1.0), (0.0, 1.0), f.face_w * 0.09, 0.30),
     },
     FacePart {
         name: "left brow tail",
-        slider: |s| s.brow_tail,
+        slider: |s| s.sides.brow_tail[SIDE_L].unwrap_or(s.brow_tail),
         shape: |f| f.shift_band(f.pt(mesh::BROW_MID_L), f.pt(mesh::BROW_OUT_L), v(f.left(), 1.0), (0.0, 1.0), f.face_w * 0.09, 0.30),
     },
     FacePart {
         name: "right brow tail",
-        slider: |s| s.brow_tail,
+        slider: |s| s.sides.brow_tail[SIDE_R].unwrap_or(s.brow_tail),
         shape: |f| f.shift_band(f.pt(mesh::BROW_MID_R), f.pt(mesh::BROW_OUT_R), v(f.left(), -1.0), (0.0, 1.0), f.face_w * 0.09, 0.30),
     },
-    FacePart { name: "left brow thickness", slider: |s| s.brow_thickness, shape: |f| f.brow_line(1.0) },
-    FacePart { name: "right brow thickness", slider: |s| s.brow_thickness, shape: |f| f.brow_line(-1.0) },
+    FacePart { name: "left brow thickness", slider: |s| s.sides.brow_thickness[SIDE_L].unwrap_or(s.brow_thickness), shape: |f| f.brow_line(1.0) },
+    FacePart { name: "right brow thickness", slider: |s| s.sides.brow_thickness[SIDE_R].unwrap_or(s.brow_thickness), shape: |f| f.brow_line(-1.0) },
     FacePart {
         name: "left brow spacing",
-        slider: |s| s.brow_spacing,
+        slider: |s| s.sides.brow_spacing[SIDE_L].unwrap_or(s.brow_spacing),
         shape: |f| f.shift_band(f.pt(mesh::BROW_INNER_L), f.pt(mesh::BROW_IN_L), v(f.left(), -1.0), (0.0, 1.0), f.face_w * 0.09, 0.25),
     },
     FacePart {
         name: "right brow spacing",
-        slider: |s| s.brow_spacing,
+        slider: |s| s.sides.brow_spacing[SIDE_R].unwrap_or(s.brow_spacing),
         shape: |f| f.shift_band(f.pt(mesh::BROW_INNER_R), f.pt(mesh::BROW_IN_R), v(f.left(), 1.0), (0.0, 1.0), f.face_w * 0.09, 0.25),
     },
     FacePart {
         name: "left brow tilt",
-        slider: |s| s.brow_tilt,
+        slider: |s| s.sides.brow_tilt[SIDE_L].unwrap_or(s.brow_tilt),
         shape: |f| f.shift_band(f.pt(mesh::BROW_MID_L), f.pt(mesh::BROW_OUT_L), v(f.up(), -1.0), (0.0, 1.0), f.face_w * 0.09, 0.30),
     },
     FacePart {
         name: "right brow tilt",
-        slider: |s| s.brow_tilt,
+        slider: |s| s.sides.brow_tilt[SIDE_R].unwrap_or(s.brow_tilt),
         shape: |f| f.shift_band(f.pt(mesh::BROW_MID_R), f.pt(mesh::BROW_OUT_R), v(f.up(), -1.0), (0.0, 1.0), f.face_w * 0.09, 0.30),
     },
     FacePart {
         name: "left brow shape",
-        slider: |s| s.brow_shape,
+        slider: |s| s.sides.brow_shape[SIDE_L].unwrap_or(s.brow_shape),
         shape: |f| f.shift_band(f.pt(mesh::BROW_IN_L), f.pt(mesh::BROW_OUT_L), v(f.up(), 1.0), (0.3, 0.7), f.face_w * 0.08, 0.25),
     },
     FacePart {
         name: "right brow shape",
-        slider: |s| s.brow_shape,
+        slider: |s| s.sides.brow_shape[SIDE_R].unwrap_or(s.brow_shape),
         shape: |f| f.shift_band(f.pt(mesh::BROW_IN_R), f.pt(mesh::BROW_OUT_R), v(f.up(), 1.0), (0.3, 0.7), f.face_w * 0.08, 0.25),
     },
     FacePart {
         name: "left brow height",
-        slider: |s| s.brow_height,
+        slider: |s| s.sides.brow_height[SIDE_L].unwrap_or(s.brow_height),
         shape: |f| f.shift_band(f.pt(mesh::BROW_IN_L), f.pt(mesh::BROW_OUT_L), v(f.up(), 1.0), (0.1, 0.9), f.face_w * 0.10, 0.25),
     },
     FacePart {
         name: "right brow height",
-        slider: |s| s.brow_height,
+        slider: |s| s.sides.brow_height[SIDE_R].unwrap_or(s.brow_height),
         shape: |f| f.shift_band(f.pt(mesh::BROW_IN_R), f.pt(mesh::BROW_OUT_R), v(f.up(), 1.0), (0.1, 0.9), f.face_w * 0.10, 0.25),
     },
 ];
@@ -797,6 +871,26 @@ mod tests {
     }
 
     #[test]
+    fn a_side_override_takes_only_its_own_row() {
+        // The base slider moves both temples; the left override answers only the left row.
+        let mut sliders = FaceSliders { temples: 60.0, ..Default::default() };
+        let (both, _) = build(sliders);
+        sliders.sides.temples[SIDE_L] = Some(-20.0);
+        let (split, _) = build(sliders);
+        let at = |f: &LiquifyField, x: f64, y: f64| {
+            let d = f.sample(x, y);
+            d[0].hypot(d[1])
+        };
+        let left = |f: &LiquifyField| at(f, 362.0, 180.0);
+        let right = |f: &LiquifyField| at(f, 150.0, 180.0);
+        let (bl, br) = (left(&both), right(&both));
+        assert!((bl - br).abs() < 0.2, "linked sides match: {bl:?} {br:?}");
+        let (sl, sr) = (left(&split), right(&split));
+        assert!(sl < bl * 0.6, "the overridden side reads its own value: {sl:?} vs {bl:?}");
+        assert!((sr - br).abs() < 0.2, "the other side follows the base: {sr:?} vs {br:?}");
+    }
+
+    #[test]
     fn zero_sliders_build_the_identity_field() {
         let (field, report) = build(FaceSliders::default());
         assert!(field.is_identity());
@@ -950,6 +1044,7 @@ mod tests {
             brow_height: 100.0,
             preset: FacePreset::None,
             preset_strength: 0.0,
+            sides: FaceSides::default(),
         };
         let (field, report) = build(sliders);
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
