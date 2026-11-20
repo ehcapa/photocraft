@@ -321,3 +321,12 @@ u2netp 分不开背景的照片如实报 "no contour to relax" 而不是去平�
 至此对标全景:身体面板 22 滑杆(19/19 + 双下巴 + 组合件)、面部面板 48
 滑杆(47 + smooth)。**仍未做:** 7 脸型预设(参数束)、对称液化(镜像)、
 3D塑颜(伪转头透视)、左右分开小锁、L/R 成对锁 UI。
+
+## 2026-11-20: 脸型预设(四期之一)
+
+`filter.faceSculpt` 加 `preset`(none/classic/youthful/heroic/juvenile/round/long/
+square)+ `presetStrength`(0..100,对话框默认 60、解析默认 0——存储态永远带显式值)。
+七个束按像素蛋糕 wiki 的描述立值(经典=瘦脸25/大眼15;长脸=中庭−30/下庭−25/发际
+线下移;方脸=下颌40/下巴+20…),`FacePreset::delta()` 返回滑杆差量、`composed()`
+按强度混入手动值后 clamp——AI塑形 同一条确定性规则,回放逐位一致。对话框的
+schema 行自动出现(preset 是 choice 参数)。

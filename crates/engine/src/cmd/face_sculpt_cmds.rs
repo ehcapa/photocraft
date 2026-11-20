@@ -6,7 +6,7 @@
 //! [`photocraft_algo::face_sculpt`] over the four primitives the body table defined.
 
 use photocraft_algo::contour;
-use photocraft_algo::face_sculpt::{FaceAnchors, FaceSliders, FaceSpec, face_field};
+use photocraft_algo::face_sculpt::{FaceAnchors, FacePreset, FaceSliders, FaceSpec, face_field};
 use photocraft_algo::liquify::{apply_liquify, auto_cell};
 use photocraft_doc::LayerContent;
 use photocraft_geom::Rect;
@@ -80,6 +80,13 @@ fn sliders(p: &Value) -> Result<FaceSliders> {
         brow_tilt: slider(p, "browTilt")?,
         brow_shape: slider(p, "browShape")?,
         brow_height: slider(p, "browHeight")?,
+        preset: match p.get("preset").and_then(Value::as_str) {
+            None | Some("none") => FacePreset::None,
+            Some(name) => {
+                FacePreset::parse(name).ok_or_else(|| bad(format!("unknown preset \"{name}\" (none|classic|youthful|heroic|juvenile|round|long|square)")))?
+            }
+        },
+        preset_strength: p.get("presetStrength").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0) as f32,
     })
 }
 
@@ -140,7 +147,7 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let canvas = d.doc.bounds();
     let id = crate::commands::layer_param(s, p)?;
     let smooth = smooth_of(p);
-    if values == FaceSliders::default() && smooth <= 0.0 {
+    if values == FaceSliders::default() && smooth <= 0.0 && values.preset == FacePreset::None {
         return Ok(json!({"layer": id.0, "changed": false}));
     }
     let cell = cell(p, canvas)?;
@@ -227,7 +234,7 @@ pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> 
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0,"smooth":0..100=0 (AI 面部流畅: the face oval contour, low-passed and relaxed; the ring is embedded from the mesh at apply time, like the anchors) (the face-mesh analysis runs first — cached like Select Region, seconds the first time; each slider's positive direction is its label's action),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0,"preset":"none|classic|youthful|heroic|juvenile|round|long|square"="none","presetStrength":0..100=60 (a named bundle of the sliders, stacked with the manual ones),"smooth":0..100=0 (AI 面部流畅: the face oval contour, low-passed and relaxed; the ring is embedded from the mesh at apply time, like the anchors) (the face-mesh analysis runs first — cached like Select Region, seconds the first time; each slider's positive direction is its label's action),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: FACE_SCULPT,
         label: "Face Sculpt…",

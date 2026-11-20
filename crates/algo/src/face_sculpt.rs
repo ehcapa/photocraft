@@ -81,6 +81,110 @@ pub struct FaceSliders {
     pub brow_tilt: f32,
     pub brow_shape: f32,
     pub brow_height: f32,
+    // the preset family (PixCake's 脸型预设): a named bundle of the sliders above, scaled
+    // by `preset_strength`, blended in [`FaceSliders::composed`] before any row runs.
+    pub preset: FacePreset,
+    pub preset_strength: f32,
+}
+
+/// The seven face-type presets, PixCake's own list: each is the adjustment its face shape
+/// wants (their wiki's wording), as a bundle of this panel's sliders at strength 100.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FacePreset {
+    #[default]
+    None,
+    /// 经典: the universal retouch — a gentle slim with slightly larger eyes.
+    Classic,
+    /// 幼态: rounder, lower-set features; bigger eyes, a shorter mid face.
+    Youthful,
+    /// 英气: a narrower face with a stronger jaw line.
+    Heroic,
+    /// 少年: a smoother contour, the least intrusive.
+    Juvenile,
+    /// 圆脸适用: narrow and taper — the V line, a pointer chin.
+    Round,
+    /// 长脸适用: shorten the middle and lower thirds.
+    Long,
+    /// 方脸适用: soften the jaw, lengthen the chin.
+    Square,
+}
+
+impl FacePreset {
+    /// The wire names, as the params and the dialog carry them.
+    pub fn parse(name: &str) -> Option<FacePreset> {
+        Some(match name {
+            "none" => FacePreset::None,
+            "classic" => FacePreset::Classic,
+            "youthful" => FacePreset::Youthful,
+            "heroic" => FacePreset::Heroic,
+            "juvenile" => FacePreset::Juvenile,
+            "round" => FacePreset::Round,
+            "long" => FacePreset::Long,
+            "square" => FacePreset::Square,
+            _ => return None,
+        })
+    }
+
+    /// The bundle at strength 100 as a slider delta: only the fields a preset touches are
+    /// set, everything else stays zero (and out of `composed`'s blend).
+    fn delta(self) -> FaceSliders {
+        let d = |fields: &[(&str, f32)]| {
+            let mut s = FaceSliders::default();
+            for &(name, v) in fields {
+                match name {
+                    "faceSlim" => s.face_slim = v,
+                    "eyeSize" => s.eye_size = v,
+                    "faceWidth" => s.face_width = v,
+                    "midFace" => s.mid_face = v,
+                    "lowerFace" => s.lower_face = v,
+                    "chinLength" => s.chin_length = v,
+                    "jaw" => s.jaw = v,
+                    "vFace" => s.v_face = v,
+                    "chinPoint" => s.chin_point = v,
+                    "browTilt" => s.brow_tilt = v,
+                    "hairline" => s.hairline = v,
+                    _ => {}
+                }
+            }
+            s
+        };
+        match self {
+            FacePreset::None => FaceSliders::default(),
+            FacePreset::Classic => d(&[("faceSlim", 25.0), ("eyeSize", 15.0)]),
+            FacePreset::Youthful => d(&[("eyeSize", 20.0), ("faceWidth", 10.0), ("midFace", -15.0), ("chinLength", -10.0)]),
+            FacePreset::Heroic => d(&[("faceSlim", 35.0), ("eyeSize", 8.0), ("jaw", 20.0), ("browTilt", 15.0)]),
+            FacePreset::Juvenile => d(&[("faceSlim", 18.0), ("eyeSize", 10.0), ("midFace", -8.0), ("chinLength", -6.0)]),
+            FacePreset::Round => d(&[("faceSlim", 40.0), ("vFace", 35.0), ("chinPoint", 25.0), ("eyeSize", 12.0)]),
+            FacePreset::Long => d(&[("midFace", -30.0), ("lowerFace", -25.0), ("hairline", -20.0), ("faceSlim", 15.0)]),
+            FacePreset::Square => d(&[("jaw", 40.0), ("chinLength", 20.0), ("faceSlim", 25.0)]),
+        }
+    }
+}
+
+impl FaceSliders {
+    /// The sliders after the preset blends in: the bundle's values, scaled by
+    /// `preset_strength` (0..100), stack with the manual sliders and clamp at the stops —
+    /// the body panel's AI塑形 rule, so a stored filter's raw sliders compose to the same
+    /// field bit for bit.
+    pub fn composed(self) -> Self {
+        let k = self.preset_strength.clamp(0.0, 100.0) / 100.0;
+        let blend = |own: f32, extra: f32| (own + extra * k).clamp(-100.0, 100.0);
+        let d = self.preset.delta();
+        Self {
+            face_slim: blend(self.face_slim, d.face_slim),
+            eye_size: blend(self.eye_size, d.eye_size),
+            face_width: blend(self.face_width, d.face_width),
+            mid_face: blend(self.mid_face, d.mid_face),
+            lower_face: blend(self.lower_face, d.lower_face),
+            chin_length: blend(self.chin_length, d.chin_length),
+            jaw: blend(self.jaw, d.jaw),
+            v_face: blend(self.v_face, d.v_face),
+            chin_point: blend(self.chin_point, d.chin_point),
+            brow_tilt: blend(self.brow_tilt, d.brow_tilt),
+            hairline: blend(self.hairline, d.hairline),
+            ..self
+        }
+    }
 }
 
 /// The anchors a stored face field needs: the 478 mesh points (`x, y` in document pixels)
@@ -563,8 +667,9 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
     let mut report = FaceReport::default();
     let Some(frame) = FaceFrame::new(&spec.anchors) else { return (field, report) };
     let mut asked: Vec<(&'static FacePart, f64, Shape)> = Vec::new();
+    let sliders = spec.sliders.composed();
     for part in FACE_PARTS {
-        let slider = (part.slider)(&spec.sliders);
+        let slider = (part.slider)(&sliders);
         if slider.abs() < 0.5 {
             continue;
         }
@@ -665,6 +770,30 @@ mod tests {
 
     fn build(sliders: FaceSliders) -> (LiquifyField, FaceReport) {
         face_field(&FaceSpec { sliders, anchors: face() }, bounds(), CELL)
+    }
+
+    #[test]
+    fn the_presets_blend_their_bundles_into_the_manual_sliders() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // 经典 at 100: slim 25, eyes +15; the untouched zones stay.
+        let c = FaceSliders { preset: FacePreset::Classic, preset_strength: 100.0, ..Default::default() }.composed();
+        assert!(near(c.face_slim, 25.0) && near(c.eye_size, 15.0));
+        assert!(near(c.jaw, 0.0) && near(c.mouth_size, 0.0));
+        // Strength scales: 50 halves the bundle; manual values stack and clamp.
+        let c = FaceSliders { preset: FacePreset::Classic, preset_strength: 50.0, face_slim: 20.0, ..Default::default() }.composed();
+        assert!(near(c.face_slim, 32.5) && near(c.eye_size, 7.5));
+        let c = FaceSliders { preset: FacePreset::Classic, preset_strength: 100.0, face_slim: 90.0, ..Default::default() }.composed();
+        assert!(near(c.face_slim, 100.0), "the stop clamps");
+        // 长脸 shortens the middle third; 方脸 works the jaw.
+        let c = FaceSliders { preset: FacePreset::Long, preset_strength: 100.0, ..Default::default() }.composed();
+        assert!(near(c.mid_face, -30.0) && near(c.lower_face, -25.0));
+        let c = FaceSliders { preset: FacePreset::Square, preset_strength: 100.0, ..Default::default() }.composed();
+        assert!(near(c.jaw, 40.0) && near(c.chin_length, 20.0));
+        // A preset alone moves the field; zero strength does not.
+        let (f, _) = build(FaceSliders { preset: FacePreset::Round, preset_strength: 100.0, ..Default::default() });
+        assert!(!f.is_identity());
+        let (f, _) = build(FaceSliders { preset: FacePreset::Round, preset_strength: 0.0, ..Default::default() });
+        assert!(f.is_identity());
     }
 
     #[test]
@@ -819,6 +948,8 @@ mod tests {
             brow_tilt: 100.0,
             brow_shape: 100.0,
             brow_height: 100.0,
+            preset: FacePreset::None,
+            preset_strength: 0.0,
         };
         let (field, report) = build(sliders);
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
