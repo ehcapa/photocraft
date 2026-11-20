@@ -635,11 +635,21 @@ pub fn finish_object_selection(app: &mut PhotocraftApp, start: [f64; 2], end: [f
 /// Reports a smart-selection command result in the status bar. Engine errors are already
 /// reported by [`PhotocraftApp::run`], but an empty result (`changed: false`) is a silent
 /// success that looks like a dead button (Select Subject finding nothing on a busy photo,
-/// Object Selection missing its rectangle). `empty_msg` says what to try next.
+/// Object Selection missing its rectangle). `empty_msg` says what to try next. A
+/// synchronous `Err` (a region the analysis never populated — a fashion tier that is not
+/// placed, a person that was not found) is spelled out too: an unexplained nothing is
+/// indistinguishable from a dead button.
 pub fn report_smart_result(app: &mut PhotocraftApp, res: Result<Value, String>, empty_msg: &str) {
-    if matches!(res, Ok(ref v) if v.get("changed").and_then(Value::as_bool) == Some(false)) {
-        app.ui.status = empty_msg.into();
-        app.ui.status_error = false;
+    match res {
+        Ok(ref v) if v.get("changed").and_then(Value::as_bool) == Some(false) => {
+            app.ui.status = empty_msg.into();
+            app.ui.status_error = false;
+        }
+        Err(error) => {
+            app.ui.status = error;
+            app.ui.status_error = true;
+        }
+        _ => {}
     }
 }
 
