@@ -205,7 +205,7 @@ fn history_jumps_wait_for_a_pending_crop() {
     let mut app = app(SampleType::U8);
     app.run("history.newSnapshot", json!({})).unwrap();
     app.run("image.canvasSize", json!({"width": 300, "height": 200})).unwrap();
-    let snapshot = app.session.active().unwrap().snapshots[0].id;
+    let snapshot = app.session.active().unwrap().snapshots()[0].id;
     let frame = boxed(220.0, 120.0, 290.0, 190.0, 0.0);
     // A pass first: the tool holds a frame for the document it was made for, which Discard drops.
     crate::canvas::testing::frame(&mut app);
@@ -331,11 +331,13 @@ fn a_pending_crop_greys_the_menus_photoshop_greys() {
     for id in greyed {
         assert!(!allows(&app, id), "{id} is greyed");
     }
-    assert!(
-        ids.iter()
-            .filter(|id| id.starts_with("layer.") || id.starts_with("type.") || id.starts_with("select.") || id.starts_with("filter."))
-            .all(|id| !allows(&app, id))
-    );
+    let offending: Vec<&str> = ids
+        .iter()
+        .filter(|id| id.starts_with("layer.") || id.starts_with("type.") || id.starts_with("select.") || id.starts_with("filter."))
+        .filter(|id| allows(&app, id))
+        .copied()
+        .collect();
+    assert!(offending.is_empty(), "still allowed during a pending crop: {offending:?}");
     // Committing still runs `image.crop` itself, and frees the menus again.
     assert!(crop_ui::apply(&mut app));
     assert_eq!(doc_size(&app), Size::new(40, 30));

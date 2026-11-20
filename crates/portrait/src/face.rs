@@ -146,10 +146,7 @@ fn feather(a: &mut [f32], w: u32, h: u32) {
 /// (document pixels) — above the first line is brow and forehead, below the second is
 /// chin. `None` when the landmarks run short.
 pub fn cheek_band(landmarks: &[[f32; 3]]) -> Option<(f32, f32)> {
-    Some((
-        (landmarks.get(145)?[1] + landmarks.get(374)?[1]) * 0.5,
-        (landmarks.get(13)?[1] + landmarks.get(14)?[1]) * 0.5,
-    ))
+    Some(((landmarks.get(145)?[1] + landmarks.get(374)?[1]) * 0.5, (landmarks.get(13)?[1] + landmarks.get(14)?[1]) * 0.5))
 }
 
 /// The blush mask: an ellipse per cheek point, sized off the eye span, feathered. The

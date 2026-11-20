@@ -97,10 +97,7 @@ pub fn detect_faces(px: &[[f32; 3]], w: usize, h: usize) -> Option<Vec<FaceDet>>
     }
     let tensor = Tensor::from_shape(&[1, 3, DETECT_SIDE, DETECT_SIDE], &input).ok()?;
     let outputs = plan.run(tvec![tensor.into()]).ok()?;
-    let flat: Vec<Vec<f32>> = outputs
-        .iter()
-        .map(|o| o.to_plain_array_view::<f32>().map(|v| v.iter().copied().collect()).unwrap_or_default())
-        .collect();
+    let flat: Vec<Vec<f32>> = outputs.iter().map(|o| o.to_plain_array_view::<f32>().map(|v| v.iter().copied().collect()).unwrap_or_default()).collect();
     if flat.len() != 9 || flat.iter().any(|v| v.is_empty()) {
         return None;
     }
@@ -125,10 +122,7 @@ pub fn detect_faces(px: &[[f32; 3]], w: usize, h: usize) -> Option<Vec<FaceDet>>
                 y1: back(cy * s + d(3), oy).min(h as f32),
                 score: scores[i],
                 kps: std::array::from_fn(|k| {
-                    [
-                        back(cx * s + kps[i * 10 + k * 2] * s, ox).clamp(0.0, w as f32),
-                        back(cy * s + kps[i * 10 + k * 2 + 1] * s, oy).clamp(0.0, h as f32),
-                    ]
+                    [back(cx * s + kps[i * 10 + k * 2] * s, ox).clamp(0.0, w as f32), back(cy * s + kps[i * 10 + k * 2 + 1] * s, oy).clamp(0.0, h as f32)]
                 }),
             };
             if face.x1 > face.x0 && face.y1 > face.y0 {

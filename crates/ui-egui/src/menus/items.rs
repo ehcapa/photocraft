@@ -8,7 +8,7 @@ use craft::menu::{
 };
 use serde_json::json;
 
-use super::invoke::{panel_alias, proof_preset, workspace_id};
+use super::invoke::{panel_alias, proof_preset, smart_row, workspace_id};
 use super::state::{checked, is_enabled, reveal_label, translated_menu_label};
 use super::{DOCUMENT_ITEM, PhotocraftApp, TOP_MENUS, UI_COMMANDS};
 
@@ -24,6 +24,7 @@ pub fn is_live(id: &str) -> bool {
         || id == "view.proofSetup.custom"
         || crate::tool_shortcuts::tool(id).is_some()
         || panel_alias(id).is_some()
+        || smart_row(id)
         || crate::panel_docking::toggle_panel(id).is_some()
         || workspace_id(id).is_some()
         || proof_preset(id).is_some()

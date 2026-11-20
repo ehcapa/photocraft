@@ -264,15 +264,7 @@ fn suppress_speckle(vals: &mut [f32], w: usize, h: usize) {
         while let Some(i) = stack.pop() {
             size += 1;
             let (x, y) = (i % w, i / w);
-            for j in [
-                (x > 0).then(|| i - 1),
-                (x + 1 < w).then_some(i + 1),
-                (y > 0).then(|| i - w),
-                (y + 1 < h).then_some(i + w),
-            ]
-            .into_iter()
-            .flatten()
-            {
+            for j in [(x > 0).then(|| i - 1), (x + 1 < w).then_some(i + 1), (y > 0).then(|| i - w), (y + 1 < h).then_some(i + w)].into_iter().flatten() {
                 if labels[j] == 0 && vals[j] > 0.0 {
                     labels[j] = id;
                     stack.push(j);
@@ -342,12 +334,7 @@ fn oval_box(landmarks: &[[f32; 3]]) -> Option<photocraft_geom::Rect> {
 fn plausible(landmarks: &[[f32; 3]], over: photocraft_geom::Rect) -> bool {
     let Some(b) = oval_box(landmarks) else { return false };
     let (w, h) = (over.width() as f32, over.height() as f32);
-    let margins = [
-        (b.x0 - over.x0) as f32 / w,
-        (over.x1 - b.x1) as f32 / w,
-        (b.y0 - over.y0) as f32 / h,
-        (over.y1 - b.y1) as f32 / h,
-    ];
+    let margins = [(b.x0 - over.x0) as f32 / w, (over.x1 - b.x1) as f32 / w, (b.y0 - over.y0) as f32 / h, (over.y1 - b.y1) as f32 / h];
     margins.iter().all(|&m| m >= 0.05) && (b.width() as f32).max(b.height() as f32) / w.max(h) >= 0.1
 }
 
@@ -641,11 +628,13 @@ pub(crate) fn analyze_person(
                 (ring.width() >= MIN_FACE_SIDE as u32 && ring.height() >= MIN_FACE_SIDE as u32).then_some(ring)
             });
             match ring {
-                Some(ring) => match ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)) {
-                    Some(pts) => Some((pts, ring)),
-                    None if roi.is_some() => return Err(no_face()),
-                    None => None,
-                },
+                Some(ring) => {
+                    match ctx.stage(0.55, 0.6, "Finding landmarks", |_| mesh_over(doc, target, sample_all, ring)).filter(|pts| plausible(pts, ring)) {
+                        Some(pts) => Some((pts, ring)),
+                        None if roi.is_some() => return Err(no_face()),
+                        None => None,
+                    }
+                }
                 None if roi.is_some() => return Err(no_face()),
                 None => None,
             }
@@ -699,7 +688,8 @@ pub(crate) fn analyze_person(
     };
     if let Some(pts) = mesh {
         analysis.landmarks = pts;
-        if !parsing_skin && let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
+        if !parsing_skin
+            && let Some(gated) = photocraft_portrait::face::face_mask(&analysis.landmarks, dw, dh).and_then(|hull| person_gated(&hull, &person, dw, dh))
         {
             analysis.union(photocraft_portrait::Region::Face, gated);
         }
@@ -726,11 +716,7 @@ pub(crate) fn analyze_person(
                             skin,
                             eyes,
                             lips,
-                            &CheekGeometry {
-                                nose_x: analysis.landmarks.get(1).map(|p| p[0]).unwrap_or_default(),
-                                nose_half: span * 0.30,
-                                band,
-                            },
+                            &CheekGeometry { nose_x: analysis.landmarks.get(1).map(|p| p[0]).unwrap_or_default(), nose_half: span * 0.30, band },
                             dw,
                             dh,
                         )
@@ -773,11 +759,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         move |ctx| {
             // The analysis resolves first — a cache hit skips subject, parsing and
             // landmarks; the derived pixels below run whenever the recipe asks.
-            let analysis = if let Some(analysis) = cached {
-                analysis
-            } else {
-                analyze_person(&doc, target, sample_all, roi, ctx)?
-            };
+            let analysis = if let Some(analysis) = cached { analysis } else { analyze_person(&doc, target, sample_all, roi, ctx)? };
             // The restoration first: the GAN redraws skin texture, so the smoothing below
             // runs on the enhanced composite when both are asked for (the DAG's
             // Enhance-before-Skin edge, realised as the blur's source).
@@ -1555,9 +1537,11 @@ mod tests {
                 let name = format!("{region:?}").to_lowercase();
                 let bounds = (covered > 0).then_some(json!([x0, y0, x1, y1])).unwrap_or(json!(null));
                 summary.insert(name.clone(), json!({ "coverage": covered as f64 / (w as f64 * h as f64), "bounds": bounds }));
-                let mut doc = Document::new(&name, photocraft_geom::Size { width: w, height: h }, photocraft_doc::ColorMode::Grayscale, photocraft_doc::SampleType::U8);
+                let mut doc =
+                    Document::new(&name, photocraft_geom::Size { width: w, height: h }, photocraft_doc::ColorMode::Grayscale, photocraft_doc::SampleType::U8);
                 doc.layers.push(Layer::new(&name, LayerContent::Raster(surface)));
-                let exported = photocraft_io::export(&doc, "png", &photocraft_io::ExportOptions::default()).map_err(|e| EngineError::Other(format!("export: {e}")))?;
+                let exported =
+                    photocraft_io::export(&doc, "png", &photocraft_io::ExportOptions::default()).map_err(|e| EngineError::Other(format!("export: {e}")))?;
                 std::fs::write(format!("{out}/{stem}-{name}.png"), &exported.bytes).map_err(|e| EngineError::Other(format!("write: {e}")))?;
             }
             eprintln!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(summary)).unwrap_or_default());
@@ -1589,7 +1573,10 @@ mod tests {
             s.write_region(photocraft_geom::Rect::new(0, 0, w, h), &vals);
             s
         };
-        let m = photocraft_doc::LayerMask { surface: outside_rect(&mask(16, 8), photocraft_geom::Rect::new(4, 2, 9, 6), 16, 8).unwrap(), ..photocraft_doc::LayerMask::reveal_all() };
+        let m = photocraft_doc::LayerMask {
+            surface: outside_rect(&mask(16, 8), photocraft_geom::Rect::new(4, 2, 9, 6), 16, 8).unwrap(),
+            ..photocraft_doc::LayerMask::reveal_all()
+        };
         for y in 0..8 {
             for x in 0..16 {
                 let expected = if (4..9).contains(&x) && (2..6).contains(&y) { 0.0 } else { (y * 16 + x) as f32 % 7.0 / 7.0 };
@@ -1666,7 +1653,11 @@ mod tests {
                 let (x1, y1) = (((x + w) / area.width() as f32 * sw as f32) as usize, ((y + h) / area.height() as f32 * sh as f32) as usize);
                 for y in y0..y1.min(sh) {
                     for x in x0..x1.min(sw) {
-                        let v = planes.get(photocraft_ml::body::BODY_SKIN).map(|p| p[y * sw + x]).unwrap_or(0.0).max(planes.get(photocraft_ml::body::FACE_SKIN).map(|p| p[y * sw + x]).unwrap_or(0.0));
+                        let v = planes
+                            .get(photocraft_ml::body::BODY_SKIN)
+                            .map(|p| p[y * sw + x])
+                            .unwrap_or(0.0)
+                            .max(planes.get(photocraft_ml::body::FACE_SKIN).map(|p| p[y * sw + x]).unwrap_or(0.0));
                         lo = lo.min(v);
                         hi = hi.max(v);
                         sum += v;
@@ -1701,15 +1692,7 @@ mod tests {
         let eyes = surface(w, h, &|x, y| (4..10).contains(&x) && (4..7).contains(&y) || (22..28).contains(&x) && (4..7).contains(&y));
         let lips = surface(w, h, &|x, y| (12..20).contains(&x) && (12..15).contains(&y));
         let mask = photocraft_doc::LayerMask {
-            surface: cheeks_from_parsing(
-                &skin,
-                &eyes,
-                &lips,
-                &CheekGeometry { nose_x: 16.0, nose_half: 6.0, band: (4.0, 12.0) },
-                32,
-                16,
-            )
-            .unwrap(),
+            surface: cheeks_from_parsing(&skin, &eyes, &lips, &CheekGeometry { nose_x: 16.0, nose_half: 6.0, band: (4.0, 12.0) }, 32, 16).unwrap(),
             ..photocraft_doc::LayerMask::reveal_all()
         };
         assert_eq!(mask.value(16, 2), 0.0, "above the eye line is forehead");

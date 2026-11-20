@@ -864,6 +864,7 @@ fn registry_filesystem_path_params_are_classified() {
         "workingGray": "/outside/photocraft-probe.icc",
         "input": "/outside/photocraft-input",
         "output": "/outside/photocraft-output",
+        "reference": "/outside/photocraft-probe.png",
         "paths": ["/outside/photocraft-probe.psd"],
     });
     let preference_probe = serde_json::json!({"path": ".scriptEvents", "value": {}});
@@ -1076,6 +1077,8 @@ fn documents_filesystem_path_params(id: &str, params: &str) -> bool {
             | "layer.new.frame"
             // `"stepName":"Transform Path"` names the History step, not a host file.
             | "edit.transform"
+            // `ORT_DYLIB_PATH` names the ONNX runtime's environment variable, not a request parameter.
+            | "select.subject"
     ) || id.starts_with("layer.newFillLayer.")
         || id.starts_with("layer.newAdjustmentLayer.")
     {

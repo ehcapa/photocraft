@@ -234,7 +234,7 @@ fn smart_portrait_opens_the_recipe_dialog_and_runs_on_ok() {
         assert!(rows.iter().any(|p| p.key == key), "a {key} row");
     }
     assert!(!rows.iter().any(|p| p.key == "reference" || p.key == "referenceStats"), "protocol-only rows stay out");
-    assert!(crate::filter_dialog::previews(CMD) == false, "the pipeline is too heavy for a live preview");
+    assert!(!crate::filter_dialog::previews(CMD), "the pipeline is too heavy for a live preview");
     // The menu row routes to the dialog, and an OK runs the command.
     let ctx = app.ctx().clone();
     let r = crate::menus::invoke(&mut app, &ctx, CMD, Value::Null).unwrap();

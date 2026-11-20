@@ -22,13 +22,15 @@ pub const FEYNOBG: ModelFile = ModelFile { canonical: "feynobg.onnx", blake3: So
 
 /// The face detector (SCRFD det_10g): insightface's buffalo_l detection model as hosted by
 /// immich-app — the automatic face box of `detect`, the drawn `roi`'s automatic sibling.
-pub const FACEDETECTOR: ModelFile = ModelFile { canonical: "facedetector.onnx", blake3: Some("fa3e5d8c62722a7b7122dc185245236589dcf0b3b5c9c5561cc742ce356fba56") };
+pub const FACEDETECTOR: ModelFile =
+    ModelFile { canonical: "facedetector.onnx", blake3: Some("fa3e5d8c62722a7b7122dc185245236589dcf0b3b5c9c5561cc742ce356fba56") };
 
 /// The whole-body six-class segmentation (MediaPipe selfie multiclass, tflite→ONNX
 /// conversion): body-skin/face-skin/clothes/hair over the whole document — the body
 /// complement of the face-crop parsing stage. Apache-2.0, the one clean-license body
 /// parser; see docs/fork/models.md.
-pub const SELFIE: ModelFile = ModelFile { canonical: "selfiemulticlass.onnx", blake3: Some("847b94b7812e47cd0daa22986bd1a7fe9fdf846026c38a1922746b78003c3e31") };
+pub const SELFIE: ModelFile =
+    ModelFile { canonical: "selfiemulticlass.onnx", blake3: Some("847b94b7812e47cd0daa22986bd1a7fe9fdf846026c38a1922746b78003c3e31") };
 
 /// The face-enhancement model's slot — version-free on purpose: the GFPGAN v1.x line
 /// shares the 512² / 0..1 / RGB interface, so another version dropped into

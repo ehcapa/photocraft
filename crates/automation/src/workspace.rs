@@ -708,6 +708,9 @@ fn params_contain_ambient_path(id: &str, params: &Value) -> bool {
         | "layer.smartObjects.convertToLayers"
         | "layer.smartObjects.exportSvg"
         | "layer.smartObjects.updateSvg" => &["path"],
+        // The 追色 colour-match reference: any non-empty `reference` reads a host image;
+        // `referenceStats` carries the same numbers inline instead (protocol-only).
+        "portrait.create" => &["reference"],
         "image.mode.rgb" | "image.mode.grayscale" | "image.mode.cmyk" | "image.mode.lab" => &["profile"],
         "edit.assignProfile" | "edit.convertToProfile" | "edit.profileInfo" | "view.proofSetup" | "view.gamutWarning" => &["profile"],
         // New Document's Color Profile (#321) can name an .icc file.
@@ -719,7 +722,7 @@ fn params_contain_ambient_path(id: &str, params: &Value) -> bool {
         params
             .get(*key)
             .and_then(Value::as_str)
-            .is_some_and(|value| if matches!(*key, "file" | "mapPath" | "path") { !value.is_empty() } else { looks_like_path(value) })
+            .is_some_and(|value| if matches!(*key, "file" | "mapPath" | "path" | "reference") { !value.is_empty() } else { looks_like_path(value) })
     })
 }
 

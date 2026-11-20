@@ -32,6 +32,18 @@ pub(crate) fn panel_alias(id: &str) -> Option<&'static str> {
     })
 }
 
+/// The person regions `select.region` knows, the options bar's picker and the Select › Person
+/// rows' shared list.
+pub(super) const PERSON_REGIONS: &[&str] = &["skin", "face", "hair", "eyes", "eyelids", "lips", "cheeks", "clothes"];
+
+/// The Select menu's stateless smart-selection rows: `select.subject.hair` and the
+/// `select.region.<region>` person rows, which [`invoke`](fn@crate::menus::invoke) carries out
+/// rather than the engine. `is_live` reads this, so the modal gates (a pending crop) grey them
+/// like the commands they run.
+pub(super) fn smart_row(id: &str) -> bool {
+    id == "select.subject.hair" || id.strip_prefix("select.region.").is_some_and(|r| PERSON_REGIONS.contains(&r))
+}
+
 /// View › Proof Setup presets we can simulate, as `view.proofSetup` profiles.
 pub(super) fn proof_preset(id: &str) -> Option<&'static str> {
     Some(match id.strip_prefix("view.proofSetup.")? {
@@ -131,7 +143,7 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
     // Select › Person ▸ …: the menu's stateless region rows, `select.region` with the row's
     // region and the held modifiers' selection mode.
     if let Some(region) = id.strip_prefix("select.region.")
-        && matches!(region, "skin" | "face" | "hair" | "eyes" | "eyelids" | "lips" | "cheeks" | "clothes")
+        && PERSON_REGIONS.contains(&region)
     {
         let mut mode = None;
         if let Some(m) = smart_selection_mode(ctx.input(|i| i.modifiers)) {
@@ -582,9 +594,7 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
         "select.findLayers" => crate::layer_filter_ui::find::invoke(app, params),
         // Photoshop's "Select and Mask…" is the engine's select.refineEdge.
         // Select › Color Range… from the menu: the dialog (with params: the engine directly).
-        "select.colorRange" if params.as_object().is_none_or(|o| o.is_empty()) => {
-            Ok(json!({"dialog": crate::color_range_ui::open(app).map(|dialog| dialog.value().to_string())}))
-        }
+        "select.colorRange" if params.as_object().is_none_or(|o| o.is_empty()) => crate::color_range_ui::open(app).map(dialog_reply),
         // Layer › New Fill Layer › Pattern… from the menu: the Pattern Fill dialog (with params:
         // the engine directly).
         photocraft_engine::pattern_fill_cmds::CREATE if params.as_object().is_none_or(|o| o.is_empty()) => {

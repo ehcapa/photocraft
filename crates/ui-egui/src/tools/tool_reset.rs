@@ -198,12 +198,14 @@ pub fn option_keys(tool: Tool) -> &'static [&'static str] {
             move_show_layers_hover_bounds,
             transform
         ),
-        Tool::RectMarquee | Tool::EllipseMarquee => reset!(feather, anti_alias, marquee_style, marquee_width, marquee_height, marquee_unit),
+        Tool::RectMarquee | Tool::EllipseMarquee => {
+            reset!(feather, anti_alias, marquee_style, marquee_width, marquee_height, marquee_unit, subject_hair, region_pick)
+        }
         // The single-pixel marquees are never anti-aliased: Feather is their only option.
-        Tool::SingleRowMarquee | Tool::SingleColumnMarquee => reset!(feather),
-        Tool::Lasso | Tool::PolygonLasso => reset!(feather, anti_alias),
-        Tool::MagneticLasso => reset!(feather, anti_alias, magnetic),
-        Tool::MagicWand => reset!(tolerance, anti_alias, contiguous),
+        Tool::SingleRowMarquee | Tool::SingleColumnMarquee => reset!(feather, subject_hair, region_pick),
+        Tool::Lasso | Tool::PolygonLasso => reset!(feather, anti_alias, subject_hair, region_pick),
+        Tool::MagneticLasso => reset!(feather, anti_alias, magnetic, subject_hair, region_pick),
+        Tool::MagicWand => reset!(tolerance, anti_alias, contiguous, subject_hair, region_pick),
         Tool::QuickSelection => reset!(enhance_edge),
         Tool::ObjectSelection => reset!(enhance_edge, object_finder, object_hard_edge),
         Tool::Crop => reset!(crop),
