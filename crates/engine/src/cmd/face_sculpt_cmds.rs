@@ -533,6 +533,7 @@ mod tests {
             "lowerFace" => s.lower_face = v,
             "chinLength" => s.chin_length = v,
             "chinPoint" => s.chin_point = v,
+            "chinRetract" => s.chin_retract = v,
             "chinRettract" => s.chin_retract = v,
             "eyeSize" => s.eye_size = v,
             "pupilSize" => s.pupil_size = v,
@@ -565,7 +566,7 @@ mod tests {
             "browTilt" => s.brow_tilt = v,
             "browShape" => s.brow_shape = v,
             "browHeight" => s.brow_height = v,
-            _ => {}
+            _ => panic!("with_one: unknown slider {name}"),
         }
         s
     }
