@@ -496,6 +496,7 @@ pub fn run(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     crate::prefs_ui::feed(app);
     app.framework.dialogs.run(ui);
     take_results(app, &ui.ctx().clone());
+    crate::sculpt_ui::windows(app, &ui.ctx().clone());
 }
 
 /// Answers dialog `id` with OK, as its default button would, and runs what OK does. A held OK is answered at once by the
@@ -609,6 +610,10 @@ pub fn open_command_dialog(app: &mut PhotocraftApp, command: &str, label: &str) 
     }
     if adjust_dialog::has_dialog(command) {
         return adjust_dialog::open(app, command);
+    }
+    if command == crate::sculpt_ui::BODY || command == crate::sculpt_ui::FACE {
+        crate::sculpt_ui::open(app, if command == crate::sculpt_ui::FACE { crate::sculpt_ui::FACE } else { crate::sculpt_ui::BODY });
+        return Ok(crate::sculpt_ui::dialog_id());
     }
     if filter_dialog::has_dialog(command) {
         return filter_dialog::open(app, command);

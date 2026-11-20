@@ -56,6 +56,7 @@ pub mod panels;
 pub mod preset_files_ui;
 pub mod proxy;
 pub mod render_path;
+pub mod sculpt_ui;
 pub mod state;
 pub mod texel_guard;
 pub mod theme;
@@ -304,6 +305,9 @@ type InfoSampleKey = (i32, i32, u64, u32, u32);
 pub struct PhotocraftApp {
     pub session: Session,
     pub ui: UiState,
+    /// The open Body/Face Sculpt panel, when there is one (sculpt_ui). Plain app state,
+    /// not UiState: the control channel does not drive this panel.
+    pub sculpt: Option<sculpt_ui::Panel>,
     pub services: Services,
     /// Canvas caches per (document, display): CPU textures hold monitor values; the GPU
     /// canvas state is shared (`canvas::GPU_OUTPUT`).

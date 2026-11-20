@@ -49,6 +49,7 @@ impl PhotocraftApp {
         let mut app = Self {
             session,
             ui: UiState::default(),
+            sculpt: None,
             services,
             canvases: HashMap::new(),
             raster_logs: HashMap::new(),
