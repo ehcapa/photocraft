@@ -1,9 +1,13 @@
-//! The Body/Face Sculpt panel — the bespoke grouped face of the two sculpt commands,
-//! PixCake's own panel shape: sections down the left, the active section's sliders on the
-//! right, the preset row on top (face), a chain link on every two-sided feature (linked
-//! moves the pair, unlinked edits each side), and an Apply that runs the engine command
-//! and keeps the panel open for the next pass. The generic schema dialog served both
-//! commands until here; this is the pixel-parity surface over the same engine params.
+//! The Body/Face Sculpt panel — the bespoke grouped face of the two sculpt commands:
+//! sections as one tab row, the active section's sliders in a two-column grid, the preset
+//! row above them (face), a chain link on every two-sided feature (linked moves the pair,
+//! unlinked edits each side), and an Apply that runs the engine command and keeps the panel
+//! open for the next pass. The generic schema dialog served both commands until here; this
+//! is the pixel-parity surface over the same engine params.
+//!
+//! The window is capped to the screen and the rows scroll, so the panel fits a laptop: an
+//! earlier left-hand section column held the window open at the height of all its buttons
+//! and the content-sized window ran past the screen bottom, putting Apply out of reach.
 
 use std::collections::BTreeMap;
 
@@ -214,7 +218,9 @@ impl Panel {
                 m.insert(format!("{base}Right"), json!(side("Right")));
             }
         }
-        if self.command == FACE && self.preset != "none" {
+        // No preset is `none`; an unset panel must not send the empty string the engine
+        // refuses (`unknown preset ""`).
+        if self.command == FACE && !matches!(self.preset.as_str(), "" | "none") {
             m.insert("preset".into(), json!(self.preset));
             m.insert("presetStrength".into(), json!(self.value("presetStrength")));
         }
@@ -227,9 +233,9 @@ pub fn dialog_id() -> craft::ui::dialog::DialogId {
     craft::ui::dialog::DialogId::NULL
 }
 
-/// Opens the panel for `command` (fresh values, every lock linked).
+/// Opens the panel for `command` (fresh values, every lock linked, no preset chosen).
 pub fn open(app: &mut PhotocraftApp, command: &'static str) {
-    app.sculpt = Some(Panel { command, ..Panel::default() });
+    app.sculpt = Some(Panel { command, preset: "none".into(), ..Panel::default() });
 }
 
 /// Draws the open panel. Kept open across Apply — the point of a panel.
@@ -243,7 +249,7 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // each once unlinked) outgrow a laptop's usable height. Cap the window to the screen and
     // let the rows scroll, so Apply and Close can never be pushed below its bottom edge.
     let max_height = (ctx.content_rect().height() - 48.0).max(240.0);
-    egui::Window::new(title).id(egui::Id::unique("photocraft.sculpt")).min_width(420.0).default_size([460.0, 560.0]).max_height(max_height).show(ctx, |ui| {
+    egui::Window::new(title).id(egui::Id::unique("photocraft.sculpt")).min_width(360.0).default_size([440.0, 420.0]).max_height(max_height).show(ctx, |ui| {
         let sections = panel.sections();
         let mut apply = false;
         let mut reset = false;
@@ -257,12 +263,26 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 if ui.button(tl!("Close")).clicked() {
                     close = true;
                 }
+                if ui.button(tl!("Reset")).clicked() {
+                    reset = true;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.weak(tl!("Applies and stays open"));
                 });
             });
             ui.separator();
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                // Sections as one wrapped tab row. A left-hand column held the window open at
+                // the height of all its buttons — the floor the shrink grip bounced back to —
+                // and a tab row costs a line instead.
+                ui.horizontal_wrapped(|ui| {
+                    for (i, s) in sections.iter().enumerate() {
+                        if ui.selectable_label(panel.section == i, tl!(s.name)).clicked() {
+                            panel.section = i;
+                        }
+                    }
+                });
+                ui.separator();
                 // The preset row (face only): seven one-clicks, the chosen one held. Wrapped, so
                 // a narrow window takes two lines rather than widening past the screen.
                 if panel.command == FACE {
@@ -274,89 +294,80 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             }
                         }
                     });
-                    let mut strength = panel.value("presetStrength");
-                    if strength == 0.0 && !panel.preset.is_empty() && panel.preset != "none" {
-                        strength = 60.0; // the dialog's own default, shown rather than sent
+                    // Strength belongs to a chosen preset; without one the row would only
+                    // add height (and a slider that does nothing).
+                    if !matches!(panel.preset.as_str(), "" | "none") {
+                        let mut strength = panel.value("presetStrength");
+                        if strength == 0.0 {
+                            strength = 60.0; // the dialog's own default, shown rather than sent
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(tl!("Preset Strength"));
+                            ui.add(egui::Slider::new(&mut strength, 0.0..=100.0));
+                        });
+                        panel.set("presetStrength", strength);
                     }
-                    ui.horizontal(|ui| {
-                        ui.label(tl!("Preset Strength"));
-                        ui.add(egui::Slider::new(&mut strength, 0.0..=100.0));
-                    });
-                    panel.set("presetStrength", strength);
                     ui.separator();
                 }
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        for (i, s) in sections.iter().enumerate() {
-                            if ui.selectable_label(panel.section == i, tl!(s.name)).clicked() {
-                                panel.section = i;
+                // The remaining height, and no shrinking to the rows: past it they
+                // scroll (a ScrollArea that auto-shrinks would grow with them).
+                egui::ScrollArea::vertical().auto_shrink([false, false]).min_scrolled_height(24.0).max_height(ui.available_height().max(1.0)).show(ui, |ui| {
+                    let section = &sections[panel.section.min(sections.len() - 1)];
+                    #[derive(Clone, Copy)]
+                    struct Edit {
+                        key: &'static str,
+                        base: f32,
+                        sides: Option<(f32, f32)>,
+                    }
+                    let mut edits: Vec<Edit> = Vec::new();
+                    // Two columns — the link and label, then the slider — so the sliders line
+                    // up and every row costs one line; an open pair adds its L and R rows
+                    // under its own. The slider takes the width the labels leave.
+                    ui.spacing_mut().slider_width = (ui.available_width() - 180.0).clamp(80.0, 220.0);
+                    egui::Grid::new("photocraft.sculpt.rows").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                        for row in section.rows {
+                            let paired = section.pairs.contains(&row.key);
+                            let linked = *panel.locks.get(row.key).unwrap_or(&true);
+                            if paired {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button(if linked { "🔗" } else { "⛓" }).clicked() {
+                                        panel.locks.insert(row.key.to_owned(), !linked);
+                                    }
+                                    ui.label(tl!(row.label));
+                                });
+                                let mut base = panel.value(row.key);
+                                ui.add(egui::Slider::new(&mut base, -100.0..=100.0));
+                                ui.end_row();
+                                if linked {
+                                    edits.push(Edit { key: row.key, base, sides: None });
+                                } else {
+                                    let mut l = panel.value(&format!("{}Left", row.key));
+                                    let mut rt = panel.value(&format!("{}Right", row.key));
+                                    ui.label("L");
+                                    ui.add(egui::Slider::new(&mut l, -100.0..=100.0));
+                                    ui.end_row();
+                                    ui.label("R");
+                                    ui.add(egui::Slider::new(&mut rt, -100.0..=100.0));
+                                    ui.end_row();
+                                    panel.set(row.key, base);
+                                    edits.push(Edit { key: row.key, base, sides: Some((l, rt)) });
+                                }
+                            } else {
+                                let mut v = panel.value(row.key);
+                                ui.label(tl!(row.label));
+                                ui.add(egui::Slider::new(&mut v, -100.0..=100.0));
+                                ui.end_row();
+                                edits.push(Edit { key: row.key, base: v, sides: None });
                             }
                         }
-                        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                            if ui.button(tl!("Reset")).clicked() {
-                                reset = true;
-                            }
-                        });
                     });
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        // The remaining height, and no shrinking to the rows: past it they
-                        // scroll (a ScrollArea that auto-shrinks would grow with them).
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height().max(1.0)).show(ui, |ui| {
-                            let section = &sections[panel.section.min(sections.len() - 1)];
-                            #[derive(Clone, Copy)]
-                            struct Edit {
-                                key: &'static str,
-                                base: f32,
-                                sides: Option<(f32, f32)>,
-                            }
-                            let mut edits: Vec<Edit> = Vec::new();
-                            for row in section.rows {
-                                let paired = section.pairs.contains(&row.key);
-                                let linked = *panel.locks.get(row.key).unwrap_or(&true);
-                                if paired {
-                                    ui.horizontal(|ui| {
-                                        if ui.small_button(if linked { "🔗" } else { "⛓" }).clicked() {
-                                            panel.locks.insert(row.key.to_owned(), !linked);
-                                        }
-                                        ui.label(tl!(row.label));
-                                    });
-                                    let mut base = panel.value(row.key);
-                                    ui.add(egui::Slider::new(&mut base, -100.0..=100.0));
-                                    if linked {
-                                        edits.push(Edit { key: row.key, base, sides: None });
-                                    } else {
-                                        let mut l = panel.value(&format!("{}Left", row.key));
-                                        let mut rt = panel.value(&format!("{}Right", row.key));
-                                        ui.horizontal(|ui| {
-                                            ui.label("L");
-                                            ui.add(egui::Slider::new(&mut l, -100.0..=100.0));
-                                        });
-                                        ui.horizontal(|ui| {
-                                            ui.label("R");
-                                            ui.add(egui::Slider::new(&mut rt, -100.0..=100.0));
-                                        });
-                                        panel.set(row.key, base);
-                                        edits.push(Edit { key: row.key, base, sides: Some((l, rt)) });
-                                    }
-                                } else {
-                                    let mut v = panel.value(row.key);
-                                    ui.horizontal(|ui| {
-                                        ui.label(tl!(row.label));
-                                        ui.add(egui::Slider::new(&mut v, -100.0..=100.0));
-                                    });
-                                    edits.push(Edit { key: row.key, base: v, sides: None });
-                                }
-                            }
-                            for e in edits {
-                                panel.set(e.key, e.base);
-                                if let Some((l, rt)) = e.sides {
-                                    panel.set(&format!("{}Left", e.key), l);
-                                    panel.set(&format!("{}Right", e.key), rt);
-                                }
-                            }
-                        });
-                    });
+                    for e in edits {
+                        panel.set(e.key, e.base);
+                        if let Some((l, rt)) = e.sides {
+                            panel.set(&format!("{}Left", e.key), l);
+                            panel.set(&format!("{}Right", e.key), rt);
+                        }
+                    }
                 });
             });
         });
