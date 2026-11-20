@@ -35,8 +35,9 @@ const VISIBILITY: f64 = 0.5;
 /// body parts want a broad plateau with the feather at the rim only.
 const DENSITY: f64 = 0.6;
 
-/// The sixteen shaping sliders, each −100..100. A slider's positive direction is its label's
-/// action: `waist` narrows, `hips` rounds, `leg_length` lengthens; zero leaves the part out.
+/// The twenty-one shaping sliders, each −100..100. A slider's positive direction is its
+/// label's action: `waist` narrows, `hips` rounds, `leg_length` lengthens; zero leaves the
+/// part out.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SculptSliders {
     pub slim_body: f32,
@@ -55,6 +56,40 @@ pub struct SculptSliders {
     pub waist_length: f32,
     pub torso_length: f32,
     pub neck_length: f32,
+    /// The composition sliders this crate never reads as rows — `ai_sculpt` (a gentle
+    /// whole-body slim) and `swan_neck` (slim + lengthen + square the shoulders) blend
+    /// into the parts they name inside [`sculpt_field`] (see [`SculptSliders::composed`]),
+    /// so the run path and the stored-params replay compose identically.
+    pub ai_sculpt: f32,
+    pub straight_shoulders: f32,
+    pub swan_neck: f32,
+    pub bust_lift: f32,
+    pub double_chin: f32,
+}
+
+impl SculptSliders {
+    /// The sliders after the composition family blends in: AI塑形 adds a gentle whole-body
+    /// slim across the shaping parts (the rounder zones — hips, bust, head — stay out; the
+    /// slider means the silhouette, not the figure), 天鹅颈 adds its neck trio. The blend
+    /// happens here, inside the one pure spec → field function, so a stored filter's raw
+    /// sliders compose to the same field bit for bit.
+    pub fn composed(self) -> Self {
+        let blend = |own: f32, extra: f32| (own + extra).clamp(-100.0, 100.0);
+        let (ai, swan) = (self.ai_sculpt, self.swan_neck);
+        Self {
+            slim_body: blend(self.slim_body, ai * 0.60),
+            waist: blend(self.waist, ai * 0.50),
+            belly: blend(self.belly, ai * 0.40),
+            arms: blend(self.arms, ai * 0.50),
+            thighs: blend(self.thighs, ai * 0.50),
+            calves: blend(self.calves, ai * 0.35),
+            shoulders: blend(self.shoulders, ai * 0.25),
+            neck: blend(self.neck, swan * 0.60),
+            neck_length: blend(self.neck_length, swan * 0.40),
+            straight_shoulders: blend(self.straight_shoulders, swan * 0.50),
+            ..self
+        }
+    }
 }
 
 /// The head anchor: the face-oval centre and a radius that covers the hair.
@@ -210,6 +245,10 @@ impl Frame {
     fn ramp(&self, a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64) -> Option<Shape> {
         (norm(sub(b, a)) >= 4.0 && width >= 4.0 && band.1 > band.0).then_some(Shape::Ramp { a, b, band, width, gain })
     }
+
+    fn shift(&self, a: [f64; 2], b: [f64; 2], dir: [f64; 2], band: (f64, f64), width: f64, gain: f64) -> Option<Shape> {
+        (norm(sub(b, a)) >= 4.0 && norm(dir) > 1e-9 && width >= 4.0 && band.1 > band.0).then_some(Shape::Shift { a, b, dir, band, width, gain })
+    }
 }
 
 /// One part's resolved geometry.
@@ -228,6 +267,11 @@ enum Shape {
     /// t∈[1.5, 2.5] so the ride ends smoothly instead of at a seam. Laterally the falloff
     /// is about the axis line over `width`.
     Ramp { a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64 },
+    /// Translate a band rigidly along a fixed direction: the whole zone rides `Δ =
+    /// gain · k · len` (len = the segment's own length as the scale), laterally a
+    /// plateau-plus-feather like a ramp's (the core rides whole), longitudinally the
+    /// smoothstep window over `band`. The inverse-map displacement points against `dir`.
+    Shift { a: [f64; 2], b: [f64; 2], dir: [f64; 2], band: (f64, f64), width: f64, gain: f64 },
 }
 
 /// One row of the parts table: the report name, the slider it answers to, the joints that
@@ -271,6 +315,15 @@ const PARTS: &[Part] = &[
             f.contract(a, b, (0.0, 1.0), f.shoulder_w() * 0.75, 0.07)
         },
     },
+    // Straight shoulders: the trapezius slope contracts toward the shoulder line itself
+    // (a horizontal axis), which reads as the line flattening — the slope's rim pulls down
+    // to it the same way a waist's rim pulls in.
+    Part {
+        name: "straight shoulders",
+        slider: |s| s.straight_shoulders,
+        needs: &[11, 12],
+        shape: |f| f.contract(f.pt(11), f.pt(12), (0.0, 1.0), f.shoulder_w() * 0.38, 0.08),
+    },
     Part { name: "left upper arm", slider: |s| s.arms, needs: &[11, 13], shape: |f| arm(f, 11, 13, 0.10) },
     Part { name: "left forearm", slider: |s| s.arms, needs: &[13, 15], shape: |f| arm(f, 13, 15, 0.10) },
     Part { name: "right upper arm", slider: |s| s.arms, needs: &[12, 14], shape: |f| arm(f, 12, 14, 0.10) },
@@ -285,8 +338,30 @@ const PARTS: &[Part] = &[
     Part { name: "right hip", slider: |s| s.hips, needs: &[23, 24], shape: |f| hip(f, 24) },
     Part { name: "left bust", slider: |s| s.bust, needs: &[11, 12, 23, 24], shape: |f| bust(f, -1.0) },
     Part { name: "right bust", slider: |s| s.bust, needs: &[11, 12, 23, 24], shape: |f| bust(f, 1.0) },
+    // The bust-lift band rides up the torso axis (the third of it the bust occupies).
+    Part {
+        name: "bust lift",
+        slider: |s| s.bust_lift,
+        needs: &[11, 12, 23, 24],
+        shape: |f| {
+            let a = lerp(f.shoulder_mid(), f.hip_mid(), 0.18);
+            let b = lerp(f.shoulder_mid(), f.hip_mid(), 0.50);
+            f.shift(a, b, scale(f.u_torso(), -1.0), (0.05, 0.95), f.shoulder_w() * 0.70, 0.07)
+        },
+    },
     Part { name: "head", slider: |s| s.head_size, needs: &[], shape: |f| f.radial(f.head_c, f.head_radius() * 1.40, 0.09) },
     Part { name: "neck", slider: |s| s.neck, needs: &[11, 12], shape: |f| f.contract(f.chin, f.shoulder_mid(), (0.10, 0.95), f.shoulder_w() * 0.36, 0.08) },
+    // Double chin: the submental bulge contracts toward the short under-chin axis —
+    // PixCake files this under flaw removal; the liquify approximation rides the panel.
+    Part {
+        name: "double chin",
+        slider: |s| s.double_chin,
+        needs: &[11, 12],
+        shape: |f| {
+            let b = lerp(f.chin, f.shoulder_mid(), 0.30);
+            f.contract(f.chin, b, (0.05, 0.95), f.head_radius() * 0.85, 0.09)
+        },
+    },
     Part {
         name: "height",
         slider: |s| s.height,
@@ -367,8 +442,9 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
     // Resolve every asked part before writing any: the length family shares one fold budget
     // ([`RAMP_BUDGET`]), which needs all their magnitudes up front.
     let mut asked: Vec<(&'static Part, f64, Shape)> = Vec::new();
+    let sliders = spec.sliders.composed();
     for part in PARTS {
-        let slider = (part.slider)(&spec.sliders);
+        let slider = (part.slider)(&sliders);
         if slider.abs() < 0.5 {
             continue; // the slider is at zero: nothing was asked of this row
         }
@@ -390,6 +466,7 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
             Shape::Contract { a, b, band, width, gain } => write_contract(&mut field, a, b, band, width, gain, k),
             Shape::Radial { c, radius, gain } => write_radial(&mut field, c, radius, gain, k),
             Shape::Ramp { a, b, band, width, gain } => write_ramp(&mut field, a, b, band, width, gain, k * ramp_scale),
+            Shape::Shift { a, b, dir, band, width, gain } => write_shift(&mut field, a, b, dir, band, width, gain * k),
         }
         report.applied.push(part.name);
     }
@@ -522,6 +599,44 @@ fn write_ramp(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64, f6
     }
 }
 
+/// A rigid band translate ([`Shape::Shift`]): the displacement's magnitude is uniform over
+/// the plateau (the zone rides whole, the bust-lift's point) with the ramp family's
+/// plateau-plus-feather laterally and the contract family's smoothstep window
+/// longitudinally. The inverse map points against `dir`, so the content reads as moved
+/// along it; the ride is `gain` of the segment's own length.
+fn write_shift(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], dir: [f64; 2], band: (f64, f64), width: f64, gain: f64) {
+    let ab = sub(b, a);
+    let len = norm(ab);
+    let u = scale(ab, 1.0 / len);
+    let dir = scale(dir, 1.0 / norm(dir));
+    let delta = gain * len;
+    let (lo, hi) = (band.0.min(band.1), band.1.max(band.0));
+    let ramp = (hi - lo) * 0.25;
+    let (min_x, max_x) = (a[0].min(b[0]) - width, a[0].max(b[0]) + width);
+    let (min_y, max_y) = (a[1].min(b[1]) - width, a[1].max(b[1]) + width);
+    let Some((i0, j0, i1, j1)) = span(field, min_x, min_y, max_x, max_y) else { return };
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let p = field.node_pos(i, j);
+            let t = dot(sub(p, a), u) / len;
+            let q = add(a, scale(u, t.clamp(0.0, 1.0) * len));
+            let rho = norm(sub(p, q));
+            if rho >= width {
+                continue;
+            }
+            let long = smoothstep(lo, lo + ramp, t) * (1.0 - smoothstep(hi - ramp, hi, t));
+            if long <= 0.0 {
+                continue;
+            }
+            let lat = 1.0 - smoothstep(0.6, 1.0, rho / width);
+            let mag = delta * long * lat;
+            let idx = j * field.w + i;
+            field.d[idx][0] -= (dir[0] * mag) as f32;
+            field.d[idx][1] -= (dir[1] * mag) as f32;
+        }
+    }
+}
+
 // ---------- the small maths ----------
 
 fn add(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -634,6 +749,13 @@ mod tests {
             SculptSliders { waist_length: 100.0, ..SculptSliders::default() },
             SculptSliders { torso_length: 100.0, ..SculptSliders::default() },
             SculptSliders { neck_length: 100.0, ..SculptSliders::default() },
+            SculptSliders { straight_shoulders: 100.0, ..SculptSliders::default() },
+            SculptSliders { bust_lift: 100.0, ..SculptSliders::default() },
+            SculptSliders { double_chin: 100.0, ..SculptSliders::default() },
+            // The composition sliders have no rows of their own: alone they still move the
+            // field through the parts they blend into (the blend runs inside sculpt_field).
+            SculptSliders { ai_sculpt: 100.0, ..SculptSliders::default() },
+            SculptSliders { swan_neck: 100.0, ..SculptSliders::default() },
         ] {
             let (field, report) = build(sliders);
             assert!(!field.is_identity(), "the slider left the field untouched");
@@ -745,11 +867,56 @@ mod tests {
                 waist_length: 100.0 * sign,
                 torso_length: 100.0 * sign,
                 neck_length: 100.0 * sign,
+                straight_shoulders: 100.0 * sign,
+                swan_neck: 100.0 * sign,
+                bust_lift: 100.0 * sign,
+                double_chin: 100.0 * sign,
+                ai_sculpt: 100.0 * sign,
             };
             let (field, report) = build(sliders);
             assert!(report.skipped.is_empty(), "{:?}", report.skipped);
             let step = max_adjacent_step(&field);
             assert!(step < CELL, "adjacent nodes step {step:.2}px past the {CELL}px cell — the field folds");
         }
+    }
+
+    #[test]
+    fn straight_shoulders_flatten_the_trapezius_slope() {
+        // Above the shoulder line, on the slope: the contraction's inverse map points away
+        // from the line (up there), which reads as the slope pulled down to it.
+        let (field, _) = build(SculptSliders { straight_shoulders: 100.0, ..SculptSliders::default() });
+        let slope = field.sample(280.0, 158.0); // 22 px above the shoulder line, right of centre
+        assert!(slope[1] < -0.3, "the slope must pull toward the line (upward field): {slope:?}");
+        let below = field.sample(280.0, 210.0); // below the line, inside the width
+        assert!(below[1] > 0.3, "below the line the field points down to it: {below:?}");
+        let far = field.sample(10.0, 180.0); // past the shoulder tip
+        assert!(far[0].abs() < 0.05 && far[1].abs() < 0.05, "past the shoulder tip stays: {far:?}");
+    }
+
+    #[test]
+    fn bust_lift_moves_the_band_up_rigidly() {
+        // The inverse map points against the ride direction (down), which reads as lifted.
+        let (field, _) = build(SculptSliders { bust_lift: 100.0, ..SculptSliders::default() });
+        let in_band = field.sample(256.0, 280.0); // the torso axis inside the bust band
+        assert!(in_band[1] > 1.0, "the band must ride: {in_band:?}");
+        let outside = field.sample(256.0, 480.0); // well below the band
+        assert!(outside[0].abs() < 0.05 && outside[1].abs() < 0.05, "below the band stays: {outside:?}");
+    }
+
+    #[test]
+    fn the_composition_family_blends_into_its_parts() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // AI塑形 alone moves the slim family and leaves the rounder zones alone.
+        let c = SculptSliders { ai_sculpt: 100.0, ..SculptSliders::default() }.composed();
+        assert!(near(c.waist, 50.0) && near(c.slim_body, 60.0));
+        assert!(near(c.hips, 0.0) && near(c.bust, 0.0), "the silhouette slider does not round the zones");
+        // It stacks with a manual slider and clamps at the stop.
+        let c = SculptSliders { ai_sculpt: 100.0, waist: 70.0, ..SculptSliders::default() }.composed();
+        assert!(near(c.waist, 100.0));
+        // 天鹅颈 is its trio; negative AI塑形 plumps.
+        let c = SculptSliders { swan_neck: 50.0, ..SculptSliders::default() }.composed();
+        assert!(near(c.neck, 30.0) && near(c.neck_length, 20.0) && near(c.straight_shoulders, 25.0));
+        let c = SculptSliders { ai_sculpt: -100.0, ..SculptSliders::default() }.composed();
+        assert!(near(c.waist, -50.0));
     }
 }
