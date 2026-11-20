@@ -10,6 +10,7 @@
 //! params alone must rebuild the field. A linked layer mask rides the same field — slimming
 //! pixels under a stale mask is a broken silhouette (#3083's rule, Puppet Warp's precedent).
 
+use photocraft_algo::contour;
 use photocraft_algo::liquify::{apply_liquify, auto_cell};
 use photocraft_algo::sculpt::{SculptAnchors, SculptHead, SculptSliders, SculptSpec, sculpt_field};
 use photocraft_doc::LayerContent;
@@ -116,12 +117,69 @@ pub(crate) fn anchors_from_analysis(a: &photocraft_portrait::Analysis) -> Option
     Some(SculptAnchors { doc: [a.width as f32, a.height as f32], pose, head, chin })
 }
 
+/// The person mask's silhouette as a closed polyline: the left and right rims of every
+/// sampled row, walked down one side and back up the other. Rows that read empty — or
+/// edge-to-edge, a subject tier that cannot separate this photo's background — contribute
+/// nothing, so a full-width mask yields no contour and the smooth slider says so instead of
+/// smoothing the frame's box.
+fn person_contour(mask: &Surface) -> Option<Vec<[f64; 2]>> {
+    let b = mask.content_bounds();
+    let w = b.x1.max(0);
+    let rows: usize = b.height() as usize;
+    let step = (rows / 120).max(1);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut y = b.y0;
+    while y < b.y1 {
+        let (mut l, mut r) = (None, None);
+        for x in 0..w {
+            if mask.sample_channel(x, y, 0) > 0.5 {
+                l.get_or_insert(x);
+                r = Some(x);
+            }
+        }
+        if let (Some(l), Some(r)) = (l, r)
+            && r - l < w * 9 / 10
+            && r - l > 4
+        {
+            left.push([l as f64 + 0.5, y as f64 + 0.5]);
+            right.push([r as f64 + 0.5, y as f64 + 0.5]);
+        }
+        y += step as i32;
+    }
+    if left.len() < 8 {
+        return None;
+    }
+    right.reverse();
+    left.extend(right);
+    Some(left)
+}
+
+/// The smoothing amount (身型流畅, one-directional 0..100).
+fn smooth_of(p: &Value) -> f32 {
+    p.get("smooth").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0) as f32
+}
+
+/// The stored contour as `[[x, y], …]` document pixels, when the params carry one.
+fn contour_of(p: &Value) -> Option<Vec<[f64; 2]>> {
+    serde_json::from_value::<Vec<[f64; 2]>>(p.get("contour")?.clone()).ok().filter(|c| c.len() >= 8)
+}
+
+/// Stamps the contour relaxation into a built field (the run path builds it from the
+/// analysis, the replay path reads it back from the stored params — same stamp either way).
+fn stamp_contour(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64; 2]], smooth: f32) {
+    let len: f64 = pts.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum::<f64>()
+        + (pts[0][0] - pts[pts.len() - 1][0]).hypot(pts[0][1] - pts[pts.len() - 1][1]);
+    contour::stamp(field, pts, len / pts.len() as f64, f64::from(smooth));
+}
+
 fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let values = sliders(p)?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let canvas = d.doc.bounds();
     let id = crate::commands::layer_param(s, p)?;
-    if values == SculptSliders::default() {
+    let smooth = smooth_of(p);
+    if values == SculptSliders::default() && smooth <= 0.0 {
         return Ok(json!({"layer": id.0, "changed": false}));
     }
     let cell = cell(p, canvas)?;
@@ -148,7 +206,23 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let t0 = Stopwatch::start();
     let spec = SculptSpec { sliders: values, anchors };
-    let (field, report) = sculpt_field(&spec, canvas, cell);
+    let (mut field, mut report) = sculpt_field(&spec, canvas, cell);
+    // 身型流畅: the silhouette's own contour, low-passed and stamped over the parts. The
+    // contour rides the stored params like the anchors, so the re-render replays it with
+    // no mask and no analysis.
+    let stored_contour = if smooth > 0.0 {
+        let pts = contour_of(p).or_else(|| analysis.mask(photocraft_portrait::Region::Person).and_then(person_contour));
+        match &pts {
+            Some(pts) => {
+                stamp_contour(&mut field, pts, smooth);
+                report.applied.push("smooth");
+            }
+            None => report.skipped.push(("smooth", "the subject mask has no contour to relax")),
+        }
+        pts
+    } else {
+        None
+    };
     let smart = matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Smart(_)));
     if field.is_identity() && !smart {
         return Ok(json!({"layer": id.0, "changed": false, "parts": parts(&report)}));
@@ -158,6 +232,9 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let mut stored = p.clone();
     if let Value::Object(m) = &mut stored {
         m.insert("anchors".into(), serde_json::to_value(&spec.anchors).map_err(|e| bad(format!("the anchors would not serialise: {e}")))?);
+        if let Some(pts) = &stored_contour {
+            m.insert("contour".into(), serde_json::to_value(pts).map_err(|e| bad(format!("the contour would not serialise: {e}")))?);
+        }
     }
     let r = crate::distort_cmds::run_on_layer(
         s,
@@ -193,12 +270,15 @@ fn parts(report: &photocraft_algo::sculpt::SculptReport) -> Value {
 /// Smart-filter hook: re-applies a stored Body Sculpt to a rendered smart object.
 pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> Option<Surface> {
     let (spec, cell) = stored_spec(params, canvas)?;
-    let (field, _) = sculpt_field(&spec, canvas, cell);
+    let (mut field, _) = sculpt_field(&spec, canvas, cell);
+    if let Some(pts) = contour_of(params) {
+        stamp_contour(&mut field, &pts, smooth_of(params));
+    }
     Some(apply_liquify(surf, &field))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0 (each slider's positive direction is its label's action: Waist narrows, Hips rounds, Leg Length lengthens; the analysis runs first — cached like Select Region, seconds the first time),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action: Waist narrows, Hips rounds, Leg Length lengthens; the analysis runs first — cached like Select Region, seconds the first time),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: SCULPT,
         label: "Body Sculpt…",

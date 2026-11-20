@@ -5,6 +5,7 @@
 //! same opt-out of the live preview and the remembered values. The parts table lives in
 //! [`photocraft_algo::face_sculpt`] over the four primitives the body table defined.
 
+use photocraft_algo::contour;
 use photocraft_algo::face_sculpt::{FaceAnchors, FaceSliders, FaceSpec, face_field};
 use photocraft_algo::liquify::{apply_liquify, auto_cell};
 use photocraft_doc::LayerContent;
@@ -112,12 +113,34 @@ pub(crate) fn anchors_from_analysis(a: &photocraft_portrait::Analysis) -> Option
     Some(FaceAnchors { doc: [a.width as f32, a.height as f32], pts })
 }
 
+/// The smoothing amount (AI 面部流畅, one-directional 0..100).
+fn smooth_of(p: &Value) -> f32 {
+    p.get("smooth").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0) as f32
+}
+
+fn contour_of(p: &Value) -> Option<Vec<[f64; 2]>> {
+    serde_json::from_value::<Vec<[f64; 2]>>(p.get("contour")?.clone()).ok().filter(|c| c.len() >= 8)
+}
+
+/// The face's contour: the FACE_OVAL ring, ordered and closed — the same list the head
+/// anchor's centroid comes from.
+fn oval_ring(anchors: &FaceAnchors) -> Vec<[f64; 2]> {
+    photocraft_portrait::face::FACE_OVAL.iter().map(|&i| [anchors.pts[i][0] as f64, anchors.pts[i][1] as f64]).collect()
+}
+
+fn stamp_ring(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64; 2]], smooth: f32) {
+    let len: f64 = pts.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum::<f64>()
+        + (pts[0][0] - pts[pts.len() - 1][0]).hypot(pts[0][1] - pts[pts.len() - 1][1]);
+    contour::stamp(field, pts, len / pts.len() as f64, f64::from(smooth));
+}
+
 fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let values = sliders(p)?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let canvas = d.doc.bounds();
     let id = crate::commands::layer_param(s, p)?;
-    if values == FaceSliders::default() {
+    let smooth = smooth_of(p);
+    if values == FaceSliders::default() && smooth <= 0.0 {
         return Ok(json!({"layer": id.0, "changed": false}));
     }
     let cell = cell(p, canvas)?;
@@ -139,15 +162,30 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("no face found — Face Sculpt needs the face-mesh landmarks".into()));
     };
     let t0 = Stopwatch::start();
+    let ring = oval_ring(&anchors);
     let spec = FaceSpec { sliders: values, anchors };
-    let (field, report) = face_field(&spec, canvas, cell);
+    let (mut field, mut report) = face_field(&spec, canvas, cell);
+    // AI 面部流畅: the face oval's own contour, low-passed and stamped over the parts.
+    if smooth > 0.0 {
+        match contour_of(p).or_else(|| Some(ring.clone())) {
+            Some(pts) => {
+                stamp_ring(&mut field, &pts, smooth);
+                report.applied.push("smooth");
+            }
+            None => report.skipped.push(("smooth", "no face contour to relax")),
+        }
+    }
     let smart = matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Smart(_)));
     if field.is_identity() && !smart {
         return Ok(json!({"layer": id.0, "changed": false, "parts": parts(&report)}));
     }
+    let stored_contour = if smooth > 0.0 { Some(contour_of(p).unwrap_or_else(|| ring.clone())) } else { None };
     let mut stored = p.clone();
     if let Value::Object(m) = &mut stored {
         m.insert("anchors".into(), serde_json::to_value(&spec.anchors).map_err(|e| bad(format!("the anchors would not serialise: {e}")))?);
+        if let Some(pts) = &stored_contour {
+            m.insert("contour".into(), serde_json::to_value(pts).map_err(|e| bad(format!("the contour would not serialise: {e}")))?);
+        }
     }
     let r = crate::distort_cmds::run_on_layer(
         s,
@@ -181,12 +219,15 @@ fn parts(report: &photocraft_algo::face_sculpt::FaceReport) -> Value {
 /// Smart-filter hook: re-applies a stored Face Sculpt to a rendered smart object.
 pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> Option<Surface> {
     let (spec, cell) = stored_spec(params, canvas)?;
-    let (field, _) = face_field(&spec, canvas, cell);
+    let (mut field, _) = face_field(&spec, canvas, cell);
+    if let Some(pts) = contour_of(params) {
+        stamp_ring(&mut field, &pts, smooth_of(params));
+    }
     Some(apply_liquify(surf, &field))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0 (the face-mesh analysis runs first — cached like Select Region, seconds the first time; each slider's positive direction is its label's action),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0,"smooth":0..100=0 (AI 面部流畅: the face oval contour, low-passed and relaxed; the ring is embedded from the mesh at apply time, like the anchors) (the face-mesh analysis runs first — cached like Select Region, seconds the first time; each slider's positive direction is its label's action),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: FACE_SCULPT,
         label: "Face Sculpt…",
@@ -349,7 +390,8 @@ mod tests {
             // The smart object stores the mesh and replays bit-identically.
             s.execute("select.all", json!({}))?;
             s.execute("layer.smartObjects.convertToSmartObject", json!({}))?;
-            let r = s.execute(FACE_SCULPT, json!({"eyeSize": -20, "faceSlim": 25}))?;
+            let r = s.execute(FACE_SCULPT, json!({"eyeSize": -20, "faceSlim": 25, "smooth": 60}))?;
+            assert!(r["parts"]["applied"].as_array().is_some_and(|a| a.iter().any(|v| v == "smooth")), "the smooth pass must run: {r}");
             assert_eq!(r["changed"], json!(true), "{r}");
             let (params, source) = {
                 let d = s.active().ok_or(EngineError::NoDocument)?;

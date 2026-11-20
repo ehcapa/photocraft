@@ -621,8 +621,6 @@ mod tests {
         set(mesh::TEMPLE_R, 150.0, 180.0);
         set(mesh::CHEEKBONE_L, 332.0, 268.0);
         set(mesh::CHEEKBONE_R, 180.0, 268.0);
-        set(mesh::JAW_L, 342.0, 340.0);
-        set(mesh::JAW_R, 170.0, 340.0);
         // left eye (person's left, image right): centre (306, 232), width 30
         for (k, &i) in mesh::EYE_RING_L.iter().enumerate() {
             let t = k as f64 / mesh::EYE_RING_L.len() as f64;

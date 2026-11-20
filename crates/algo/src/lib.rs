@@ -28,6 +28,7 @@ pub mod camera_raw;
 pub mod channel_noise;
 pub mod color_to_alpha;
 pub mod content_aware;
+pub mod contour;
 pub mod convolution;
 pub mod coverage;
 mod cutout;
