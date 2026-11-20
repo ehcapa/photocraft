@@ -26,6 +26,21 @@ pub enum Region {
     /// answered, the FaceMesh cheek-point ellipses otherwise — the blush area either way.
     Cheeks,
     Clothes,
+    /// The garment classes the fashion tier splits `Clothes` into (ATR-18; each garment
+    /// class feeds both its sub-region and `Clothes`). Upper garments: ATR upper-clothes.
+    UpperClothes,
+    /// Lower garments: ATR skirt and pants.
+    LowerClothes,
+    /// A one-piece garment: ATR dress.
+    Dress,
+    /// Footwear: ATR left-shoe and right-shoe.
+    Shoes,
+    /// A held or worn bag: ATR bag (a held helmet reads bag too — ATR's held-object
+    /// semantics, verified 2026-11-20).
+    Bag,
+    /// A neck covering: ATR scarf — the class that retires the rust-neck-as-skin
+    /// misread of the six-class tier.
+    Scarf,
     Background,
     Whole,
 }
@@ -64,7 +79,21 @@ impl StageId {
     pub fn produces(self) -> &'static [Region] {
         match self {
             StageId::Cutout => &[Region::Person],
-            StageId::Parsing => &[Region::Skin, Region::Hair, Region::Face, Region::Eyes, Region::Lips, Region::Clothes, Region::Background],
+            StageId::Parsing => &[
+                Region::Skin,
+                Region::Hair,
+                Region::Face,
+                Region::Eyes,
+                Region::Lips,
+                Region::Clothes,
+                Region::UpperClothes,
+                Region::LowerClothes,
+                Region::Dress,
+                Region::Shoes,
+                Region::Bag,
+                Region::Scarf,
+                Region::Background,
+            ],
             StageId::Landmarks => &[Region::Face, Region::Eyes, Region::Eyelids, Region::Lips, Region::Cheeks],
             StageId::Enhance | StageId::Skin | StageId::HairColor | StageId::Inpaint | StageId::Grade => &[],
         }
@@ -207,7 +236,23 @@ mod tests {
     #[test]
     fn every_region_some_stage_produces() {
         // Each region is named as some stage's output, so no region can be orphaned by typo.
-        let all = [Region::Person, Region::Skin, Region::Hair, Region::Face, Region::Eyes, Region::Lips, Region::Clothes, Region::Background, Region::Whole];
+        let all = [
+            Region::Person,
+            Region::Skin,
+            Region::Hair,
+            Region::Face,
+            Region::Eyes,
+            Region::Lips,
+            Region::Clothes,
+            Region::UpperClothes,
+            Region::LowerClothes,
+            Region::Dress,
+            Region::Shoes,
+            Region::Bag,
+            Region::Scarf,
+            Region::Background,
+            Region::Whole,
+        ];
         for r in all {
             assert!(
                 [StageId::Cutout, StageId::Parsing, StageId::Landmarks, StageId::Enhance, StageId::Skin, StageId::HairColor, StageId::Inpaint, StageId::Grade]

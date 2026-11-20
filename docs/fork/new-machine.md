@@ -29,6 +29,7 @@ mv faceparser_sim.onnx faceparser.onnx                                  # 规范
 curl -L -o facedetector.onnx https://hf-mirror.com/immich-app/buffalo_l/resolve/main/detection/model.onnx   # SCRFD 人脸检测,16MB,自动放框
 curl -LO https://hf-mirror.com/neurobytemind/GFPGANv1.4.onnx/resolve/main/GFPGANv1.4.onnx
 mv GFPGANv1.4.onnx gfpgan.onnx                                          # 340MB
+curl -L -o schp-atr.onnx https://hf-mirror.com/mattmdjaga/segformer_b2_clothes/resolve/main/onnx/model.onnx   # ATR-18 服装分割,110MB
 curl -LO https://hf-mirror.com/PinkPixel/fey-nobg-onnx/resolve/main/model_fp16.onnx
 mv model_fp16.onnx feynobg.onnx                                         # 563MB,仅 ort 档需要
 ```
@@ -42,8 +43,11 @@ mv model_fp16.onnx feynobg.onnx                                         # 563MB,
 # ~/.zshrc(或运行配置):
 export PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models
 export CRAFT_I18N_DIR=/Users/<你>/Project/Rust/craft-i18n   # 中文 UI,路径按新机器改
-export ORT_DYLIB_PATH=~/Project/Rust/onnxruntime/lib/libonnxruntime.so   # ort 档运行时动态库(见 §4)
+export ORT_DYLIB_PATH=~/Project/Rust/onnxruntime/lib/libonnxruntime.so   # Linux;macOS 同路径是 libonnxruntime.dylib
 # ort 档(仅 feynobg 需要)= 编译 feature(§4)+ 上面的 ORT_DYLIB_PATH
+# 注意:app 进程必须带着这两个变量启动(GUI 图标启动的进程没有 shell 的 export)。
+# 2026-11-20 实况:缺 PHOTOCRAFT_MODELS_DIR 时 hair 档静默回落标准档(两者结果
+# 一样,像没生效)、服装子区域报 "no … region — no person found" —— 都先查启动环境
 ```
 
 ## 4. 构建

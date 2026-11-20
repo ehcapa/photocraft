@@ -169,3 +169,43 @@ face 变像素级发际线追踪,cheeks 双颊独立 patch 鼻/眼/唇全排除;
 (围巾 0.908 高置信像素、身体皮肤在小人脸图上仍低于地板)——下一档是 SCHP
 (ATR-18/LIP-20,512²,scarf/upper-clothes 独立类;其 arm/leg 为几何部位类的
 映射坑 spike 时验),Sapiens 0.3B(ort 档)列第二梯队。
+
+## 2026-11-20: 服装细类解封(SCHP ATR-18 落地)+ Pose 基础层
+
+**服装 tier。** 上条留的下一档落地:选 HF `mattmdjaga/segformer_b2_clothes` 的
+ONNX 导出(SegFormer-B2,ATR-18 训练,110MB,runtime slot `schp-atr.onnx`,
+blake3 `2e34f72e…a1662b2`)。`fashion_probe`(engine example,常驻)验证:
+tract 钉输入后可载,**~0.5s/run**(注意力架构远快于预期,3s 门内);契约 =
+导出自身 preprocessor(ImageNet 归一化 0..1 NCHW 512²,raw 值 −13…9,softmax
+归我们);类语义经窗口探针 + 视觉模型 ground truth 双向核实(坐姿照 dress/裸腿
+left-leg/长发/抬手全对,宇航服照袖子无 arm blob、颈部黑色高领读 scarf)。
+
+**arm/leg 映射坑:通过,变体 1。** 几何部位类只烧裸皮(裸腿→leg、裸前臂→arm,
+着装手臂不触发),入 `Skin`;永不成为独立区域。
+
+**优先级链,不是 union。** `Analysis::union` 是逐像素 max,SCHP 与
+selfiemulticlass 并跑会保留六类档的"锈色颈部 0.908 读成皮肤"(union 救不了
+错的一方)。故 **fashion 有答案 → 它接管 Clothes/Skin/Hair + 服装子区域,
+selfie 降为缺席 fallback**。验收(test-portrait.png):scarf 1.01% 落颈部,
+skin bounds 止于 y=208(=脸下缘,0.908 错误随 selfie 不跑而消失),
+upperclothes 22.07% 紧贴其下;test-user.jpg(全身):dress 5.36% 与探针 blob
+同位、skin 延到画面底(裸腿 union)、裙装时 upper/lower 正确为空。
+
+**区域词汇表:对 2026-11-19 八类封顶的定向解封。** 封顶是 faceparser 导出
+类语义不可信的裁决,不是产品上限;服装类经逐类探针挣得区域——`UpperClothes`
+(ATR upper-clothes)、`LowerClothes`(skirt∪pants)、`Dress`、`Shoes`
+(L∪R shoe,位置邻接验证、未见实景鞋照,复验待补)、`Bag`(ATR 手持物语义,
+手里的头盔也读 bag,已验)、`Scarf`。hat/sunglasses/belt 无探针证据,不映射。
+每服装类同时喂 `Clothes`。select.region 的 match/spec、PERSON_REGIONS、
+menu_catalog、选项栏 SplitButton 四点同步,command_ids.txt 不动(无状态
+菜单 id 非 engine 命令)。
+
+**Pose 基础层。** MediaPipe Pose Landmarks Detector(BlazePose full,33 关节)
+的社区 ONNX 导出(Apache-2.0,12.8MB,**内嵌** `crates/ml/data/poselandmark.onnx`,
+facemesh 先例)。契约(README + pose_probe 验证):NHWC 256² 0..1、输出 5 张量、
+screen landmarks [1,195]=39×(x,y,z,vis,presence)、**vis 是 raw logit,sigmoid
+归我们**(探针读 8.5/−0.8)。裁剪:person matte bbox 的**轴对齐外扩正方形**
+(`to_square`),v1 不做旋转对齐(端正照合理,倾斜退化已知并记录);~35ms。
+`Analysis.pose: Vec<[f32;4]>` 存储,**无消费者**——身体液化/瘦身锚点
+(PuppetPin.src / LiquifyField 均已就绪)是下一迭代;本期只到探针验收
+(pose_landmarks_dump_probe:33 点、有限、vis 值域、肩<髋)。

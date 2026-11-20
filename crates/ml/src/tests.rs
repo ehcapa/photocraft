@@ -218,3 +218,54 @@ fn body_probs_smoke_when_model_provided() {
         }
     }
 }
+
+#[test]
+fn fashion_probs_smoke_when_model_provided() {
+    let Some(path) = std::env::var_os("PHOTOCRAFT_MODELS_DIR") else {
+        assert!(crate::fashion::fashion_probs(&[], 0, 0).is_none());
+        eprintln!("skipping: PHOTOCRAFT_MODELS_DIR unset");
+        return;
+    };
+    if !std::path::Path::new(&path).join("schp-atr.onnx").is_file() {
+        eprintln!("skipping: no schp-atr.onnx in PHOTOCRAFT_MODELS_DIR");
+        return;
+    }
+    let (w, h) = (64, 64);
+    let px: Vec<[f32; 3]> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let inside = (x as f32 - 32.0).powi(2) + (y as f32 - 32.0).powi(2) < 20.0 * 20.0;
+            [if inside { 0.8 } else { 0.3 }; 3]
+        })
+        .collect();
+    let planes = crate::fashion::fashion_probs(&px, w, h).expect("model provided but no probs");
+    assert_eq!(planes.len(), crate::fashion::FASHION_CLASSES);
+    for p in &planes {
+        assert_eq!(p.len(), w * h);
+    }
+    for i in 0..w * h {
+        let sum: f32 = planes.iter().map(|p| p[i]).sum();
+        assert!((sum - 1.0).abs() < 1e-3, "softmax sums to {sum}");
+        for p in &planes {
+            assert!((0.0..=1.0).contains(&p[i]), "plane value out of range");
+        }
+    }
+}
+
+#[test]
+fn pose_landmarks_answer_on_any_input() {
+    let (w, h) = (64, 64);
+    let px: Vec<[f32; 3]> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let inside = (x as f32 - 32.0).powi(2) + (y as f32 - 32.0).powi(2) < 20.0 * 20.0;
+            [if inside { 0.8 } else { 0.3 }; 3]
+        })
+        .collect();
+    let pts = crate::pose::pose_landmarks(&px, w, h).expect("the embedded model always answers");
+    assert_eq!(pts.len(), crate::pose::POSE_COUNT);
+    assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite() && p.visibility.is_finite()));
+    assert!(pts.iter().all(|p| ((-(w as f32))..=(2.0 * w as f32)).contains(&p.x)));
+    assert!(pts.iter().all(|p| (0.0..=1.0).contains(&p.visibility)), "the visibility logit goes through the sigmoid");
+    assert!(crate::pose::pose_landmarks(&[], 0, 0).is_none(), "a size mismatch is a None, not an inference");
+}

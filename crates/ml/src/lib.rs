@@ -181,6 +181,14 @@ pub mod detect;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod body;
 
+/// The ATR-18 fashion parsing: the clothing tier of the body stage (native only, tract tier).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod fashion;
+
+/// The body-pose landmarks (BlazePose full, 33 joints; native only, tract tier, embedded).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pose;
+
 mod resample;
 
 #[cfg(test)]

@@ -562,6 +562,14 @@ pub static CATALOG: &[(&[&str], &str, Option<&str>, &str)] = &[
     (&["Select", "Person"], "Lips", None, "select.region.lips"),
     (&["Select", "Person"], "Cheeks", None, "select.region.cheeks"),
     (&["Select", "Person"], "Clothes", None, "select.region.clothes"),
+    // The fashion tier's clothing split (schp-atr.onnx; the rows answer "no region found"
+    // as their empty state when the model is not placed).
+    (&["Select", "Person"], "Upper Clothes", None, "select.region.upperClothes"),
+    (&["Select", "Person"], "Lower Clothes", None, "select.region.lowerClothes"),
+    (&["Select", "Person"], "Dress", None, "select.region.dress"),
+    (&["Select", "Person"], "Shoes", None, "select.region.shoes"),
+    (&["Select", "Person"], "Bag", None, "select.region.bag"),
+    (&["Select", "Person"], "Scarf", None, "select.region.scarf"),
     (&["Select"], "Sky", None, "select.sky"),
     (&["Select"], "Select and Mask…", None, "select.selectAndMask"),
     (&["Select"], "---", None, "---"),

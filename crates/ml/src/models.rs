@@ -38,6 +38,15 @@ pub const SELFIE: ModelFile =
 /// version's hash here and in docs/fork/models.md). The hash below is v1.4's.
 pub const GFPGAN: ModelFile = ModelFile { canonical: "gfpgan.onnx", blake3: Some("42a4f8e1a701cd6d56b2087ab00de1f76f4f7c1fe015556fa496d19b37a25d08") };
 
+/// The ATR-18 fashion parsing (SegFormer-B2 trained on ATR, HF
+/// `mattmdjaga/segformer_b2_clothes`' ONNX): the clothing tier of the body stage —
+/// scarf/upper-clothes/skirt/pants/dress/shoes/bag as independent classes, the arm/leg
+/// geometric classes verified to fire on bare skin only (docs/fork/decisions.md
+/// 2026-11-20). 512², ImageNet-normalized NCHW, raw logits (softmax ours), ~0.5 s/run
+/// through tract. Code Apache-2.0; weights trained on ATR — research use, the faceparser
+/// precedent's bar; see docs/fork/models.md.
+pub const SCHP: ModelFile = ModelFile { canonical: "schp-atr.onnx", blake3: Some("2e34f72ec449124cbf9b4f01d44fb51792a84b2da8a3e630445bca792a1662b2") };
+
 /// The pure resolution: `dir` joined with the canonical name; a directory that is not
 /// there is the same as none.
 pub fn resolve(dir: Option<std::ffi::OsString>, model: &ModelFile) -> Option<std::path::PathBuf> {
@@ -67,8 +76,10 @@ fn matches_hash(path: &std::path::Path, want: &str) -> bool {
     false
 }
 
-/// The blake3 of `path`'s contents, streamed; `None` when it cannot be read.
-fn fingerprint(path: &std::path::Path) -> Option<String> {
+/// The blake3 of `path`'s contents, streamed; `None` when it cannot be read. The intake
+/// example (`cargo run -p photocraft-ml --example fingerprint -- <file>`) prints it for the
+/// models.md intake step.
+pub fn fingerprint_of(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = blake3::Hasher::new();
@@ -80,6 +91,10 @@ fn fingerprint(path: &std::path::Path) -> Option<String> {
         }
         hasher.update(&buf[..n]);
     }
+}
+
+fn fingerprint(path: &std::path::Path) -> Option<String> {
+    fingerprint_of(path)
 }
 
 #[cfg(test)]

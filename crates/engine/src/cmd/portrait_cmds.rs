@@ -351,6 +351,36 @@ fn mesh_over(doc: &Document, target: Option<photocraft_doc::LayerId>, sample_all
     })
 }
 
+/// The axis-aligned square about `bounds`' centre, clamped to the document — the pose
+/// model's crop. MediaPipe's own pipeline feeds the landmark model a *rotated* detector
+/// ROI; v1 takes the square upright (the pose_probe verdict of 2026-11-20: plausible on
+/// upright photos, the tilted case recorded as the known degradation).
+fn to_square(bounds: photocraft_geom::Rect, w: i32, h: i32) -> photocraft_geom::Rect {
+    let side = bounds.width().max(bounds.height()) as i32;
+    let (cx, cy) = ((bounds.x0 + bounds.x1) / 2, (bounds.y0 + bounds.y1) / 2);
+    let half = side / 2;
+    let x0 = (cx - half).clamp(0, (w - side).max(0));
+    let y0 = (cy - half).clamp(0, (h - side).max(0));
+    photocraft_geom::Rect::new(x0, y0, (x0 + side).min(w), (y0 + side).min(h))
+}
+
+/// The body-pose landmarks of the person's square crop (BlazePose full, embedded), mapped
+/// to document pixels — the foundation layer: they land on `Analysis.pose`, no stage
+/// consumes them yet. `None` without a person (the caller keeps the empty default).
+fn pose_over(doc: &Document, target: Option<photocraft_doc::LayerId>, sample_all: bool, bounds: photocraft_geom::Rect) -> Option<Vec<[f32; 4]>> {
+    if bounds.is_empty() {
+        return None;
+    }
+    let area = to_square(bounds, doc.size.width as i32, doc.size.height as i32);
+    with_doc_sampler(doc, target, sample_all, |smp, _| {
+        let step = photocraft_algo::segment::scale_for(area, photocraft_ml::pose::POSE_SIDE * photocraft_ml::pose::POSE_SIDE);
+        let img = smp.rgb_scaled(area, step);
+        let pts = photocraft_ml::pose::pose_landmarks(&img.px, img.w, img.h)?;
+        let (rw, rh) = (area.width() as f32, area.height() as f32);
+        Some(pts.into_iter().map(|p| [p.x / img.w as f32 * rw + area.x0 as f32, p.y / img.h as f32 * rh + area.y0 as f32, p.z, p.visibility]).collect())
+    })
+}
+
 /// The parsing regions of `doc`, upsampled to document resolution and intersected with the
 /// person: the model's per-class probabilities grouped into regions
 /// (`photocraft_portrait::parsing`), each resampled like the subject mask rides back and
@@ -430,18 +460,39 @@ fn body_regions(
     }) else {
         return Vec::new();
     };
+    gated_region_planes(
+        &planes,
+        sw,
+        sh,
+        area,
+        person,
+        &[
+            (photocraft_ml::body::BODY_SKIN, photocraft_portrait::Region::Skin),
+            (photocraft_ml::body::FACE_SKIN, photocraft_portrait::Region::Skin),
+            (photocraft_ml::body::HAIR, photocraft_portrait::Region::Hair),
+            (photocraft_ml::body::CLOTHES, photocraft_portrait::Region::Clothes),
+        ],
+    )
+}
+
+/// The body/fashion planes' shared tail: each `classes` entry's plane rides back at the
+/// crop's size, through the [`BODY_FLOOR`] ramp and the person gate, lands speckle-suppressed
+/// in a full-document surface at the crop's offset (outside it the region stays 0) — one
+/// class may feed several regions (upper-clothes into `UpperClothes` *and* `Clothes`), the
+/// body tier's two-skin-classes-into-`Skin` precedent.
+fn gated_region_planes(
+    planes: &[Vec<f32>],
+    sw: usize,
+    sh: usize,
+    area: photocraft_geom::Rect,
+    person: &photocraft_raster::Surface,
+    classes: &[(usize, photocraft_portrait::Region)],
+) -> Vec<(photocraft_portrait::Region, photocraft_raster::Surface)> {
     let gate = photocraft_doc::LayerMask { surface: person.clone(), ..photocraft_doc::LayerMask::reveal_all() };
     let (aw, ah) = (area.width() as usize, area.height() as usize);
     let mut out = Vec::new();
-    for (class, region) in [
-        (photocraft_ml::body::BODY_SKIN, photocraft_portrait::Region::Skin),
-        (photocraft_ml::body::FACE_SKIN, photocraft_portrait::Region::Skin),
-        (photocraft_ml::body::HAIR, photocraft_portrait::Region::Hair),
-        (photocraft_ml::body::CLOTHES, photocraft_portrait::Region::Clothes),
-    ] {
-        // The planes ride back at the sample's size, through the floor, and land in a
-        // full-document surface at the crop's offset — outside it the region stays 0.
-        let Some(mut vals) = planes.get(class).and_then(|p| photocraft_ml::resize_mask(p, sw, sh, aw, ah)) else { continue };
+    for (class, region) in classes {
+        let Some(mut vals) = planes.get(*class).and_then(|p| photocraft_ml::resize_mask(p, sw, sh, aw, ah)) else { continue };
         for y in 0..ah {
             for x in 0..aw {
                 vals[y * aw + x] = body_floor(vals[y * aw + x]) * gate.value(x as i32 + area.x0, y as i32 + area.y0);
@@ -450,9 +501,66 @@ fn body_regions(
         suppress_speckle(&mut vals, aw, ah);
         let mut surface = photocraft_raster::Surface::with_default(photocraft_doc::PixelFormat::GRAY8, &[0.0]);
         surface.write_region(area, &vals);
-        out.push((region, surface));
+        out.push((*region, surface));
     }
     out
+}
+
+/// The fashion tier's class→region table (ATR-18), the `fashion_probe` spike's verified
+/// subset (docs/fork/decisions.md 2026-11-20): the garment classes into their sub-regions
+/// *and* `Clothes`, the face and the bare-skin geometric classes (arm/leg, verified to
+/// fire on bare skin only — suited sleeves produced no arm blob) into `Skin`, hair into
+/// `Hair`. Unmapped on purpose: background, hat, sunglasses and belt — no probe evidence,
+/// so they surface nowhere (the eight-region cap's lesson: classes earn regions).
+const FASHION_REGIONS: &[(usize, photocraft_portrait::Region)] = &[
+    (photocraft_ml::fashion::UPPER_CLOTHES, photocraft_portrait::Region::UpperClothes),
+    (photocraft_ml::fashion::UPPER_CLOTHES, photocraft_portrait::Region::Clothes),
+    (photocraft_ml::fashion::SKIRT, photocraft_portrait::Region::LowerClothes),
+    (photocraft_ml::fashion::SKIRT, photocraft_portrait::Region::Clothes),
+    (photocraft_ml::fashion::PANTS, photocraft_portrait::Region::LowerClothes),
+    (photocraft_ml::fashion::PANTS, photocraft_portrait::Region::Clothes),
+    (photocraft_ml::fashion::DRESS, photocraft_portrait::Region::Dress),
+    (photocraft_ml::fashion::DRESS, photocraft_portrait::Region::Clothes),
+    (photocraft_ml::fashion::LEFT_SHOE, photocraft_portrait::Region::Shoes),
+    (photocraft_ml::fashion::RIGHT_SHOE, photocraft_portrait::Region::Shoes),
+    (photocraft_ml::fashion::BAG, photocraft_portrait::Region::Bag),
+    (photocraft_ml::fashion::SCARF, photocraft_portrait::Region::Scarf),
+    (photocraft_ml::fashion::FACE, photocraft_portrait::Region::Skin),
+    (photocraft_ml::fashion::LEFT_ARM, photocraft_portrait::Region::Skin),
+    (photocraft_ml::fashion::RIGHT_ARM, photocraft_portrait::Region::Skin),
+    (photocraft_ml::fashion::LEFT_LEG, photocraft_portrait::Region::Skin),
+    (photocraft_ml::fashion::RIGHT_LEG, photocraft_portrait::Region::Skin),
+    (photocraft_ml::fashion::HAIR, photocraft_portrait::Region::Hair),
+];
+
+/// The clothing regions of `doc` (`schp-atr.onnx`, the ATR-18 fashion tier) over the same
+/// person crop as [`body_regions`]. This tier **replaces** the six-class one when it
+/// answers — a union would keep the worse model's errors per-pixel-max (the rust neck
+/// reading skin at 0.908 survives a union even with a correct scarf class), so the
+/// precedence is: fashion answers → it owns the clothing sub-regions, `Clothes`, `Skin`
+/// and `Hair`; the six-class tier runs only in its absence. Empty like `body_regions`
+/// when the model is not placed or the person has no bounds.
+fn fashion_regions(
+    doc: &Document,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    person: &photocraft_raster::Surface,
+) -> Vec<(photocraft_portrait::Region, photocraft_raster::Surface)> {
+    let (dw, dh) = (doc.size.width, doc.size.height);
+    let bounds = person.content_bounds();
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+    let area = expanded(bounds, dw, dh, BODY_MARGIN);
+    let Some((planes, sw, sh)) = with_doc_sampler(doc, target, sample_all, |smp, _d| {
+        let step = photocraft_algo::segment::scale_for(area, photocraft_ml::fashion::FASHION_SIDE * photocraft_ml::fashion::FASHION_SIDE);
+        let img = smp.rgb_scaled(area, step);
+        let (sw, sh) = (img.w, img.h);
+        photocraft_ml::fashion::fashion_probs(&img.px, sw, sh).map(|p| (p, sw, sh))
+    }) else {
+        return Vec::new();
+    };
+    gated_region_planes(&planes, sw, sh, area, person, FASHION_REGIONS)
 }
 
 /// A copy of `mask` clipped by `person` (per-pixel multiply), the hull's share of the gate
@@ -652,7 +760,12 @@ pub(crate) fn analyze_person(
     let (parse_lo, parse_hi) = if boxed.is_some() { (0.6, 0.65) } else { (0.4, 0.65) };
     let (regions, body) = ctx.stage(parse_lo, parse_hi, "Parsing regions", |_| {
         let regions = parsing_regions(doc, target, sample_all, &person, boxed.as_ref().map(|(_, r)| *r));
-        let body = body_regions(doc, target, sample_all, &person);
+        // The fashion tier owns the body when it answers; the six-class tier is its
+        // fallback (a union would keep the six-class rust-neck-as-skin misread).
+        let body = match fashion_regions(doc, target, sample_all, &person) {
+            found if !found.is_empty() => found,
+            _ => body_regions(doc, target, sample_all, &person),
+        };
         (regions, body)
     });
     // The parsing's skin plane is the face skin, hairline-accurate — also the Face
@@ -678,6 +791,15 @@ pub(crate) fn analyze_person(
         };
         analysis.union(region, mask);
     }
+    // The body-pose landmarks (BlazePose full, embedded, ~35ms): the foundation layer of
+    // 2026-11-20 — they land on `Analysis.pose` for the body-aware work of a later
+    // iteration; a quiet stage that degrades to empty, nothing consumes them yet.
+    analysis.pose = ctx
+        .stage(0.7, 0.75, "Finding pose", |_| {
+            let bounds = person.content_bounds();
+            (!bounds.is_empty()).then(|| pose_over(doc, target, sample_all, bounds)).flatten()
+        })
+        .unwrap_or_default();
     // FaceMesh landmarks (weights embedded in photocraft-ml, ~15ms): the face
     // region comes from the landmark ring's hull, gated by the person like the
     // parsing regions. The box path already ran its mesh; the whole-document
@@ -1117,6 +1239,24 @@ mod tests {
         assert!(group.children.iter().any(|l| l.name == "Skin Smoothing"), "the skin layer lands with the body stage in the run");
     }
 
+    /// The fashion tier answers, so its clothing regions exist in the analysis — as empty
+    /// masks on the disc (no real garments): the ask succeeds with an empty selection
+    /// rather than erroring or wronging the selection. Real-photo semantics are the
+    /// dump/probe tests' job (region_dump_diagnostic, fashion_probe).
+    #[test]
+    fn fashion_tier_smokes_when_the_model_is_placed() {
+        if std::env::var_os("PHOTOCRAFT_MODELS_DIR").is_none_or(|d| !std::path::Path::new(&d).join("schp-atr.onnx").is_file()) {
+            eprintln!("skipping: no schp-atr.onnx in PHOTOCRAFT_MODELS_DIR");
+            return;
+        }
+        let (mut s, _) = disc();
+        let out = s.execute("select.region", json!({"region": "scarf"})).unwrap();
+        assert_eq!(out["selected"], json!(false), "an empty region selects nothing");
+        let cached = s.portrait_cache.get(&s.active().unwrap().doc, crate::layer_multi_cmds::same_pixels);
+        assert!(cached.is_some(), "the analysis the fashion tier ran is cached");
+        assert!(cached.unwrap().regions().any(|r| r == photocraft_portrait::Region::Scarf), "the fashion regions are in the cached analysis");
+    }
+
     #[test]
     fn cancelled_while_finding_the_person_changes_nothing() {
         let (mut s, _) = disc();
@@ -1518,6 +1658,7 @@ mod tests {
             let (w, h) = (analysis.width, analysis.height);
             let mut summary = serde_json::Map::new();
             summary.insert("landmarks".into(), json!(analysis.landmarks.len()));
+            summary.insert("pose".into(), json!(analysis.pose.len()));
             for region in analysis.regions() {
                 let surface = analysis.mask(region).cloned().ok_or_else(|| EngineError::Other("mask read".into()))?;
                 let mask = photocraft_doc::LayerMask { surface: surface.clone(), ..photocraft_doc::LayerMask::reveal_all() };
@@ -1713,4 +1854,38 @@ mod tests {
         assert!(!Session::new().is_enabled(CMD));
         assert!(Session::new().execute(CMD, json!({})).is_err());
     }
+}
+
+/// The foundation layer's acceptance: a real photo's analysis carries the 33 body-pose
+/// landmarks, finite, visibility in range, shoulders above hips — the numbers printed
+/// for eyeballing against the photo (the probe-based acceptance the methodology wants).
+#[test]
+fn pose_landmarks_dump_probe() {
+    let Some(photo) = std::env::var_os("PHOTOCRAFT_REGION_PHOTO") else {
+        eprintln!("skipping: PHOTOCRAFT_REGION_PHOTO unset");
+        return;
+    };
+    let run = || -> Result<std::sync::Arc<photocraft_portrait::Analysis>> {
+        let mut s = Session::new();
+        let name = std::path::Path::new(&photo).file_name().and_then(|n| n.to_str()).unwrap_or("photo").to_string();
+        let imported =
+            photocraft_io::import_file(&name, std::path::Path::new(&photo), &photocraft_io::ImportOptions::default(), &photocraft_raster::Interrupt::NONE)
+                .map_err(|e| EngineError::Other(format!("import: {e}")))?;
+        s.open_document(imported.document, None);
+        let d = s.active().ok_or(EngineError::NoDocument)?;
+        let target = d.active_layer.filter(|id| d.doc.layer(*id).and_then(Layer::surface).is_some());
+        let ctx = crate::jobs::JobCtx::new();
+        crate::portrait_cmds::analyze_person(&d.doc, target, false, None, &ctx)
+    };
+    let analysis = run().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(analysis.pose.len(), 33, "the embedded model answers 33 joints");
+    assert!(analysis.pose.iter().all(|p| p.iter().all(|v| v.is_finite())));
+    assert!(analysis.pose.iter().all(|p| (0.0..=1.0).contains(&p[3])), "visibility through the sigmoid");
+    let (shoulder, hip) = ((analysis.pose[11][1] + analysis.pose[12][1]) / 2.0, (analysis.pose[23][1] + analysis.pose[24][1]) / 2.0);
+    let vis: f32 = analysis.pose.iter().map(|p| p[3]).sum::<f32>() / 33.0;
+    eprintln!("pose: shoulder y {shoulder:.0}, hip y {hip:.0}, mean visibility {vis:.2}");
+    for (i, p) in analysis.pose.iter().enumerate() {
+        eprintln!("  {i:2} x={:7.1} y={:7.1} vis={:.2}", p[0], p[1], p[3]);
+    }
+    assert!(shoulder < hip, "shoulders above hips on an upright photo");
 }

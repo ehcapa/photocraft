@@ -615,10 +615,9 @@ fn standard_subject(s: &mut Session, target: Option<LayerId>, all_layers: bool, 
 /// pixel-keyed cache then serves every other region instantly, Smart Portrait included. The
 /// selection keeps the mask's fractional values: hair edges arrive as live alpha.
 fn select_region(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = p
-        .get("region")
-        .and_then(Value::as_str)
-        .ok_or_else(|| bad("select.region", "needs a region: skin, face, hair, eyes, eyelids, lips, cheeks or clothes"))?;
+    let name = p.get("region").and_then(Value::as_str).ok_or_else(|| {
+        bad("select.region", "needs a region: skin, face, hair, eyes, eyelids, lips, cheeks, clothes, upperClothes, lowerClothes, dress, shoes, bag or scarf")
+    })?;
     let region = match name {
         "skin" => photocraft_portrait::Region::Skin,
         "face" => photocraft_portrait::Region::Face,
@@ -628,6 +627,14 @@ fn select_region(s: &mut Session, p: &Value) -> Result<Value> {
         "lips" => photocraft_portrait::Region::Lips,
         "cheeks" => photocraft_portrait::Region::Cheeks,
         "clothes" => photocraft_portrait::Region::Clothes,
+        // The fashion tier's clothing split (schp-atr.onnx; absent the model these
+        // answer "no <region> region" like any unpopulated region).
+        "upperClothes" => photocraft_portrait::Region::UpperClothes,
+        "lowerClothes" => photocraft_portrait::Region::LowerClothes,
+        "dress" => photocraft_portrait::Region::Dress,
+        "shoes" => photocraft_portrait::Region::Shoes,
+        "bag" => photocraft_portrait::Region::Bag,
+        "scarf" => photocraft_portrait::Region::Scarf,
         other => return Err(bad("select.region", &format!("unknown region {other:?}"))),
     };
     let all_layers = b(p, "sampleAllLayers", false);
@@ -870,7 +877,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.region",
             "Region…",
             ["Select"],
-            r##"{"region":"skin|face|hair|eyes|eyelids|lips|cheeks|clothes","mode":"replace|add|subtract|intersect"="replace","sampleAllLayers":bool=false} (one region of the person analysis — the same analysis Smart Portrait builds: the subject line, the mesh, the face parsing, the whole-body segmentation — as a soft selection whose fractional values stay live. The first ask pays the analysis; the pixel-keyed cache then serves every other region instantly)"##,
+            r##"{"region":"skin|face|hair|eyes|eyelids|lips|cheeks|clothes|upperClothes|lowerClothes|dress|shoes|bag|scarf","mode":"replace|add|subtract|intersect"="replace","sampleAllLayers":bool=false} (one region of the person analysis — the same analysis Smart Portrait builds: the subject line, the mesh, the face parsing, the whole-body segmentation, the fashion tier's clothing split when schp-atr.onnx is placed — as a soft selection whose fractional values stay live. The first ask pays the analysis; the pixel-keyed cache then serves every other region instantly)"##,
             has_doc,
             select_region
         ),

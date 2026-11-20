@@ -17,12 +17,17 @@ pub struct Analysis {
     /// The FaceMesh landmarks (`x`, `y` in document pixels, `z` a rough depth), empty when
     /// the stage did not run — the alignment and face-hull stages read them.
     pub landmarks: Vec<[f32; 3]>,
+    /// The body-pose landmarks (BlazePose full: `x`, `y` in document pixels, `z` the rough
+    /// depth, `visibility` 0..=1), empty when the stage did not run. The foundation layer of
+    /// 2026-11-20: no pipeline stage consumes them yet, the diagnostics dump them — the
+    /// body-aware work (anchors for reshape, puppet pins) is a later iteration.
+    pub pose: Vec<[f32; 4]>,
     masks: BTreeMap<Region, Surface>,
 }
 
 impl Analysis {
     pub fn new(width: u32, height: u32) -> Self {
-        Analysis { width, height, landmarks: Vec::new(), masks: BTreeMap::new() }
+        Analysis { width, height, landmarks: Vec::new(), pose: Vec::new(), masks: BTreeMap::new() }
     }
 
     /// Records `mask` as the analysis of `region`. The caller sizes it; the plan builder

@@ -1,0 +1,9 @@
+The poselandmark.onnx weights in this directory are an ONNX export of MediaPipe's Pose
+Landmarks Detector (BlazePose full, 33 body landmarks), taken from the community export
+repository https://huggingface.co/fernandotonon/QtMeshEditor-poselandmarks-onnx
+(Apache-2.0), itself a direct conversion of Google's MediaPipe (Apache-2.0,
+https://github.com/google-ai-edge/mediapipe).
+
+License: Apache-2.0.
+Source blake3 (as downloaded 2026-11-20): d01f903d1f8e1d3dc270eabbb7c6c5723d1e40a2305bd138f2c80cf31bb5bda2
+This copy ships as a build input of photocraft-ml, compiled out of wasm builds.

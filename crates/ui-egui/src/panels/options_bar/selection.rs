@@ -312,7 +312,7 @@ pub(crate) fn smart_selection(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: 
     // The person regions, the same analysis Smart Portrait builds, as quick selections: the
     // main part reruns the last-picked region, the arrow lists them all. The first ask pays
     // the analysis; the pixel cache then serves the rest instantly.
-    let regions: [Entry<&'static str>; 8] = [
+    let regions: [Entry<&'static str>; 14] = [
         Entry::new("skin", label("Skin")),
         Entry::new("face", label("Face")),
         Entry::new("hair", label("Hair")),
@@ -321,6 +321,14 @@ pub(crate) fn smart_selection(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: 
         Entry::new("lips", label("Lips")),
         Entry::new("cheeks", label("Cheeks")),
         Entry::new("clothes", label("Clothes")),
+        // The fashion tier's clothing split (schp-atr.onnx) — the keys are the engine's
+        // `select.region` names.
+        Entry::new("upperClothes", label("Upper Clothes")),
+        Entry::new("lowerClothes", label("Lower Clothes")),
+        Entry::new("dress", label("Dress")),
+        Entry::new("shoes", label("Shoes")),
+        Entry::new("bag", label("Bag")),
+        Entry::new("scarf", label("Scarf")),
     ];
     let picked = SplitButton::new(label("Select Region"), &regions).arrow_label(label("Person regions")).show(ui);
     let run_region = |app: &mut PhotocraftApp, region: String| {

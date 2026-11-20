@@ -33,8 +33,10 @@ pub(crate) fn panel_alias(id: &str) -> Option<&'static str> {
 }
 
 /// The person regions `select.region` knows, the options bar's picker and the Select › Person
-/// rows' shared list.
-pub(super) const PERSON_REGIONS: &[&str] = &["skin", "face", "hair", "eyes", "eyelids", "lips", "cheeks", "clothes"];
+/// rows' shared list — the engine's `select.region` names, the fashion tier's clothing
+/// split included.
+pub(super) const PERSON_REGIONS: &[&str] =
+    &["skin", "face", "hair", "eyes", "eyelids", "lips", "cheeks", "clothes", "upperClothes", "lowerClothes", "dress", "shoes", "bag", "scarf"];
 
 /// The Select menu's stateless smart-selection rows: `select.subject.hair` and the
 /// `select.region.<region>` person rows, which [`invoke`](fn@crate::menus::invoke) carries out

@@ -75,6 +75,9 @@ winsafe = { version = "=0.0.29", default-features = false, features = ["kernel"]
 photocraft-ipp = { workspace = true }
 
 [dev-dependencies]
+# The fashion/pose probe examples drive tract directly (the candidate model's facts, timings
+# and raw outputs); the same tract-onnx the ml crate builds, no second copy.
+tract-onnx = { workspace = true }
 craft-affinity = { workspace = true, features = ["synth"] }
 photocraft-io = { workspace = true, features = ["testgen"] }
 # Synthetic camera raw files for the open tests.
