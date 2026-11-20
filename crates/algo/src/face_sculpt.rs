@@ -228,7 +228,9 @@ impl FaceSliders {
 #[serde(rename_all = "camelCase")]
 pub struct FaceAnchors {
     pub doc: [f32; 2],
-    pub pts: Vec<[f32; 2]>,
+    /// The 478 mesh points as `x, y, z` document pixels — z is FaceMesh's own depth,
+    /// kept because 3D塑颜's rotation reads it; everything else ignores it.
+    pub pts: Vec<[f32; 3]>,
 }
 
 /// The sliders plus the anchors they shape.
@@ -810,8 +812,8 @@ mod tests {
     /// layout (a 240 px-wide face about (256, 240)); the rest of the 478 park at the
     /// centre, as FaceMesh's own no-face fallback does — the frame only reads named ones.
     fn face() -> FaceAnchors {
-        let mut pts = vec![[256.0f32, 240.0f32]; MESH_COUNT];
-        let mut set = |i: usize, x: f64, y: f64| pts[i] = [x as f32, y as f32];
+        let mut pts = vec![[256.0f32, 240.0f32, 0.0f32]; MESH_COUNT];
+        let mut set = |i: usize, x: f64, y: f64| pts[i] = [x as f32, y as f32, 0.0];
         set(mesh::FOREHEAD_TOP, 256.0, 96.0);
         set(mesh::CHIN, 256.0, 392.0);
         set(mesh::FACE_SIDE_L, 376.0, 248.0);

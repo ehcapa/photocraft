@@ -162,8 +162,14 @@ pub(crate) fn anchors_from_analysis(a: &photocraft_portrait::Analysis) -> Option
     if a.landmarks.len() != photocraft_algo::face_sculpt::MESH_COUNT {
         return None;
     }
-    let pts = a.landmarks.iter().map(|q| [q[0], q[1]]).collect();
+    let pts = a.landmarks.iter().map(|q| [q[0], q[1], q[2]]).collect();
     Some(FaceAnchors { doc: [a.width as f32, a.height as f32], pts })
+}
+
+/// One 3D塑颜 angle: the slider's ±100 maps to ±8° (yaw, pitch) or ±6° (roll) — the
+/// range where the orthographic read of a turn stays honest.
+fn angle_of(p: &Value, key: &str, max_deg: f64) -> f64 {
+    p.get(key).and_then(Value::as_f64).unwrap_or(0.0).clamp(-100.0, 100.0) / 100.0 * max_deg
 }
 
 /// The symmetry amount (对称液化·五官, one-directional 0..100).
@@ -199,7 +205,8 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let id = crate::commands::layer_param(s, p)?;
     let smooth = smooth_of(p);
     let symmetry = symmetry_of(p);
-    if values == FaceSliders::default() && smooth <= 0.0 && symmetry <= 0.0 && values.preset == FacePreset::None {
+    let poses = angle_of(p, "poseYaw", 8.0) + angle_of(p, "posePitch", 8.0) + angle_of(p, "poseRoll", 6.0);
+    if values == FaceSliders::default() && smooth <= 0.0 && symmetry <= 0.0 && poses.abs() < 1e-6 && values.preset == FacePreset::None {
         return Ok(json!({"layer": id.0, "changed": false}));
     }
     let cell = cell(p, canvas)?;
@@ -224,6 +231,14 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let ring = oval_ring(&anchors);
     let spec = FaceSpec { sliders: values, anchors };
     let (mut field, mut report) = face_field(&spec, canvas, cell);
+    // 3D塑颜: the mesh's own depth rotates — the far side compresses, the near opens.
+    let (yaw, pitch, roll) = (angle_of(p, "poseYaw", 8.0), angle_of(p, "posePitch", 8.0), angle_of(p, "poseRoll", 6.0));
+    if yaw.abs() + pitch.abs() + roll.abs() > 1e-6 {
+        let pts3: Vec<[f64; 3]> = spec.anchors.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64]).collect();
+        let eye_w = (pts3[263][0] - pts3[362][0]).abs().max(8.0);
+        contour::pose_stamp(&mut field, &pts3, yaw, pitch, roll, eye_w * 1.5);
+        report.applied.push("pose");
+    }
     // 对称液化: the paired features align toward each other's mirror about the face's
     // axis — pure geometry of the stored mesh, so the re-render replays it for free.
     if symmetry > 0.0 {
@@ -289,6 +304,12 @@ fn parts(report: &photocraft_algo::face_sculpt::FaceReport) -> Value {
 pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> Option<Surface> {
     let (spec, cell) = stored_spec(params, canvas)?;
     let (mut field, _) = face_field(&spec, canvas, cell);
+    let (yaw, pitch, roll) = (angle_of(params, "poseYaw", 8.0), angle_of(params, "posePitch", 8.0), angle_of(params, "poseRoll", 6.0));
+    if yaw.abs() + pitch.abs() + roll.abs() > 1e-6 {
+        let pts3: Vec<[f64; 3]> = spec.anchors.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64]).collect();
+        let eye_w = (pts3[263][0] - pts3[362][0]).abs().max(8.0);
+        contour::pose_stamp(&mut field, &pts3, yaw, pitch, roll, eye_w * 1.5);
+    }
     let symmetry = symmetry_of(params);
     if symmetry > 0.0 {
         let pts: Vec<[f64; 2]> = spec.anchors.pts.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
@@ -304,7 +325,7 @@ pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> 
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0,"templesLeft":-100..100=0,"templesRight":-100..100=0,"cheekbonesLeft":-100..100=0,"cheekbonesRight":-100..100=0,"eyeSizeLeft":-100..100=0,"eyeSizeRight":-100..100=0,"pupilSizeLeft":-100..100=0,"pupilSizeRight":-100..100=0,"eyeHeightLeft":-100..100=0,"eyeHeightRight":-100..100=0,"eyeWidthLeft":-100..100=0,"eyeWidthRight":-100..100=0,"eyeSpacingLeft":-100..100=0,"eyeSpacingRight":-100..100=0,"innerCornerLeft":-100..100=0,"innerCornerRight":-100..100=0,"outerCornerLeft":-100..100=0,"outerCornerRight":-100..100=0,"lowerLidLeft":-100..100=0,"lowerLidRight":-100..100=0,"eyeTiltLeft":-100..100=0,"eyeTiltRight":-100..100=0,"eyePositionLeft":-100..100=0,"eyePositionRight":-100..100=0,"browHeadLeft":-100..100=0,"browHeadRight":-100..100=0,"browTailLeft":-100..100=0,"browTailRight":-100..100=0,"browThicknessLeft":-100..100=0,"browThicknessRight":-100..100=0,"browSpacingLeft":-100..100=0,"browSpacingRight":-100..100=0,"browTiltLeft":-100..100=0,"browTiltRight":-100..100=0,"browShapeLeft":-100..100=0,"browShapeRight":-100..100=0,"browHeightLeft":-100..100=0,"browHeightRight":-100..100=0,"mouthWidthLeft":-100..100=0,"mouthWidthRight":-100..100=0,"lipTiltLeft":-100..100=0,"lipTiltRight":-100..100=0,"preset":"none|classic|youthful|heroic|juvenile|round|long|square"="none","presetStrength":0..100=60 (a named bundle of the sliders, stacked with the manual ones; each Left/Right pair stays linked until one side is given its own value — the lock, without the widget),"symmetry":0..100=0 (对称液化·五官: the paired features align toward each other's mirror about the face's axis),"smooth":0..100=0 (AI 面部流畅: the face oval contour, low-passed and relaxed; the ring is embedded from the mesh at apply time, like the anchors) (the face-mesh analysis runs first — cached like Select Region, seconds the first time; each slider's positive direction is its label's action),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"faceSlim":-100..100=0,"temples":-100..100=0,"cheekbones":-100..100=0,"jaw":-100..100=0,"faceSize":-100..100=0,"vFace":-100..100=0,"faceWidth":-100..100=0,"hairline":-100..100=0,"foreheadWidth":-100..100=0,"foreheadHeight":-100..100=0,"philtrum":-100..100=0,"midFace":-100..100=0,"lowerFace":-100..100=0,"chinLength":-100..100=0,"chinPoint":-100..100=0,"chinRetract":-100..100=0,"eyeSize":-100..100=0,"pupilSize":-100..100=0,"eyeHeight":-100..100=0,"eyeWidth":-100..100=0,"eyeSpacing":-100..100=0,"innerCorner":-100..100=0,"outerCorner":-100..100=0,"lowerLid":-100..100=0,"eyeTilt":-100..100=0,"eyePosition":-100..100=0,"noseSize":-100..100=0,"noseHeight":-100..100=0,"noseShift":-100..100=0,"noseBridge":-100..100=0,"noseWings":-100..100=0,"noseTip":-100..100=0,"mouthSize":-100..100=0,"mouthWidth":-100..100=0,"mouthHeight":-100..100=0,"mouthShift":-100..100=0,"gumSmile":-100..100=0,"lipTilt":-100..100=0,"upperLip":-100..100=0,"lowerLip":-100..100=0,"browHead":-100..100=0,"browTail":-100..100=0,"browThickness":-100..100=0,"browSpacing":-100..100=0,"browTilt":-100..100=0,"browShape":-100..100=0,"browHeight":-100..100=0,"templesLeft":-100..100=0,"templesRight":-100..100=0,"cheekbonesLeft":-100..100=0,"cheekbonesRight":-100..100=0,"eyeSizeLeft":-100..100=0,"eyeSizeRight":-100..100=0,"pupilSizeLeft":-100..100=0,"pupilSizeRight":-100..100=0,"eyeHeightLeft":-100..100=0,"eyeHeightRight":-100..100=0,"eyeWidthLeft":-100..100=0,"eyeWidthRight":-100..100=0,"eyeSpacingLeft":-100..100=0,"eyeSpacingRight":-100..100=0,"innerCornerLeft":-100..100=0,"innerCornerRight":-100..100=0,"outerCornerLeft":-100..100=0,"outerCornerRight":-100..100=0,"lowerLidLeft":-100..100=0,"lowerLidRight":-100..100=0,"eyeTiltLeft":-100..100=0,"eyeTiltRight":-100..100=0,"eyePositionLeft":-100..100=0,"eyePositionRight":-100..100=0,"browHeadLeft":-100..100=0,"browHeadRight":-100..100=0,"browTailLeft":-100..100=0,"browTailRight":-100..100=0,"browThicknessLeft":-100..100=0,"browThicknessRight":-100..100=0,"browSpacingLeft":-100..100=0,"browSpacingRight":-100..100=0,"browTiltLeft":-100..100=0,"browTiltRight":-100..100=0,"browShapeLeft":-100..100=0,"browShapeRight":-100..100=0,"browHeightLeft":-100..100=0,"browHeightRight":-100..100=0,"mouthWidthLeft":-100..100=0,"mouthWidthRight":-100..100=0,"lipTiltLeft":-100..100=0,"lipTiltRight":-100..100=0,"preset":"none|classic|youthful|heroic|juvenile|round|long|square"="none","presetStrength":0..100=60 (a named bundle of the sliders, stacked with the manual ones; each Left/Right pair stays linked until one side is given its own value — the lock, without the widget),"poseYaw":-100..100=0,"posePitch":-100..100=0,"poseRoll":-100..100=0 (3D塑颜: the mesh's own depth rotates — ±100 is ±8° yaw/pitch, ±6° roll),"symmetry":0..100=0 (对称液化·五官: the paired features align toward each other's mirror about the face's axis),"smooth":0..100=0 (AI 面部流畅: the face oval contour, low-passed and relaxed; the ring is embedded from the mesh at apply time, like the anchors) (the face-mesh analysis runs first — cached like Select Region, seconds the first time; each slider's positive direction is its label's action),"anchors":{…}? (embedded from that analysis and stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px?,"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: FACE_SCULPT,
         label: "Face Sculpt…",
@@ -345,9 +366,9 @@ mod tests {
 
     #[test]
     fn stored_params_replay_the_same_field() {
-        let mut pts = vec![[256.0f32, 240.0f32]; photocraft_algo::face_sculpt::MESH_COUNT];
+        let mut pts = vec![[256.0f32, 240.0f32, 0.0f32]; photocraft_algo::face_sculpt::MESH_COUNT];
         for &(i, x, y) in &[(10usize, 256.0, 96.0), (152, 256.0, 392.0), (454, 376.0, 248.0), (234, 136.0, 248.0)] {
-            pts[i] = [x as f32, y as f32];
+            pts[i] = [x as f32, y as f32, 0.0];
         }
         let anchors = FaceAnchors { doc: [512.0, 512.0], pts };
         let params = json!({"eyeSize": -25.0, "faceSlim": 40.0, "anchors": serde_json::to_value(&anchors).unwrap(), "meshSize": 4});
@@ -448,8 +469,8 @@ mod tests {
                 one(name, 100.0);
             }
             // The footprint gauge: Eye Size moves its band and not the chin's.
-            let eye = anchors.pts[468];
-            let chin = anchors.pts[152];
+            let eye = [anchors.pts[468][0], anchors.pts[468][1]];
+            let chin = [anchors.pts[152][0], anchors.pts[152][1]];
             let changed = |before: &Surface, after: &Surface, c: [f32; 2], r: i32| -> f64 {
                 let region = Rect::new(c[0] as i32 - r, c[1] as i32 - r, c[0] as i32 + r, c[1] as i32 + r);
                 let (a, b) = (before.read_region(region), after.read_region(region));

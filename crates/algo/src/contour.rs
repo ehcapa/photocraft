@@ -92,6 +92,40 @@ pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength:
     relax(field, 2);
 }
 
+/// 3D塑颜: rotates the mesh's own 3D points about their centre (yaw about the vertical
+/// axis, pitch about the horizontal, roll about the view axis; degrees) and stamps each
+/// point's projected displacement — the far side of the face compresses and the near side
+/// opens exactly as a small turn would move it. FaceMesh's z is the depth the mesh ships
+/// with; the angles stay small (the caller maps its slider to a few degrees), where the
+/// orthographic projection is honest.
+pub fn pose_stamp(field: &mut LiquifyField, pts: &[[f64; 3]], yaw_deg: f64, pitch_deg: f64, roll_deg: f64, reach: f64) {
+    if pts.len() < 8 || (yaw_deg.abs() < 1e-6 && pitch_deg.abs() < 1e-6 && roll_deg.abs() < 1e-6) {
+        return;
+    }
+    let n = pts.len() as f64;
+    let c = pts.iter().fold([0.0f64; 3], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n, a[2] + p[2] / n]);
+    let (y0, p0, r0) = (yaw_deg.to_radians(), pitch_deg.to_radians(), roll_deg.to_radians());
+    let (sy, cy) = y0.sin_cos();
+    let (sp, cp) = p0.sin_cos();
+    let (sr, cr) = r0.sin_cos();
+    let items: Vec<([f64; 2], [f64; 2])> = pts
+        .iter()
+        .map(|p| {
+            let l = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+            // yaw (about y, image-down): x picks up z, z gives back x.
+            let x1 = l[0] * cy + l[2] * sy;
+            let z1 = -l[0] * sy + l[2] * cy;
+            // pitch (about x): y picks up z.
+            let y1 = l[1] * cp - z1 * sp;
+            // roll (about the view axis): the 2D rotation.
+            let xr = x1 * cr - y1 * sr;
+            let yr = x1 * sr + y1 * cr;
+            ([p[0], p[1]], [xr - l[0], yr - l[1]])
+        })
+        .collect();
+    stamp_deltas(field, &items, reach);
+}
+
 /// Reflects `p` about the line through `a` along unit `u`.
 fn reflect(p: [f64; 2], a: [f64; 2], u: [f64; 2]) -> [f64; 2] {
     let d = [p[0] - a[0], p[1] - a[1]];
@@ -252,6 +286,31 @@ mod tests {
         // closed ring), which must be a fraction of the bump's own correction.
         let far = field.sample(48.0, 128.0);
         assert!(far[0].abs() < 1.5, "the far side only drifts: {far:?}");
+    }
+
+    #[test]
+    fn a_yaw_compresses_the_far_side_and_opens_the_near() {
+        // A small 3D plate of points: near (z +10), far (z −10), both off the centre.
+        let pts: Vec<[f64; 3]> = (0..24)
+            .map(|k| {
+                let t = k as f64 / 24.0 * std::f64::consts::TAU;
+                [128.0 + 40.0 * t.cos(), 128.0 + 40.0 * t.sin(), 10.0 * t.cos()]
+            })
+            .collect();
+        let mut field = LiquifyField::new(bounds(), 2.0);
+        pose_stamp(&mut field, &pts, 5.0, 0.0, 0.0, 24.0);
+        assert!(!field.is_identity());
+        // Yaw moves +x content by ~z·sin: the near-right point (t=0: z=10) travels right,
+        // the far-left (t=π: z=−10) travels right too but by the opposite sign — sample the
+        // two ends and check they went opposite ways (one opens, one compresses).
+        let near = field.sample(pts[0][0], pts[0][1]);
+        let far = field.sample(pts[12][0], pts[12][1]);
+        assert!(near[0] < 0.0, "the near point's correction points left (opens left for a right turn): {near:?}");
+        assert!(far[0] > 0.0, "the far point opposes it: {far:?}");
+        // Zero angles stamp nothing.
+        let mut flat = LiquifyField::new(bounds(), 2.0);
+        pose_stamp(&mut flat, &pts, 0.0, 0.0, 0.0, 24.0);
+        assert!(flat.is_identity());
     }
 
     #[test]
