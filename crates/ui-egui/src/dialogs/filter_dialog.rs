@@ -188,9 +188,18 @@ pub const PREVIEWED: &[&str] = &[
     "edit.fade",
 ];
 
+/// `filter.*` commands that must **not** offer the live preview. Body Sculpt analyses the
+/// person per preview tick — the preview document is a fresh session, so the pixel-keyed
+/// portrait cache never hits and every slider move re-runs the whole pipeline (seconds) —
+/// and at proxy scale the document-pixel anchors embedded in the command's result would warp
+/// the downscaled proxy geometrically wrong. Both are fixable (anchors captured at dialog
+/// open plus a proxy-scale hook, the `blur_pins::scale_for_proxy` precedent); until then
+/// the dialog is OK-applies like Smart Portrait's.
+const NO_PREVIEW: &[&str] = &["filter.bodySculpt"];
+
 /// Whether the dialog of `command` offers the Preview box and a live preview.
 pub(crate) fn previews(command: &str) -> bool {
-    command.starts_with("filter.") || PREVIEWED.contains(&command)
+    (command.starts_with("filter.") && !NO_PREVIEW.contains(&command)) || PREVIEWED.contains(&command)
 }
 
 /// Whether `command` opens a schema dialog.
@@ -332,7 +341,8 @@ pub(crate) fn params(app: &mut PhotocraftApp, command: &str, spec: &str) -> Vec<
             // Smart Portrait's recipe never remembers: the spec defaults are the sane retouch,
             // and a stale extreme slider from an earlier session presents as the pipeline
             // breaking, not as a starting point (2026-11-19's hue-164/saturation--61 export).
-            if command == "portrait.create" {
+            // Body Sculpt is the same story about a person's body.
+            if command == "portrait.create" || command == "filter.bodySculpt" {
                 p = p.not_remembered();
             }
             // Global Light's Altitude takes whole degrees, as its Angle does (#14980).

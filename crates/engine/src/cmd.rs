@@ -114,6 +114,7 @@ pub mod render_cmds;
 pub mod retouch_cmds;
 #[cfg(test)]
 mod rotate_canvas_bitmap_tests;
+pub mod sculpt_cmds;
 
 #[cfg(test)]
 mod rotate_canvas_guides_tests;

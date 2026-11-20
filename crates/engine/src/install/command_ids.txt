@@ -821,6 +821,7 @@ edit.puppetWarp
 layer.smartObjects.puppetWarp
 edit.perspectiveWarp
 layer.smartObjects.perspectiveWarp
+filter.bodySculpt
 image.analysis.setMeasurementScale
 image.analysis.selectDataPoints
 image.analysis.recordMeasurements

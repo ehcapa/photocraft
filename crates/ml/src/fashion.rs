@@ -89,7 +89,7 @@ pub fn fashion_probs(px: &[[f32; 3]], w: usize, h: usize) -> Option<Vec<Vec<f32>
     let outputs = plan.run(tvec![tensor.into()]).ok()?;
     let raw: Vec<f32> = outputs.into_iter().next()?.to_plain_array_view::<f32>().ok()?.iter().copied().collect();
     // Class axis first: `[1, 18, oh, ow]` — the spatial side follows from the count.
-    if raw.len() % FASHION_CLASSES != 0 {
+    if !raw.len().is_multiple_of(FASHION_CLASSES) {
         return None;
     }
     let stride = raw.len() / FASHION_CLASSES;

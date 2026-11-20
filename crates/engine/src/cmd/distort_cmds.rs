@@ -165,7 +165,7 @@ fn interp(p: &Value) -> Interp {
 /// bounds the selection reaches is blended into a copy of `old`: a small selection over distant
 /// sparse content no longer expands the empty space between them. Refused, before any dense
 /// buffer, when that part would still pass the working budget.
-fn mix_by_selection(old: &Surface, new: &Surface, sel: &Surface) -> Result<Surface> {
+pub(crate) fn mix_by_selection(old: &Surface, new: &Surface, sel: &Surface) -> Result<Surface> {
     let content = old.content_bounds().union(&new.content_bounds());
     // Outside its tiles the selection's coverage is its default: an empty default lets the
     // blend keep to the selection's bounds.
@@ -249,6 +249,8 @@ pub fn apply_to_surface(id: &str, params: &Value, surf: &Surface, canvas: Rect) 
             Some(puppet_surface(surf, &puppet_params(id, params).ok()?, interp(params)).unwrap_or_else(|| surf.clone()))
         }
         PERSPECTIVE | PERSPECTIVE_SMART => Some(perspective_surface(surf, &perspective_params(id, params).ok()?, interp(params))),
+        // Body Sculpt's stored form carries its own anchors; the hook is in its own module.
+        crate::sculpt_cmds::SCULPT => crate::sculpt_cmds::apply_to_surface(params, surf, canvas),
         _ => None,
     }
 }
@@ -288,11 +290,11 @@ fn check_locks(l: &Layer, group: Locks, position: bool) -> Result<()> {
 /// Shared driver: a smart object records `cmd` as a smart filter; a pixel layer is edited in
 /// place by `f(surface, selection)`.
 /// Deforms a linked layer mask the same way, limited to the selection when there is one.
-type MaskFn<'a> = Option<&'a dyn Fn(&Surface, Option<&Surface>) -> Result<Surface>>;
+pub(crate) type MaskFn<'a> = Option<&'a dyn Fn(&Surface, Option<&Surface>) -> Result<Surface>>;
 /// Deforms a layer's pixels (with the selection and canvas); an `Err` leaves the layer as it was.
-type LayerFn<'a> = &'a dyn Fn(&Surface, Option<&Surface>, Rect) -> Result<Surface>;
+pub(crate) type LayerFn<'a> = &'a dyn Fn(&Surface, Option<&Surface>, Rect) -> Result<Surface>;
 
-fn run_on_layer(s: &mut Session, cmd: &str, label: &str, p: &Value, moves: bool, f: LayerFn, mask: MaskFn) -> Result<Value> {
+pub(crate) fn run_on_layer(s: &mut Session, cmd: &str, label: &str, p: &Value, moves: bool, f: LayerFn, mask: MaskFn) -> Result<Value> {
     let id = target(s, p)?;
     let colors = crate::color_channels::target(s, p)?.is_some();
     let mut params = p.clone();

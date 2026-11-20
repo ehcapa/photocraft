@@ -209,3 +209,51 @@ screen landmarks [1,195]=39×(x,y,z,vis,presence)、**vis 是 raw logit,sigmoid
 `Analysis.pose: Vec<[f32;4]>` 存储,**无消费者**——身体液化/瘦身锚点
 (PuppetPin.src / LiquifyField 均已就绪)是下一迭代;本期只到探针验收
 (pose_landmarks_dump_probe:33 点、有限、vis 值域、肩<髋)。
+
+## 2026-11-20: `filter.bodySculpt` —— 关键点驱动身体塑形(v1,对标像素蛋糕全身美型)
+
+**对标定位。** 像素蛋糕全身美型(wiki 9412)约 19 滑杆、面部重塑(wiki 9405)
+约 60 滑杆,全部是"关键点→形变"同一台机器(身体 BlazePose 33 点、面部 FaceMesh
+478 点,两个模型都已内嵌)。v1 落身体面板 **16 滑杆**(瘦身/瘦腰/瘦腹/手臂/
+大腿/小腿/肩宽/美臀/丰胸/小头/瘦脖子 + 增高/长腿/腰长/上身长/脖长),独立命令
+`Filter ▸ Body Sculpt…`(像素蛋糕自己也是独立面板);架构按全部滑杆设计——
+algo 的部件表是数据,面部面板三期只加表项。
+
+**解析写场,不走 dab 链,不用 freeze。** 三条都有 liquify.rs 行级证据:
+①身体尺度笔刷(200-400px)的 Pucker dab 链要数千 dab,智能滤镜每次重渲染重付,
+且压力×间距的合成让滑杆→位移成为涌现函数,没法校准——直接 `LiquifyField::new`
++ 写 `d`,滑杆→边缘位移一阶线性;②`apply_liquify` 在 freeze>0 处把 Catmull-Rom
+混向双线性(:879-886),冻结带边缘成可见折痕,各部件横向剖面自身 C1 到零
+(复用 pub `falloff`)即够局部;③逆向映射本无洞,折叠才是风险,测试断言
+`相邻节点|Δd| < cell`。**该断言首跑即抓住真问题**:四个长度 ramp 的横向衰减
+叠在同一剪影边缘(实测 6.4px/4px)——修复 = ramp 横向改高原+羽毛(剪影内
+刚体骑移零梯度,剪切移进背景)+ 五长度滑杆**共享折叠预算**(幅度和封顶
+0.20×宽度,堆满等比缩而非散架)。
+
+**锚点嵌入 params,重渲染纯数据。** SmartFilter 在合成时重渲染,没有 Session/
+portrait_cache 可问——命令应用时把 pose [x,y,vis]×33 + 头部中心/半径
+(FACE_OVAL 质心×1.15 含发)+ chin(FaceMesh 152)+ doc 尺寸塞进 params 随滤镜
+存储;`apply_to_surface`(distort_cmds 分发臂)从 params 确定性重建场。
+分层规则不破:algo 只吃纯几何,ml 依赖止于 engine。蒙版跟场走(#3083,
+puppet 先例):链接蒙版同一 `apply_liquify`,瘦身不留胖蒙版。
+
+**UI 三点。** Filter 菜单行;通用 schema 对话框(16 滑杆行,not_remembered
+——portrait.create 2026-11-19 同款理由:跨会话残留的极端滑杆呈现为"管线坏了");
+**预览显式退出**——验证了 preview 每 tick 建新 Session(缓存必 miss→整套分析)
+且代理 k 缩放下 doc 像素锚点几何错位,修复路径(对话框开时捕获锚点 +
+scale_preview_params 钩子,blur_pins 先例)记录待做。
+
+**验收。** algo 8 测(合成站姿,CI 安全):恒等/确定性/单调/方向/ramp 连续/
+vis 门控/±100 叠加平滑。engine 真图门控测试(PHOTOCRAFT_SCULPT_PHOTO,
+region_dump 先例——分析链是 crate 内部,example 够不着):test-user.jpg
+16 滑杆表 + 门控正确(半身照,踝/膝不可见 → calves/legs/height 正确跳过)、
+**footprint 量具**(直接量图层像素,不依赖蒙版):waist-100 → 腰带 10.4%
+像素可见移动,head/legs 带 0.000;蒙版 rim 量具在此照降级如实报告
+(u2netp 蒙版整幅覆盖——已知主体档短板,ort 档存在的原因);智能对象存
+anchors + 真路径 `apply_filter_to_surface` 两次重渲染逐位相等。校准:各部件
+gain 是表常量(gain×局部宽/骨长),±100 约 10% 量级,探针表打印可调。
+
+**延后表。** AI塑形/身型流畅(需 AI 平滑机制,另一原语)、直角肩/天鹅颈
+(滑杆组合件)、胸位提升、左右分开小锁、双下巴(像素蛋糕归"祛除瑕疵"修复类,
+可先近似下颌收紧)、面部面板(~60 件,FaceMesh,三期)。zh 词条走外部
+craft-i18n,`tl!` 回落英文。
