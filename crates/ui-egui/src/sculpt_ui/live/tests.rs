@@ -145,6 +145,47 @@ fn apply_with_anchors_is_one_step_and_keeps_the_panel_open() {
     assert!(h.state().sculpt_live.as_ref().is_some_and(|live| !live.has_preview()), "the preview gives way to the commit");
 }
 
+/// An Apply whose reply leaves a region out, or places one by inference, says so inline. A
+/// clean reply leaves the status line alone.
+#[test]
+fn an_apply_reports_regions_it_left_out_or_inferred() {
+    let skipped = json!({"parts": {"applied": ["waist"], "approximate": [], "skipped": [{"part": "right upper arm", "why": "outside"}]}});
+    assert!(super::parts_notice(&skipped).is_some_and(|n| n.contains("left out")), "a skipped part is said");
+    let approximate = json!({"parts": {"applied": ["thigh"], "approximate": [{"part": "left thigh", "why": "inferred"}], "skipped": []}});
+    assert!(super::parts_notice(&approximate).is_some_and(|n| n.contains("inferred")), "an inferred part is said");
+    let clean = json!({"parts": {"applied": ["waist"], "approximate": [], "skipped": []}});
+    assert!(super::parts_notice(&clean).is_none(), "a clean Apply adds no notice");
+    assert!(super::parts_notice(&json!({"changed": true})).is_none(), "a reply without parts adds none");
+}
+
+/// The measured body fit must ride with the anchors into every param set the panel sends —
+/// preview and Apply share `merged_params`, so one insertion covers both. Without a fit the
+/// params stay as they were (Face, or a mask with no measurable silhouette).
+#[test]
+fn the_body_fit_rides_with_the_anchors_into_the_params() {
+    let mut app = app(patterned(64, 64));
+    let mut live = Live::test(&mut app, BODY, body_anchors(64.0, 64.0));
+    assert!(live.merged_params(&json!({"waist": 40.0})).get("fit").is_none(), "no fit, no fit param");
+    let fit = json!({
+        "rows": [{"y": 10.0, "runs": [[4.0, 20.0]]}, {"y": 30.0, "runs": [[6.0, 18.0]]}],
+        "waist": {"t": 0.5, "left": 8.0, "right": 8.0},
+        "belly": {"t": 0.7, "left": 9.0, "right": 9.0},
+        "hip": {"t": 1.0, "left": 10.0, "right": 10.0},
+        "bust": {"t": 0.3, "left": 7.0, "right": 7.0},
+        "limbs": [
+            {"radius": 4.0, "t0": 0.1, "t1": 0.9}, {"radius": 4.0, "t0": 0.1, "t1": 0.9},
+            {"radius": 4.0, "t0": 0.1, "t1": 0.9}, {"radius": 4.0, "t0": 0.1, "t1": 0.9},
+            {"radius": 4.0, "t0": 0.1, "t1": 0.9}, {"radius": 4.0, "t0": 0.1, "t1": 0.9},
+            {"radius": 4.0, "t0": 0.1, "t1": 0.9}, {"radius": 4.0, "t0": 0.1, "t1": 0.9},
+        ],
+        "inside": vec![true; photocraft_algo::sculpt::POSE_COUNT],
+    });
+    live.fit = Some(fit.clone());
+    let merged = live.merged_params(&json!({"waist": 40.0}));
+    assert_eq!(merged.get("fit"), Some(&fit), "the fit must ride with the anchors");
+    assert_eq!(merged.get("anchors"), Some(&live.anchors), "the anchors still ride too");
+}
+
 /// Apply's warp is already on the canvas: unchanged values must not start a preview that would
 /// draw the warp a second time over the committed pixels.
 #[test]
@@ -272,7 +313,7 @@ fn a_slider_change_after_the_analysis_lands_previews() {
     let anchors = body_anchors(256.0, 384.0);
     live.worker
         .start(live.serial, app.ctx().clone(), move |_| {
-            Ok(super::worker::Output::Analysis(super::worker::Analysis { anchors, contour: None, quality: None, layer: Some(layer.0) }))
+            Ok(super::worker::Output::Analysis(super::worker::Analysis { anchors, fit: None, contour: None, quality: None, layer: Some(layer.0) }))
         })
         .unwrap();
     let ctx = app.ctx().clone();

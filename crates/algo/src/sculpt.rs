@@ -35,6 +35,15 @@ pub const SYMMETRY_PAIRS: &[(usize, usize)] = &[(11, 12), (13, 14), (15, 16), (2
 /// The joints that must be visible (the model's sigmoidged confidence) for a part to run.
 const VISIBILITY: f64 = 0.5;
 
+/// How much of a limb's own bone the person silhouette must cover for the limb to shape the
+/// covered part when one of its joints falls outside the silhouette: half the bone. Below
+/// that the pose's bone is mostly guesswork, and the row is skipped with its reason.
+const LIMB_COVERED: f64 = 0.45;
+
+/// Why a row that ran anyway is reported approximate.
+const INFERRED_REASON: &str = "the pose barely sees those landmarks; the position is inferred from the silhouette";
+const COVERED_REASON: &str = "a landmark lies outside the person silhouette; the covered part of the limb is used";
+
 /// How far each part's full effect reaches toward its rim (Liquify's Density, 0..1): the
 /// body parts want a broad plateau with the feather at the rim only.
 const DENSITY: f64 = 0.6;
@@ -117,20 +126,125 @@ pub struct SculptAnchors {
     pub chin: [f32; 2],
 }
 
+/// The eight limb segments [`BodyFit::limbs`] answers for, in its order: upper arm, forearm,
+/// thigh and calf on the pose's left, then the same on its right. The table's rows and the
+/// analysis that fills the fit both read this list, so the two cannot disagree.
+pub const LIMB_SEGMENTS: [(usize, usize); 8] = [(11, 13), (13, 15), (12, 14), (14, 16), (23, 25), (24, 26), (25, 27), (26, 28)];
+
+/// One sampled row of the person silhouette: its y and the horizontal runs the mask fills.
+/// Several runs because a raised arm or a gap between the legs is a separate run; the field's
+/// clip reads them all, and the torso fit takes the run that holds the torso axis.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyRow {
+    pub y: f32,
+    pub runs: Vec<[f32; 2]>,
+}
+
+/// One torso level the slimming rows act on, at `t` along shoulder-mid → hip-mid, with the
+/// silhouette's half-widths on each side of the axis. Half-widths, not absolute x: the levels
+/// travel with the anchors, and the axis is rebuilt from them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LevelFit {
+    pub t: f32,
+    pub left: f32,
+    pub right: f32,
+}
+
+/// One limb's half-thickness read from the person mask at its bone, and the fraction of the
+/// bone the mask actually covers (a cropped or skirt-hidden end clips the row's band instead
+/// of killing it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimbFit {
+    pub radius: f32,
+    pub t0: f32,
+    pub t1: f32,
+}
+
+/// The person silhouette fitted to the body's own geometry: torso levels, limb thickness and
+/// the rows the field clips to. `portrait.analyze` computes it once from the person mask; the
+/// command stores it in its params, so a smart filter replays the same field without the mask.
+/// Without one (old filters, or anchors sent alone) the parts fall back to joint spacing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyFit {
+    pub rows: Vec<BodyRow>,
+    pub waist: LevelFit,
+    pub belly: LevelFit,
+    pub hip: LevelFit,
+    pub bust: LevelFit,
+    pub limbs: [LimbFit; 8],
+    /// Whether each pose joint lies inside the silhouette: an occluded joint inside it is
+    /// still a usable estimate; one outside it makes the row suspect, so it is skipped unless
+    /// it is a limb whose covered bone span is long enough to shape. A `Vec` rather than
+    /// `[bool; POSE_COUNT]` because serde has no array impl past 32.
+    pub inside: Vec<bool>,
+}
+
+impl Default for BodyFit {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            waist: LevelFit::default(),
+            belly: LevelFit::default(),
+            hip: LevelFit::default(),
+            bust: LevelFit::default(),
+            limbs: std::array::from_fn(|_| LimbFit::default()),
+            inside: vec![false; POSE_COUNT],
+        }
+    }
+}
+
+impl BodyFit {
+    /// Whether the fit is usable: finite, ordered rows within the size the field will read.
+    /// A malformed or hostile `fit` from params is ignored (the parts fall back to the joints)
+    /// rather than trusted or allowed to size an allocation.
+    pub fn is_valid(&self) -> bool {
+        self.rows.len() >= 2
+            && self.rows.len() <= 4096
+            && self.inside.len() == POSE_COUNT
+            && self.rows.windows(2).all(|w| w[0].y <= w[1].y)
+            && self
+                .rows
+                .iter()
+                .all(|r| r.y.is_finite() && r.runs.len() <= 128 && r.runs.iter().all(|run| run.iter().all(|v| v.is_finite()) && run[0] <= run[1]))
+            && [self.waist, self.belly, self.hip, self.bust]
+                .iter()
+                .all(|l| l.t.is_finite() && l.left.is_finite() && l.right.is_finite() && l.left >= 0.0 && l.right >= 0.0)
+            && self.limbs.iter().all(|l| {
+                l.radius.is_finite() && l.t0.is_finite() && l.t1.is_finite() && l.radius >= 0.0 && (0.0..=1.0).contains(&l.t0) && (0.0..=1.0).contains(&l.t1)
+            })
+    }
+
+    /// The widest half-width the levels measured: the scale the contract/radial fold budget
+    /// is set against.
+    fn max_half(&self) -> f64 {
+        [self.waist, self.belly, self.hip, self.bust].iter().map(|l| f64::from(l.left.max(l.right))).fold(0.0, f64::max)
+    }
+}
+
 /// The sliders plus the anchors they shape: the whole input of [`sculpt_field`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct SculptSpec {
     pub sliders: SculptSliders,
     pub anchors: SculptAnchors,
+    /// The person-mask fit `portrait.analyze` measured, when the caller has one.
+    pub fit: Option<BodyFit>,
 }
 
 /// What a build did: the rows whose slider asked and landmarks allowed, and the rows that
 /// asked but were left out (a limb hidden from the pose, anchors too close to name an axis)
 /// with the reason — the command surfaces this, so a slider that does nothing explains
-/// itself instead of reading as a dead control.
+/// itself instead of reading as a dead control. `approximate` names the rows that ran on an
+/// inference — a landmark the pose barely saw (an occluded knee inside the silhouette), or
+/// a limb shaped over the part of its bone the silhouette covers when a joint fell outside
+/// it: they did something, but the position is inferred.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SculptReport {
     pub applied: Vec<&'static str>,
+    pub approximate: Vec<(&'static str, &'static str)>,
     pub skipped: Vec<(&'static str, &'static str)>,
 }
 
@@ -138,19 +252,22 @@ pub struct SculptReport {
 
 /// The anchors resolved once per build: joints as `[x, y]` pairs with their visibility, the
 /// head and the chin. Every part's shape is derived from this.
-struct Frame {
+struct Frame<'a> {
     p: Vec<[f64; 2]>,
     vis: Vec<f64>,
     chin: [f64; 2],
     head_c: [f64; 2],
     head_r: f64,
+    /// The person-mask fit, when one came with the spec and passed its sanity checks.
+    fit: Option<&'a BodyFit>,
 }
 
-impl Frame {
+impl<'a> Frame<'a> {
     /// `None` when the anchors are not a pose this crate understands (a joint count other
     /// than 33, or non-finite points): the caller reports and applies nothing rather than
-    /// warping from garbage.
-    fn new(a: &SculptAnchors) -> Option<Frame> {
+    /// warping from garbage. A `fit` that fails [`BodyFit::is_valid`] is ignored, not
+    /// trusted: the parts then use joint spacing, as an older stored filter would.
+    fn new(a: &SculptAnchors, fit: Option<&'a BodyFit>) -> Option<Frame<'a>> {
         if a.pose.len() != POSE_COUNT || !a.doc.iter().chain(&a.chin).chain(a.head.centre.iter()).all(|v| v.is_finite()) {
             return None;
         }
@@ -159,7 +276,14 @@ impl Frame {
             return None;
         }
         let head_r = if a.head.radius.is_finite() && a.head.radius > 0.0 { a.head.radius as f64 } else { 0.0 };
-        Some(Frame { p, vis, chin: [a.chin[0] as f64, a.chin[1] as f64], head_c: [a.head.centre[0] as f64, a.head.centre[1] as f64], head_r })
+        Some(Frame {
+            p,
+            vis,
+            chin: [a.chin[0] as f64, a.chin[1] as f64],
+            head_c: [a.head.centre[0] as f64, a.head.centre[1] as f64],
+            head_r,
+            fit: fit.filter(|f| f.is_valid()),
+        })
     }
 
     fn pt(&self, i: usize) -> [f64; 2] {
@@ -168,6 +292,50 @@ impl Frame {
 
     fn visible(&self, i: usize) -> bool {
         self.vis[i] >= VISIBILITY
+    }
+
+    /// Whether a part may run and how strongly, plus the approximate reason when it runs on
+    /// an inference. With a fit, a joint inside the silhouette is usable even when the pose's
+    /// visibility is low (occlusion, not absence): it runs at 55–100% and reports as
+    /// approximate below the visibility gate. A joint the silhouette does not contain is the
+    /// pose guessing outside the body, and the row is skipped with that reason — except for a
+    /// limb, whose covered bone span the caller may still use. Without a fit the old
+    /// all-or-nothing gate stands.
+    fn confidence(&self, needs: &[usize]) -> Result<(f64, Option<&'static str>), &'static str> {
+        let Some(fit) = self.fit else {
+            return if needs.iter().all(|&i| self.visible(i)) { Ok((1.0, None)) } else { Err("the pose does not see those landmarks") };
+        };
+        let mut min_vis = 1.0f64;
+        for &i in needs {
+            if !fit.inside.get(i).copied().unwrap_or(false) {
+                return Err("the landmark is outside the person silhouette");
+            }
+            min_vis = min_vis.min(self.vis[i].clamp(0.0, 1.0));
+        }
+        if min_vis >= VISIBILITY { Ok((1.0, None)) } else { Ok((0.55 + 0.45 * min_vis / VISIBILITY, Some(INFERRED_REASON))) }
+    }
+
+    /// The fraction of the limb `i`→`j`'s own bone the person silhouette covers, when the fit
+    /// measured that limb: the band [`limb`] shapes, nothing when the fit is absent or the
+    /// limb unmeasured.
+    fn limb_covered(&self, i: usize, j: usize) -> Option<f64> {
+        let fit = self.fit?;
+        let idx = LIMB_SEGMENTS.iter().position(|&(a, b)| a == i && b == j)?;
+        let limb = fit.limbs.get(idx)?;
+        (limb.radius > 1.0).then(|| (f64::from(limb.t1) - f64::from(limb.t0)).clamp(0.0, 1.0))
+    }
+
+    /// A torso level's two half-widths, each at least a few pixels so a fold in the
+    /// silhouette cannot collapse a row to nothing.
+    fn level_half(&self, level: &LevelFit) -> (f64, f64) {
+        (f64::from(level.left).max(4.0), f64::from(level.right).max(4.0))
+    }
+
+    /// The fitted band around a torso level: a narrow window on the torso axis, clamped to
+    /// the segment so a level at either end still names a valid window.
+    fn level_band(level: &LevelFit) -> (f64, f64) {
+        let t = f64::from(level.t).clamp(0.03, 0.97);
+        (t - 0.085, (t + 0.085).min(1.05))
     }
 
     fn mid(&self, i: usize, j: usize) -> [f64; 2] {
@@ -289,26 +457,59 @@ struct Part {
     shape: fn(&Frame) -> Option<Shape>,
 }
 
+impl Part {
+    /// The limb segment this row shapes, when it is one (its two needed joints name a bone).
+    /// A limb can keep shaping the covered part of its bone when a joint falls outside the
+    /// person silhouette; a torso row cannot (its envelope needs both ends).
+    fn limb(&self) -> Option<(usize, usize)> {
+        match *self.needs {
+            [i, j] if LIMB_SEGMENTS.contains(&(i, j)) => Some((i, j)),
+            _ => None,
+        }
+    }
+}
+
 /// The parts, table order = build order (the superposition is order-stable, which is part of
 /// the determinism the smart filter relies on).
 const PARTS: &[Part] = &[
     Part {
         name: "slim body",
         slider: |s| s.slim_body,
-        needs: &[11, 12, 23, 24, 27, 28],
-        shape: |f| f.contract(f.shoulder_mid(), f.ankle_mid(), (0.02, 0.98), f.shoulder_w() * 0.65, 0.05),
+        // The torso only: the limbs have their own rows, and a contract about the torso axis
+        // would pull both legs toward the centre instead of slimming each. The old row also
+        // needed the ankles, so a cropped or skirt-hidden pair killed the whole slider.
+        needs: &[11, 12, 23, 24],
+        shape: |f| match f.fit {
+            Some(fit) => {
+                let half = fit.max_half().max(24.0);
+                f.contract(f.shoulder_mid(), f.hip_mid(), (0.0, 1.05), 2.10 * half, 0.14)
+            }
+            None => f.contract(f.shoulder_mid(), f.hip_mid(), (0.0, 1.05), f.shoulder_w() * 0.85, 0.10),
+        },
     },
     Part {
         name: "waist",
         slider: |s| s.waist,
         needs: &[11, 12, 23, 24],
-        shape: |f| f.contract(f.shoulder_mid(), f.hip_mid(), (0.30, 0.78), f.shoulder_w() * 0.60, 0.10),
+        shape: |f| match f.fit {
+            Some(fit) => {
+                let (l, r) = f.level_half(&fit.waist);
+                f.contract(f.shoulder_mid(), f.hip_mid(), Frame::level_band(&fit.waist), 2.05 * l.max(r), 0.18)
+            }
+            None => f.contract(f.shoulder_mid(), f.hip_mid(), (0.30, 0.78), f.shoulder_w() * 0.60, 0.10),
+        },
     },
     Part {
         name: "belly",
         slider: |s| s.belly,
         needs: &[11, 12, 23, 24],
-        shape: |f| f.contract(f.shoulder_mid(), f.hip_mid(), (0.55, 0.95), f.shoulder_w() * 0.62, 0.08),
+        shape: |f| match f.fit {
+            Some(fit) => {
+                let (l, r) = f.level_half(&fit.belly);
+                f.contract(f.shoulder_mid(), f.hip_mid(), Frame::level_band(&fit.belly), 2.05 * l.max(r), 0.17)
+            }
+            None => f.contract(f.shoulder_mid(), f.hip_mid(), (0.55, 0.95), f.shoulder_w() * 0.62, 0.08),
+        },
     },
     Part {
         name: "shoulders",
@@ -329,14 +530,14 @@ const PARTS: &[Part] = &[
         needs: &[11, 12],
         shape: |f| f.contract(f.pt(11), f.pt(12), (0.0, 1.0), f.shoulder_w() * 0.38, 0.08),
     },
-    Part { name: "left upper arm", slider: |s| s.arms, needs: &[11, 13], shape: |f| arm(f, 11, 13, 0.10) },
-    Part { name: "left forearm", slider: |s| s.arms, needs: &[13, 15], shape: |f| arm(f, 13, 15, 0.10) },
-    Part { name: "right upper arm", slider: |s| s.arms, needs: &[12, 14], shape: |f| arm(f, 12, 14, 0.10) },
-    Part { name: "right forearm", slider: |s| s.arms, needs: &[14, 16], shape: |f| arm(f, 14, 16, 0.10) },
-    Part { name: "left thigh", slider: |s| s.thighs, needs: &[23, 25], shape: |f| limb(f, 23, 25, 0.42, 0.10) },
-    Part { name: "right thigh", slider: |s| s.thighs, needs: &[24, 26], shape: |f| limb(f, 24, 26, 0.42, 0.10) },
-    Part { name: "left calf", slider: |s| s.calves, needs: &[25, 27], shape: |f| limb(f, 25, 27, 0.32, 0.08) },
-    Part { name: "right calf", slider: |s| s.calves, needs: &[26, 28], shape: |f| limb(f, 26, 28, 0.32, 0.08) },
+    Part { name: "left upper arm", slider: |s| s.arms, needs: &[11, 13], shape: |f| arm(f, 11, 13, 0.26) },
+    Part { name: "left forearm", slider: |s| s.arms, needs: &[13, 15], shape: |f| arm(f, 13, 15, 0.26) },
+    Part { name: "right upper arm", slider: |s| s.arms, needs: &[12, 14], shape: |f| arm(f, 12, 14, 0.26) },
+    Part { name: "right forearm", slider: |s| s.arms, needs: &[14, 16], shape: |f| arm(f, 14, 16, 0.26) },
+    Part { name: "left thigh", slider: |s| s.thighs, needs: &[23, 25], shape: |f| limb(f, 23, 25, 0.42, 0.24) },
+    Part { name: "right thigh", slider: |s| s.thighs, needs: &[24, 26], shape: |f| limb(f, 24, 26, 0.42, 0.24) },
+    Part { name: "left calf", slider: |s| s.calves, needs: &[25, 27], shape: |f| limb(f, 25, 27, 0.32, 0.22) },
+    Part { name: "right calf", slider: |s| s.calves, needs: &[26, 28], shape: |f| limb(f, 26, 28, 0.32, 0.22) },
     // The hips and the bust expand on their positive direction (the labels mean fuller), so
     // their gains are negative: the field points inward, which reads as expansion.
     Part { name: "left hip", slider: |s| s.hips, needs: &[23, 24], shape: |f| hip(f, 23) },
@@ -397,10 +598,22 @@ const PARTS: &[Part] = &[
     Part { name: "neck length", slider: |s| s.neck_length, needs: &[11, 12], shape: |f| f.ramp(f.shoulder_mid(), f.chin, (0.05, 0.95), f.ramp_width(), 0.25) },
 ];
 
-/// One limb segment (`i`→`j`): the brush width is a fraction of the bone's own length, so
-/// the part scales with the person in the frame — a floor keeps a foreshortened segment
-/// from vanishing.
+/// One limb segment (`i`→`j`). With a fit, the brush width is twice the thickness the person
+/// mask measured at the bone and the band is the part of the bone the mask covers — the
+/// field's peak lands on the limb's own surface instead of dying before it, and a cropped or
+/// skirt-hidden end shortens the row rather than skipping it. Without a fit the old
+/// bone-length fraction stands.
 fn limb(f: &Frame, i: usize, j: usize, width_frac: f64, gain: f64) -> Option<Shape> {
+    if let Some(fit) = f.fit
+        && let Some(idx) = LIMB_SEGMENTS.iter().position(|&(a, b)| a == i && b == j)
+    {
+        let l = fit.limbs[idx];
+        let radius = f64::from(l.radius);
+        let (t0, t1) = (f64::from(l.t0).clamp(0.0, 0.98), f64::from(l.t1).clamp(0.02, 1.0));
+        if radius > 1.0 && t1 - t0 >= 0.10 {
+            return f.contract(f.pt(i), f.pt(j), (t0, t1), (2.0 * radius).max(16.0), gain);
+        }
+    }
     let len = norm(sub(f.pt(j), f.pt(i)));
     f.contract(f.pt(i), f.pt(j), (0.05, 0.95), (len * width_frac).max(12.0), gain)
 }
@@ -410,9 +623,18 @@ fn arm(f: &Frame, i: usize, j: usize, gain: f64) -> Option<Shape> {
     limb(f, i, j, 0.32, gain)
 }
 
-/// One hip: a radial expansion centred a little outside and below the joint, where the
-/// curve the slider means actually lives.
+/// One hip: a radial expansion placed halfway between the torso axis and the fitted hip
+/// contour, with the envelope reaching twice that distance so its peak lands on the visible
+/// curve. Without a fit it keeps the joint-spacing estimate.
 fn hip(f: &Frame, i: usize) -> Option<Shape> {
+    if let Some(fit) = f.fit {
+        let (left, right) = f.level_half(&fit.hip);
+        let side = if f.pt(i)[0] < f.hip_mid()[0] { -1.0 } else { 1.0 };
+        let half = if side < 0.0 { left } else { right };
+        let axis = lerp(f.shoulder_mid(), f.hip_mid(), f64::from(fit.hip.t).clamp(0.0, 1.1));
+        let c = [axis[0] + side * 0.45 * half, axis[1]];
+        return f.radial(c, (1.10 * half).max(18.0), -0.20);
+    }
     let out = sub(f.pt(i), f.hip_mid());
     let out_n = norm(out);
     let out = if out_n < 1e-9 { [0.0, 0.0] } else { scale(out, 1.0 / out_n) };
@@ -420,9 +642,17 @@ fn hip(f: &Frame, i: usize) -> Option<Shape> {
     f.radial(c, (f.hip_w() * 0.55).max(20.0), -0.08)
 }
 
-/// One side of the bust: a radial expansion on the torso axis a third of the way down from
-/// the shoulders, offset to that side.
+/// One side of the bust: the same fitted construction at the bust level, on the torso axis
+/// a third of the way down from the shoulders. Without a fit it keeps the joint-spacing
+/// estimate.
 fn bust(f: &Frame, side: f64) -> Option<Shape> {
+    if let Some(fit) = f.fit {
+        let (left, right) = f.level_half(&fit.bust);
+        let half = if side < 0.0 { left } else { right };
+        let axis = lerp(f.shoulder_mid(), f.hip_mid(), f64::from(fit.bust.t).clamp(0.0, 1.0));
+        let c = [axis[0] + side * 0.45 * half, axis[1]];
+        return f.radial(c, (1.10 * half).max(18.0), -0.18);
+    }
     let base = lerp(f.shoulder_mid(), f.hip_mid(), 0.32);
     let c = add(base, scale(f.u_shoulder(), side * f.shoulder_w() * 0.18));
     f.radial(c, f.shoulder_w() * 0.30, -0.10)
@@ -437,42 +667,78 @@ fn bust(f: &Frame, side: f64) -> Option<Shape> {
 /// slider alone well inside — the worst solo ramp is ~0.14 of the width.
 const RAMP_BUDGET: f64 = 0.20;
 
+/// The contract/radial family's shared fold budget: their peak |Δ|s may sum to this multiple
+/// of the fitted torso half-width before the family scales down together. The slimming rows
+/// all act around the same axis and stack (waist + belly + slim at once), so the budget is
+/// what keeps a full-slider stack an order below the cell size.
+const SHAPE_BUDGET: f64 = 0.35;
+
 /// The field of `spec` over `bounds` (`cell` document pixels per node, [`LiquifyField::new`]'s
 /// own clamps apply). Pure and deterministic: the same spec, bounds and cell build the same
 /// field bit for bit, which is what a stored smart filter replays on.
 pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField, SculptReport) {
     let mut field = LiquifyField::new(bounds, cell);
     let mut report = SculptReport::default();
-    let Some(frame) = Frame::new(&spec.anchors) else { return (field, report) };
+    let Some(frame) = Frame::new(&spec.anchors, spec.fit.as_ref()) else { return (field, report) };
     // Resolve every asked part before writing any: the length family shares one fold budget
-    // ([`RAMP_BUDGET`]), which needs all their magnitudes up front.
-    let mut asked: Vec<(&'static Part, f64, Shape)> = Vec::new();
+    // ([`RAMP_BUDGET`]) and the slimming family another ([`SHAPE_BUDGET`]), which needs all
+    // their magnitudes up front.
+    let mut asked: Vec<(&'static Part, f64, Shape, Option<&'static str>)> = Vec::new();
     let sliders = spec.sliders.composed();
     for part in PARTS {
         let slider = (part.slider)(&sliders);
         if slider.abs() < 0.5 {
             continue; // the slider is at zero: nothing was asked of this row
         }
-        if !part.needs.iter().all(|&i| frame.visible(i)) {
-            report.skipped.push((part.name, "the pose does not see those landmarks"));
-            continue;
-        }
+        let (confidence, approximate) = match frame.confidence(part.needs) {
+            Ok(found) => found,
+            Err(why) => {
+                // A limb's joint can sit a few pixels outside the matte while its bone runs
+                // inside it (an arm folded behind the head, a calf against a skirt). The
+                // pose must still see the joints; then shape the covered part and say the
+                // row is approximate rather than drop a limb the photo plainly shows.
+                let covered = part.limb().filter(|_| part.needs.iter().all(|&k| frame.visible(k))).and_then(|(i, j)| frame.limb_covered(i, j));
+                if covered.is_some_and(|c| c >= LIMB_COVERED) {
+                    (1.0, Some(COVERED_REASON))
+                } else {
+                    report.skipped.push((part.name, why));
+                    continue;
+                }
+            }
+        };
         let Some(shape) = (part.shape)(&frame) else {
             report.skipped.push((part.name, "the anchors are too close to name an axis"));
             continue;
         };
-        asked.push((part, f64::from(slider / 100.0).clamp(-1.0, 1.0), shape));
+        asked.push((part, f64::from(slider / 100.0).clamp(-1.0, 1.0) * confidence, shape, approximate));
     }
     let budget = RAMP_BUDGET * frame.ramp_width();
-    let ramp_sum: f64 = asked.iter().map(|&(_, k, ref s)| ramp_magnitude(s, k)).sum();
+    let ramp_sum: f64 = asked.iter().map(|&(_, k, ref s, _)| ramp_magnitude(s, k)).sum();
     let ramp_scale = if ramp_sum > budget && ramp_sum > 0.0 { budget / ramp_sum } else { 1.0 };
-    for (part, k, shape) in asked {
-        let Shape::Ramp { .. } = shape else {
-            write_shape(&mut field, &shape, k, None);
-            report.applied.push(part.name);
-            continue;
+    let shape_budget = SHAPE_BUDGET * frame.fit.map_or(frame.person_w(), |fit| fit.max_half().max(24.0));
+    let shape_sum: f64 = asked.iter().map(|&(_, k, ref s, _)| shape_magnitude(s, k)).sum();
+    let shape_scale = if shape_sum > shape_budget && shape_sum > 0.0 { shape_budget / shape_sum } else { 1.0 };
+    // The person clip: a slimming row's envelope is deliberately twice the distance to the
+    // silhouette, so its peak lands on the outline — without a clip the same envelope would
+    // move the background beside the body. The fit's rows are a feathered weight, 1 inside
+    // the person and 0 beyond a short feather; length ramps keep their own lateral plateau
+    // (they must move the silhouette and the background together to avoid a seam).
+    let field_w = field.w;
+    let weights = spec.fit.as_ref().filter(|fit| fit.is_valid()).map(|fit| person_weight(fit, &field));
+    let weight_at = |i: usize, j: usize| weights.as_ref().map_or(1.0, |w| w[j * field_w + i]);
+    for (part, k, shape, approximate) in asked {
+        let k = match &shape {
+            Shape::Contract { .. } | Shape::Radial { .. } => k * shape_scale,
+            Shape::Ramp { .. } => k * ramp_scale,
+            Shape::Shift { .. } => k,
         };
-        write_shape(&mut field, &shape, k * ramp_scale, None);
+        if let Some(why) = approximate {
+            report.approximate.push((part.name, why));
+        }
+        match shape {
+            Shape::Ramp { .. } | Shape::Shift { .. } => write_shape(&mut field, &shape, k, None),
+            Shape::Contract { .. } | Shape::Radial { .. } => write_shape(&mut field, &shape, k, Some(&weight_at)),
+        }
         report.applied.push(part.name);
     }
     (field, report)
@@ -486,9 +752,68 @@ fn ramp_magnitude(s: &Shape, k: f64) -> f64 {
     }
 }
 
+/// A contract/radial's peak |Δ| in pixels, the same currency for the slimming family.
+fn shape_magnitude(s: &Shape, k: f64) -> f64 {
+    match *s {
+        Shape::Contract { width, gain, .. } => gain.abs() * k.abs() * width * 0.35,
+        Shape::Radial { radius, gain, .. } => gain.abs() * k.abs() * radius * 0.35,
+        _ => 0.0,
+    }
+}
+
+/// The per-node person weight from the fit's silhouette rows: 1 well inside, 0 beyond a
+/// feather outside the nearest run, with a smoothstep in between. Vertical distance counts
+/// beyond the silhouette's top and bottom; between rows the nearest row's runs stand in, and
+/// the feather hides the step.
+fn person_weight(fit: &BodyFit, field: &LiquifyField) -> Vec<f32> {
+    let mut out = vec![1.0f32; field.w * field.h];
+    let (Some(first), Some(last)) = (fit.rows.first(), fit.rows.last()) else { return out };
+    let height = (last.y - first.y) as f64;
+    let feather = (0.02 * height).clamp(4.0, 24.0);
+    // Rows and field node rows are both ordered by y, so the nearest row is found by one
+    // forward cursor instead of a scan per node — a 24 MP field is a million nodes.
+    let mut near = 0usize;
+    for j in 0..field.h {
+        let y = field.node_pos(0, j)[1];
+        while near + 1 < fit.rows.len() {
+            let here = (f64::from(fit.rows[near].y) - y).abs();
+            let next = (f64::from(fit.rows[near + 1].y) - y).abs();
+            if next < here {
+                near += 1;
+            } else {
+                break;
+            }
+        }
+        let row = &fit.rows[near];
+        let dy = if y < f64::from(first.y) {
+            f64::from(first.y) - y
+        } else if y > f64::from(last.y) {
+            y - f64::from(last.y)
+        } else {
+            0.0
+        };
+        for i in 0..field.w {
+            let x = field.node_pos(i, j)[0];
+            let mut dx = f64::INFINITY;
+            for run in &row.runs {
+                let (x0, x1) = (f64::from(run[0]), f64::from(run[1]));
+                if x >= x0 && x <= x1 {
+                    dx = 0.0;
+                    break;
+                }
+                dx = dx.min((x - x0).abs().min((x - x1).abs()));
+            }
+            let dist = dx.hypot(dy);
+            out[j * field.w + i] = (1.0 - smoothstep(0.0, feather, dist)) as f32;
+        }
+    }
+    out
+}
+
 /// A per-node weight a part's displacement is multiplied by, as `(i, j) -> 0..=1`: the face
-/// table's clip to the face oval and its protection of the eyes and lips. The body passes
-/// `None` — its parts are bounded by their own falloff.
+/// table's clip to the face oval and its protection of the eyes and lips, and the body's
+/// feathered clip to the fitted person silhouette. Length ramps pass `None`: their plateau
+/// must carry the silhouette and the background together.
 pub(crate) type NodeWeight<'a> = &'a dyn Fn(usize, usize) -> f32;
 
 /// The field one part writes into and the weight it writes through — the pair every
@@ -767,7 +1092,53 @@ mod tests {
     }
 
     fn spec(sliders: SculptSliders) -> SculptSpec {
-        SculptSpec { sliders, anchors: standing() }
+        SculptSpec { sliders, anchors: standing(), fit: None }
+    }
+
+    /// A person fit for [`standing`]: a silhouette a little wider than the joint centres, the
+    /// levels measured off it, and each limb's half-thickness. The rows carry the arms as
+    /// their own runs, as a real mask does.
+    fn fitted() -> BodyFit {
+        let a = standing();
+        let arm = |y: f32| -> (f32, f32) {
+            let t = ((y - 180.0) / 192.0).clamp(0.0, 1.0);
+            (a.pose[11][0] + (a.pose[15][0] - a.pose[11][0]) * t, a.pose[12][0] + (a.pose[16][0] - a.pose[12][0]) * t)
+        };
+        let rows = (120..=700)
+            .step_by(20)
+            .map(|y| {
+                let half = 60.0 + (y - 120) as f32 * 0.06;
+                let mut runs = vec![[257.0 - half, 257.0 + half]];
+                if (180..=372).contains(&y) {
+                    let (l, r) = arm(y as f32);
+                    runs.push([l - 26.0, l + 26.0]);
+                    runs.push([r - 26.0, r + 26.0]);
+                }
+                BodyRow { y: y as f32, runs }
+            })
+            .collect();
+        BodyFit {
+            rows,
+            waist: LevelFit { t: 0.525, left: 70.0, right: 76.0 },
+            belly: LevelFit { t: 0.70, left: 80.0, right: 86.0 },
+            hip: LevelFit { t: 1.0, left: 90.0, right: 96.0 },
+            bust: LevelFit { t: 0.30, left: 60.0, right: 66.0 },
+            limbs: [
+                LimbFit { radius: 22.0, t0: 0.05, t1: 0.95 },
+                LimbFit { radius: 18.0, t0: 0.05, t1: 0.95 },
+                LimbFit { radius: 22.0, t0: 0.05, t1: 0.95 },
+                LimbFit { radius: 18.0, t0: 0.05, t1: 0.95 },
+                LimbFit { radius: 40.0, t0: 0.05, t1: 0.95 },
+                LimbFit { radius: 40.0, t0: 0.05, t1: 0.95 },
+                LimbFit { radius: 26.0, t0: 0.05, t1: 0.95 },
+                LimbFit { radius: 26.0, t0: 0.05, t1: 0.95 },
+            ],
+            inside: vec![true; POSE_COUNT],
+        }
+    }
+
+    fn fitted_spec(sliders: SculptSliders) -> SculptSpec {
+        SculptSpec { sliders, anchors: standing(), fit: Some(fitted()) }
     }
 
     fn build(sliders: SculptSliders) -> (LiquifyField, SculptReport) {
@@ -873,12 +1244,150 @@ mod tests {
     }
 
     #[test]
+    fn the_fitted_waist_pulls_the_measured_contour_in_and_the_background_stays() {
+        let (field, report) = sculpt_field(&fitted_spec(SculptSliders { waist: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        assert!(report.applied.contains(&"waist"), "{report:?}");
+        // The measured waist contour at 76 px from the axis: the fitted envelope reaches
+        // past it, so the rim moves (the old joint-spacing width stopped short of it).
+        let rim = field.sample(326.0, 295.0);
+        assert!(rim[0] > 1.0, "the fitted waist must pull its own contour in: {rim:?}");
+        // Outside the silhouette but inside the envelope, the feathered person clip keeps
+        // the background still; without it this point moves with the contract.
+        let background = field.sample(150.0, 295.0);
+        assert!(background[0].abs() < 0.05 && background[1].abs() < 0.05, "the background stays: {background:?}");
+    }
+
+    #[test]
+    fn the_fitted_levels_land_on_their_measured_rows() {
+        let belly = sculpt_field(&fitted_spec(SculptSliders { belly: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let waist = sculpt_field(&fitted_spec(SculptSliders { waist: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let at_belly = belly.sample(300.0, 334.0);
+        assert!(at_belly[0] > 1.0, "the belly must pull its measured row in: {at_belly:?}");
+        assert!(waist.sample(300.0, 334.0)[0].abs() < 0.5, "the waist band must not reach the belly row");
+        // The hips expand on the joint line, not on a skirt's widest hem row.
+        let hips = sculpt_field(&fitted_spec(SculptSliders { hips: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let hip = hips.sample(330.0, 400.0);
+        assert!(hip[0] < -1.0, "the hips must push their own contour out: {hip:?}");
+        let bust = sculpt_field(&fitted_spec(SculptSliders { bust: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let chest = bust.sample(320.0, 246.0);
+        assert!(chest[0] < -1.0, "the bust must push the chest out: {chest:?}");
+    }
+
+    #[test]
+    fn the_fitted_limbs_pull_their_own_surface_in() {
+        let (field, report) = sculpt_field(&fitted_spec(SculptSliders { arms: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        assert_eq!(report.applied.len(), 4, "{:?}", report.applied);
+        let arm = field.sample(176.0, 228.0);
+        assert!(arm[0] < -1.0, "the upper arm's own rim must pull toward its bone: {arm:?}");
+        let thigh = sculpt_field(&fitted_spec(SculptSliders { thighs: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let leg = thigh.sample(184.0, 470.0);
+        assert!(leg[0] < -1.0, "the thigh's own rim must pull toward its bone: {leg:?}");
+    }
+
+    #[test]
+    fn the_fitted_slim_body_needs_no_ankles() {
+        let mut anchors = standing();
+        for i in [27usize, 28] {
+            anchors.pose[i][2] = 0.0;
+        }
+        let spec = SculptSpec { sliders: SculptSliders { slim_body: 100.0, ..SculptSliders::default() }, anchors, fit: Some(fitted()) };
+        let (field, report) = sculpt_field(&spec, bounds(), CELL);
+        assert!(report.applied.contains(&"slim body"), "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let rim = field.sample(320.0, 300.0);
+        assert!(rim[0] > 1.0, "the fitted slim body must pull the torso contour in: {rim:?}");
+    }
+
+    #[test]
+    fn an_occluded_joint_inside_the_silhouette_runs_reduced_and_says_so() {
+        let mut anchors = standing();
+        anchors.pose[25][2] = 0.2; // the left knee: barely seen, but the mask contains it
+        let visible = sculpt_field(&fitted_spec(SculptSliders { thighs: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let spec = SculptSpec { sliders: SculptSliders { thighs: 100.0, ..SculptSliders::default() }, anchors, fit: Some(fitted()) };
+        let (field, report) = sculpt_field(&spec, bounds(), CELL);
+        assert!(report.applied.contains(&"left thigh"), "{:?}", report.applied);
+        assert!(report.approximate.iter().any(|(n, _)| *n == "left thigh"), "{:?}", report.approximate);
+        let occluded = field.sample(184.0, 470.0)[0].abs();
+        let full = visible.sample(184.0, 470.0)[0].abs();
+        assert!(occluded > 0.0 && occluded < full, "the occluded knee runs at reduced strength: {occluded:.2} vs {full:.2}");
+    }
+
+    #[test]
+    fn a_joint_outside_a_mostly_uncovered_limb_skips_its_row_with_the_reason() {
+        let mut fit = fitted();
+        fit.inside[25] = false;
+        fit.limbs[4].t1 = 0.30; // the knee is off the matte and most of the bone with it
+        let spec = SculptSpec { sliders: SculptSliders { thighs: 100.0, ..SculptSliders::default() }, anchors: standing(), fit: Some(fit) };
+        let (_, report) = sculpt_field(&spec, bounds(), CELL);
+        let why = report.skipped.iter().find(|(n, _)| *n == "left thigh").map(|(_, w)| *w);
+        assert_eq!(why, Some("the landmark is outside the person silhouette"));
+        assert!(report.applied.contains(&"right thigh"), "{:?}", report.applied);
+    }
+
+    /// The matte can miss a joint by a few pixels while the limb's bone still runs through
+    /// the person — an arm folded behind the head against the hair. The visible limb must
+    /// still slim, over the covered part of its bone, and the report must say it is inferred.
+    #[test]
+    fn a_limb_joint_just_outside_the_matte_still_shapes_its_covered_part() {
+        let mut fit = fitted();
+        fit.inside[25] = false; // the left knee, just off the silhouette
+        let spec = SculptSpec { sliders: SculptSliders { thighs: 100.0, ..SculptSliders::default() }, anchors: standing(), fit: Some(fit) };
+        let (field, report) = sculpt_field(&spec, bounds(), CELL);
+        assert!(report.applied.contains(&"left thigh"), "{report:?}");
+        assert!(report.skipped.iter().all(|(n, _)| *n != "left thigh"), "{report:?}");
+        assert!(report.approximate.iter().any(|(n, why)| *n == "left thigh" && why.contains("covered part")), "{report:?}");
+        let rim = field.sample(184.0, 470.0);
+        assert!(rim[0].abs() > 1.0, "the covered thigh surface must still move: {rim:?}");
+    }
+
+    #[test]
+    fn an_invalid_fit_is_ignored_not_trusted() {
+        let mut bad = fitted();
+        bad.rows.clear();
+        let sliders = SculptSliders { waist: 100.0, ..SculptSliders::default() };
+        let a = sculpt_field(&SculptSpec { sliders, anchors: standing(), fit: Some(bad) }, bounds(), CELL).0;
+        let b = build(SculptSliders { waist: 100.0, ..SculptSliders::default() }).0;
+        assert_eq!(a, b, "a malformed fit must fall back to the joint spacing");
+    }
+
+    #[test]
+    fn the_fitted_slimming_stack_does_not_fold() {
+        let sliders = SculptSliders {
+            slim_body: 100.0,
+            waist: 100.0,
+            belly: 100.0,
+            arms: 100.0,
+            thighs: 100.0,
+            calves: 100.0,
+            shoulders: 100.0,
+            hips: 100.0,
+            bust: 100.0,
+            head_size: 100.0,
+            neck: 100.0,
+            height: 100.0,
+            leg_length: 100.0,
+            waist_length: 100.0,
+            torso_length: 100.0,
+            neck_length: 100.0,
+            straight_shoulders: 100.0,
+            swan_neck: 100.0,
+            bust_lift: 100.0,
+            double_chin: 100.0,
+            ai_sculpt: 100.0,
+        };
+        let (field, report) = sculpt_field(&fitted_spec(sliders), bounds(), CELL);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let step = max_adjacent_step(&field);
+        assert!(step < CELL, "adjacent nodes step {step:.2}px past the {CELL}px cell — the fitted stack folds");
+    }
+
+    #[test]
     fn hidden_shoulders_skip_their_rows_and_say_why() {
         let mut anchors = standing();
         for i in [11usize, 12] {
             anchors.pose[i][2] = 0.1;
         }
-        let s = SculptSpec { sliders: SculptSliders { shoulders: 50.0, arms: 50.0, head_size: 50.0, ..SculptSliders::default() }, anchors };
+        let s = SculptSpec { sliders: SculptSliders { shoulders: 50.0, arms: 50.0, head_size: 50.0, ..SculptSliders::default() }, anchors, fit: None };
         let (_, report) = sculpt_field(&s, bounds(), CELL);
         let skipped: Vec<_> = report.skipped.iter().map(|(n, _)| *n).collect();
         assert!(skipped.contains(&"shoulders") && skipped.contains(&"left upper arm"), "{skipped:?}");

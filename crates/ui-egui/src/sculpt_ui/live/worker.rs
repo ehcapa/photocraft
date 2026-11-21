@@ -36,10 +36,12 @@ pub(crate) struct Frame {
     pub image: ColorImage,
 }
 
-/// The panel's opening analysis: the anchors Apply will carry, plus Face Sculpt's quality
-/// reading (where the face box came from and the mesh's geometry).
+/// The panel's opening analysis: the anchors Apply will carry, the measured body fit (Body
+/// only), plus Face Sculpt's quality reading (where the face box came from and the mesh's
+/// geometry).
 pub(crate) struct Analysis {
     pub anchors: Value,
+    pub fit: Option<Value>,
     pub contour: Option<Value>,
     pub quality: Option<Value>,
     /// The layer whose own pixels were sampled, or `None` when the analysis read the flattened
@@ -103,7 +105,7 @@ pub(crate) struct AnalysisJob {
 pub(crate) fn analyze(job: &AnalysisJob, ctx: &JobCtx) -> Result<Output, String> {
     let found = photocraft_engine::portrait_cmds::analyze_anchors(&job.doc, Some(job.layer), false, job.kind, job.roi, ctx).map_err(|e| e.to_string())?;
     let contour = found.contour.map(serde_json::to_value).transpose().map_err(|e| format!("the contour would not serialise: {e}"))?;
-    Ok(Output::Analysis(Analysis { anchors: found.anchors, contour, quality: found.quality, layer: Some(job.layer.0) }))
+    Ok(Output::Analysis(Analysis { anchors: found.anchors, fit: found.fit, contour, quality: found.quality, layer: Some(job.layer.0) }))
 }
 
 /// `new` over `old` (premultiplied) by coverage `c`, as the engine mixes the committed warp

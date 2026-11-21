@@ -13,7 +13,10 @@
 
 use photocraft_algo::contour;
 use photocraft_algo::liquify::{LiquifyField, apply_liquify, auto_cell};
-use photocraft_algo::sculpt::{SYMMETRY_PAIRS, SculptAnchors, SculptHead, SculptReport, SculptSliders, SculptSpec, sculpt_field};
+use photocraft_algo::sculpt::{
+    BodyFit, BodyRow, LIMB_SEGMENTS, LevelFit, LimbFit, POSE_COUNT, SYMMETRY_PAIRS, SculptAnchors, SculptHead, SculptReport, SculptSliders, SculptSpec,
+    sculpt_field,
+};
 use photocraft_doc::LayerContent;
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
@@ -87,7 +90,17 @@ fn cell(p: &Value, canvas: Rect) -> Result<f64> {
 /// command never stored.
 fn stored_spec(p: &Value, canvas: Rect) -> Option<(SculptSpec, f64)> {
     let anchors: SculptAnchors = serde_json::from_value(p.get("anchors")?.clone()).ok()?;
-    Some((SculptSpec { sliders: sliders(p).ok()?, anchors }, cell(p, canvas).ok()?))
+    Some((SculptSpec { sliders: sliders(p).ok()?, anchors, fit: fit_of(p) }, cell(p, canvas).ok()?))
+}
+
+/// The person-mask fit `portrait.analyze` computed, when the params carry one. A malformed
+/// fit is ignored rather than trusted: the parts fall back to joint spacing, exactly as an
+/// older stored filter does.
+fn fit_of(p: &Value) -> Option<BodyFit> {
+    match p.get("fit") {
+        None | Some(Value::Null) => None,
+        Some(v) => serde_json::from_value::<BodyFit>(v.clone()).ok().filter(BodyFit::is_valid),
+    }
 }
 
 /// The params' own anchors — the panel's one analysis (`portrait.analyze`), or a script's.
@@ -176,6 +189,250 @@ pub(crate) fn person_contour(mask: &Surface) -> Option<Vec<[f64; 2]>> {
     Some(left)
 }
 
+/// The person silhouette fitted to the body: the torso's waist, belly, hip and bust levels,
+/// each limb's thickness at its bone, and the mask rows the field clips to. This is what makes
+/// the slimming rows act on the visible outline instead of somewhere inside it: a part's
+/// width is set to twice its distance to the silhouette, so the field's peak lands on the
+/// outline, and the fit's `inside` flags let an occluded joint that still lies within the
+/// person run at reduced strength instead of being skipped. Coordinates are document pixels;
+/// the work runs on at most a 1600 px copy, which is plenty for a field whose cells are
+/// several pixels.
+pub fn body_fit(anchors: &SculptAnchors, mask: &Surface) -> Option<BodyFit> {
+    if anchors.pose.len() != POSE_COUNT {
+        return None;
+    }
+    let b = mask.content_bounds();
+    if b.width() < 8 || b.height() < 16 {
+        return None;
+    }
+    let scale = (b.width().max(b.height()) as usize).div_ceil(1600).max(1);
+    let fw = (b.width() as usize).div_ceil(scale);
+    let fh = (b.height() as usize).div_ceil(scale);
+    let n = fw.checked_mul(fh)?;
+    if n == 0 {
+        return None;
+    }
+    let mut inside = vec![false; n];
+    for y in 0..fh {
+        let sy = b.y0 + (y * scale) as i32 + (scale / 2) as i32;
+        for x in 0..fw {
+            let sx = b.x0 + (x * scale) as i32 + (scale / 2) as i32;
+            inside[y * fw + x] = mask.sample_channel(sx, sy, 0) > 0.5;
+        }
+    }
+    if !inside.iter().any(|v| *v) {
+        return None;
+    }
+    // Distance from every body pixel to the nearest background: at a bone, that is the limb's
+    // half-thickness, and it survives an arm touching the torso (the nearest edge is the arm's).
+    let outside: Vec<bool> = inside.iter().map(|v| !v).collect();
+    let dist = photocraft_algo::selection::edt(&outside, fw, fh);
+    if dist.len() != n {
+        return None;
+    }
+
+    // The mask rows the field clips to, and the same rows in the reduced grid for the fit.
+    let step = (fh / 160).max(1);
+    let mut rows = Vec::with_capacity(160);
+    let mut local: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(160);
+    let mut y = 0;
+    while y < fh {
+        let Some(row) = inside.get(y * fw..(y + 1) * fw) else { break };
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut x = 0;
+        while x < fw {
+            if !row.get(x).copied().unwrap_or(false) {
+                x += 1;
+                continue;
+            }
+            let x0 = x;
+            while x < fw && row.get(x).copied().unwrap_or(false) {
+                x += 1;
+            }
+            if x - x0 >= 2 {
+                runs.push((x0, x - 1));
+            }
+        }
+        if !runs.is_empty() {
+            let doc_y = b.y0 + (y * scale) as i32;
+            rows.push(BodyRow {
+                y: doc_y as f32 + scale as f32 * 0.5,
+                runs: runs.iter().map(|&(x0, x1)| [(b.x0 + (x0 * scale) as i32) as f32, (b.x0 + ((x1 + 1) * scale) as i32) as f32]).collect(),
+            });
+            local.push((y, runs));
+        }
+        y += step;
+    }
+    if rows.len() < 6 {
+        return None;
+    }
+
+    let pose = |i: usize| {
+        anchors
+            .pose
+            .get(i)
+            .map(|q| [(f64::from(q[0]) - f64::from(b.x0)) / scale as f64, (f64::from(q[1]) - f64::from(b.y0)) / scale as f64])
+            .unwrap_or([0.0, 0.0])
+    };
+    let shoulder = [(pose(11)[0] + pose(12)[0]) * 0.5, (pose(11)[1] + pose(12)[1]) * 0.5];
+    let hip = [(pose(23)[0] + pose(24)[0]) * 0.5, (pose(23)[1] + pose(24)[1]) * 0.5];
+    let ab = [hip[0] - shoulder[0], hip[1] - shoulder[1]];
+    let ab2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if ab2 < 1.0 {
+        return None;
+    }
+    let axis_x = |yl: f64| if ab[1].abs() > 1e-6 { shoulder[0] + (yl - shoulder[1]) * ab[0] / ab[1] } else { shoulder[0] };
+    let t_of = |yl: f64| {
+        let x = axis_x(yl);
+        ((x - shoulder[0]) * ab[0] + (yl - shoulder[1]) * ab[1]) / ab2
+    };
+
+    // The torso's own width profile: the run that holds the axis, at each sampled row.
+    let mut profile: Vec<(f64, f64, f64)> = Vec::with_capacity(local.len());
+    for &(yl, ref runs) in &local {
+        let t = t_of(yl as f64);
+        if !(-0.20..=1.25).contains(&t) {
+            continue;
+        }
+        let ax = axis_x(yl as f64);
+        let Some(&(x0, x1)) = runs.iter().find(|&&(x0, x1)| ax >= x0 as f64 && ax <= x1 as f64 + 1.0) else { continue };
+        let (l, r) = (ax - x0 as f64, x1 as f64 + 1.0 - ax);
+        if l >= 2.0 && r >= 2.0 {
+            profile.push((t, l, r));
+        }
+    }
+    if profile.len() < 6 {
+        return None;
+    }
+    let smooth = |v: &[f64]| -> Vec<f64> {
+        (0..v.len())
+            .map(|i| {
+                let (a, b) = (i.saturating_sub(2), (i + 3).min(v.len()));
+                v.get(a..b).map_or(0.0, |s| s.iter().sum::<f64>() / (b - a).max(1) as f64)
+            })
+            .collect()
+    };
+    let ts: Vec<f64> = profile.iter().map(|p| p.0).collect();
+    let ls = smooth(&profile.iter().map(|p| p.1).collect::<Vec<_>>());
+    let rs = smooth(&profile.iter().map(|p| p.2).collect::<Vec<_>>());
+    let profile: Vec<(f64, f64, f64)> = ts.iter().zip(&ls).zip(&rs).map(|((&t, &l), &r)| (t, l, r)).collect();
+    // The narrowest row, taken as the middle of the rows within a hair of it: a flat waist
+    // plateau should not put the level on its first row.
+    let narrowest = |lo: f64, hi: f64| -> Option<(f64, f64, f64)> {
+        let rows: Vec<(f64, f64, f64)> = profile.iter().copied().filter(|&(t, _, _)| t >= lo && t <= hi).collect();
+        let min = rows.iter().map(|p| p.1 + p.2).min_by(f64::total_cmp)?;
+        let band: Vec<(f64, f64, f64)> = rows.iter().copied().filter(|p| p.1 + p.2 <= min * 1.02 + 1.0).collect();
+        band.get(band.len() / 2).copied()
+    };
+    let near = |t: f64| -> (f64, f64, f64) { profile.iter().copied().min_by(|a, b| (a.0 - t).abs().total_cmp(&(b.0 - t).abs())).unwrap_or((t, 24.0, 24.0)) };
+    let width_at = |t: f64| {
+        let p = near(t);
+        p.1 + p.2
+    };
+
+    // The waist is a crease in the silhouette, not simply its narrowest row: a loose dress or
+    // a straight-cut coat tapers all the way into its hem, so "narrowest" would put the waist
+    // on the hips and the waist slider would squeeze the top of the skirt. The row counts
+    // only when it is also measurably narrower than the torso at 35% and at 90% of the
+    // shoulder→hip span; otherwise the anatomical middle stands in. The bust is anatomical too, near a
+    // third of the way down: above that the arms merge with the chest, so "widest above the
+    // waist" always returns the armpit, not the bust. The belly sits between the measured
+    // waist and the hip joints, and the hips are the joints' own row — a skirt's widest hem
+    // is not the body.
+    let crease = narrowest(0.40, 0.80).filter(|&(_, l, r)| {
+        let w = l + r;
+        let margin = (0.01 * w).max(2.0);
+        w + margin < width_at(0.35) && w + margin < width_at(0.90)
+    });
+    let mut waist = crease.unwrap_or_else(|| near(0.62));
+    let bust = near(0.30f64.min(waist.0 - 0.10));
+    if bust.0 >= waist.0 {
+        // No room above the waist for the bust: the waist measurement is suspect, so the
+        // anatomical middle takes over and the bust keeps its third.
+        waist = near(0.62f64.max(bust.0 + 0.10));
+    }
+    let belly = near((waist.0 + 1.0) * 0.5);
+    let hip = near(1.0);
+    waist.0 = waist.0.clamp(0.04, 1.02);
+    let level = |p: (f64, f64, f64)| LevelFit { t: p.0 as f32, left: (p.1 * scale as f64) as f32, right: (p.2 * scale as f64) as f32 };
+
+    // Each limb: the mask's thickness at its bone and the fraction of the bone the mask covers.
+    let mut limbs = [LimbFit::default(); LIMB_SEGMENTS.len()];
+    for (idx, &(i, j)) in LIMB_SEGMENTS.iter().enumerate() {
+        let a = pose(i);
+        let c = pose(j);
+        let len = (c[0] - a[0]).hypot(c[1] - a[1]);
+        if len < 4.0 {
+            continue;
+        }
+        let mut radii: Vec<f64> = Vec::new();
+        let mut span: Vec<f64> = Vec::new();
+        for k in 0..=20 {
+            let t = 0.02 + 0.96 * f64::from(k) / 20.0;
+            let x = a[0] + (c[0] - a[0]) * t;
+            let y = a[1] + (c[1] - a[1]) * t;
+            let (xi, yi) = (x.round() as isize, y.round() as isize);
+            if xi < 0 || yi < 0 || xi as usize >= fw || yi as usize >= fh {
+                continue;
+            }
+            let at = yi as usize * fw + xi as usize;
+            if !inside.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            span.push(t);
+            if (0.25..=0.75).contains(&t)
+                && let Some(&d) = dist.get(at)
+                && d.is_finite()
+                && d > 1.0
+                && d < 1.0e8
+            {
+                radii.push(f64::from(d));
+            }
+        }
+        let (Some(&t0), Some(&t1)) = (span.first(), span.last()) else { continue };
+        if t1 - t0 < 0.10 {
+            continue;
+        }
+        radii.sort_by(f64::total_cmp);
+        let cap = match idx {
+            0 | 2 => 0.30 * len,
+            1 | 3 => 0.26 * len,
+            4 | 5 => 0.36 * len,
+            _ => 0.28 * len,
+        };
+        let floor = (0.10 * len).max(3.0).min(cap);
+        let median = radii.get(radii.len() / 2).copied().unwrap_or(0.0);
+        let radius = if median > 0.0 { median.clamp(floor, cap) } else { 0.0 };
+        limbs[idx] = LimbFit { radius: (radius * scale as f64) as f32, t0: t0 as f32, t1: t1 as f32 };
+    }
+
+    let mut joint_inside = vec![false; POSE_COUNT];
+    for (i, flag) in joint_inside.iter_mut().enumerate() {
+        if let Some(q) = anchors.pose.get(i) {
+            let x = (f64::from(q[0]) - f64::from(b.x0)) / scale as f64;
+            let y = (f64::from(q[1]) - f64::from(b.y0)) / scale as f64;
+            *flag = inside_near(&inside, fw, fh, x, y, 2);
+        }
+    }
+
+    Some(BodyFit { rows, waist: level(waist), belly: level(belly), hip: level(hip), bust: level(bust), limbs, inside: joint_inside })
+}
+
+/// Whether `(x, y)` or a small neighbourhood around it is inside `mask`; the tolerance keeps a
+/// joint on the silhouette's own edge (a wrist, an ankle) from reading as outside it.
+fn inside_near(mask: &[bool], w: usize, h: usize, x: f64, y: f64, r: isize) -> bool {
+    let (cx, cy) = (x.round() as isize, y.round() as isize);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (px, py) = (cx + dx, cy + dy);
+            if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h && mask.get(py as usize * w + px as usize).copied().unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The symmetry amount (对称液化·上半身, one-directional 0..100).
 fn symmetry_of(p: &Value) -> f32 {
     p.get("symmetry").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0) as f32
@@ -202,16 +459,7 @@ fn stamp_contour(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64
 /// The field every path builds: the slider warp, the symmetry pair alignment and the
 /// contour relaxation. Apply, the smart-filter replay and the panel's live preview all call
 /// it with the same values, so the field they show cannot drift from the one they commit.
-fn field_with(
-    values: SculptSliders,
-    anchors: &SculptAnchors,
-    contour: Option<&[[f64; 2]]>,
-    symmetry: f32,
-    smooth: f32,
-    canvas: Rect,
-    cell: f64,
-) -> (LiquifyField, SculptReport) {
-    let spec = SculptSpec { sliders: values, anchors: anchors.clone() };
+fn field_with(spec: SculptSpec, contour: Option<&[[f64; 2]]>, symmetry: f32, smooth: f32, canvas: Rect, cell: f64) -> (LiquifyField, SculptReport) {
     let (mut field, mut report) = sculpt_field(&spec, canvas, cell);
     // 对称液化·上半身: the paired joints align toward each other's mirror about the
     // torso axis — pure geometry of the stored joints, replayed for free.
@@ -253,7 +501,8 @@ pub fn field_for(p: &Value, canvas: Rect) -> Result<(LiquifyField, SculptReport)
     let values = sliders(p)?;
     let anchors = anchors_from_params(p)?.ok_or_else(|| bad("`anchors` are required here — `portrait.analyze` supplies them"))?;
     let cell = cell(p, canvas)?;
-    Ok(field_with(values, &anchors, contour_of(p).as_deref(), symmetry_of(p), smooth_of(p), canvas, cell))
+    let spec = SculptSpec { sliders: values, anchors, fit: fit_of(p) };
+    Ok(field_with(spec, contour_of(p).as_deref(), symmetry_of(p), smooth_of(p), canvas, cell))
 }
 
 /// The one lightweight analysis a run without anchors needs: the person mask and the
@@ -284,6 +533,7 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     // Without them (a script, an action) one lightweight analysis answers the pose — never
     // the full Smart Portrait pipeline.
     let explicit = anchors_from_params(p)?;
+    let mut fit = fit_of(p);
     let (anchors, mut analysis) = match explicit {
         Some(anchors) => (anchors, None),
         None => {
@@ -308,7 +558,17 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         None
     };
-    let (field, report) = field_with(values, &anchors, contour.as_deref(), symmetry, smooth, canvas, cell);
+    // The fit is what turns joint spacing into the visible silhouette. The panel sends it with
+    // the anchors; a script that sent anchors alone gets the joint-spacing fallback (no
+    // analysis on Apply), and the analysis path above already has the mask to measure it.
+    if fit.is_none()
+        && let Some(a) = &analysis
+        && let Some(mask) = a.mask(photocraft_portrait::Region::Person)
+    {
+        fit = body_fit(&anchors, mask);
+    }
+    let spec = SculptSpec { sliders: values, anchors: anchors.clone(), fit: fit.clone() };
+    let (field, report) = field_with(spec, contour.as_deref(), symmetry, smooth, canvas, cell);
     let smart = matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Smart(_)));
     if field.is_identity() && !smart {
         return Ok(json!({"layer": id.0, "changed": false, "parts": parts(&report)}));
@@ -318,6 +578,9 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let mut stored = p.clone();
     if let Value::Object(m) = &mut stored {
         m.insert("anchors".into(), serde_json::to_value(&anchors).map_err(|e| bad(format!("the anchors would not serialise: {e}")))?);
+        if let Some(fit) = &fit {
+            m.insert("fit".into(), serde_json::to_value(fit).map_err(|e| bad(format!("the body fit would not serialise: {e}")))?);
+        }
         if let Some(pts) = &contour {
             m.insert("contour".into(), serde_json::to_value(pts).map_err(|e| bad(format!("the contour would not serialise: {e}")))?);
         }
@@ -349,6 +612,7 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
 fn parts(report: &photocraft_algo::sculpt::SculptReport) -> Value {
     json!({
         "applied": report.applied,
+        "approximate": report.approximate.iter().map(|(name, why)| json!({"part": name, "why": why})).collect::<Vec<_>>(),
         "skipped": report.skipped.iter().map(|(name, why)| json!({"part": name, "why": why})).collect::<Vec<_>>(),
     })
 }
@@ -356,7 +620,7 @@ fn parts(report: &photocraft_algo::sculpt::SculptReport) -> Value {
 /// Smart-filter hook: re-applies a stored Body Sculpt to a rendered smart object.
 pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> Option<Surface> {
     let (spec, cell) = stored_spec(params, canvas)?;
-    let (field, _) = field_with(spec.sliders, &spec.anchors, contour_of(params).as_deref(), symmetry_of(params), smooth_of(params), canvas, cell);
+    let (field, _) = field_with(spec, contour_of(params).as_deref(), symmetry_of(params), smooth_of(params), canvas, cell);
     Some(apply_liquify(surf, &field))
 }
 
@@ -420,6 +684,144 @@ mod tests {
 
     fn pixels(s: &Session, w: i32, h: i32) -> Vec<f32> {
         s.active().unwrap().doc.layers[0].surface().unwrap().read_region(Rect::new(0, 0, w, h))
+    }
+
+    /// A synthetic person mask on a 256×384 canvas: head, a torso that narrows at the waist
+    /// and widens at the hips, two arms and two legs, each its own run. The anchors below sit
+    /// on it, so [`body_fit`] has a known silhouette to measure.
+    fn body_mask() -> Surface {
+        let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        m.fill_rect(Rect::new(0, 0, 256, 384), &[0.0]);
+        for (x0, x1, y0, y1) in [
+            (110, 146, 40, 85),   // head
+            (90, 166, 90, 110),   // shoulders
+            (96, 160, 110, 150),  // chest
+            (104, 152, 150, 180), // waist
+            (94, 162, 180, 210),  // hips
+            (104, 122, 210, 345), // left leg
+            (134, 152, 210, 345), // right leg
+            (72, 88, 90, 170),    // left arm
+            (168, 184, 90, 170),  // right arm
+        ] {
+            m.fill_rect(Rect::new(x0, y0, x1, y1), &[1.0]);
+        }
+        m
+    }
+
+    fn body_anchors() -> SculptAnchors {
+        let mut pose = vec![[0.0f32; 3]; photocraft_algo::sculpt::POSE_COUNT];
+        for &(i, x, y) in &[
+            (0usize, 10.0, 10.0), // the nose: off the mask, as a stray pose point
+            (11, 80.0, 95.0),
+            (12, 176.0, 95.0),
+            (13, 80.0, 130.0),
+            (14, 176.0, 130.0),
+            (15, 80.0, 165.0),
+            (16, 176.0, 165.0),
+            (23, 112.0, 200.0),
+            (24, 144.0, 200.0),
+            (25, 114.0, 265.0),
+            (26, 142.0, 265.0),
+            (27, 115.0, 340.0),
+            (28, 142.0, 340.0),
+        ] {
+            pose[i] = [x as f32, y as f32, 1.0];
+        }
+        SculptAnchors { doc: [256.0, 384.0], pose, head: SculptHead { centre: [128.0, 62.0], radius: 22.0 }, chin: [128.0, 86.0] }
+    }
+
+    #[test]
+    fn body_fit_measures_the_mask_silhouette() {
+        let fit = body_fit(&body_anchors(), &body_mask()).expect("the synthetic person fits");
+        assert!(fit.is_valid(), "{fit:?}");
+        // The torso levels land in order on the mask's own narrow and wide rows.
+        assert!(fit.bust.t < fit.waist.t && fit.waist.t < fit.belly.t && fit.belly.t < fit.hip.t, "{fit:?}");
+        assert!((fit.waist.t - 0.75).abs() < 0.15, "the waist row is the mask's narrowest: {:.2}", fit.waist.t);
+        assert!((fit.waist.left - 24.0).abs() < 3.0, "the waist half-width is the mask's: {:.1}", fit.waist.left);
+        assert!((fit.hip.left - 34.0).abs() < 3.0, "the hip half-width is the mask's: {:.1}", fit.hip.left);
+        assert!((fit.hip.t - 1.0).abs() < 0.1, "the hips sit on the hip joints: {:.2}", fit.hip.t);
+        // Each limb's radius is its drawn half-thickness, not its bone length.
+        for (idx, want) in [(0usize, 8.0f32), (2, 8.0), (4, 9.0), (6, 8.0)] {
+            let r = fit.limbs[idx].radius;
+            assert!((r - want).abs() < 2.5, "limb {idx} radius {r:.1}, drew {want:.1}");
+        }
+        // Joints on the body are inside; a stray pose point off it is not.
+        assert!(fit.inside[11] && fit.inside[23] && fit.inside[27], "{:?}", fit.inside);
+        assert!(!fit.inside[0], "the nose off the mask must read outside");
+        assert!(fit.rows.iter().any(|r| r.runs.len() >= 2), "the arms are their own runs");
+    }
+
+    /// The same person in a dress that narrows all the way to its hem: the silhouette has no
+    /// waist crease, only a taper that ends in the hips.
+    fn tapered_mask() -> Surface {
+        let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        m.fill_rect(Rect::new(0, 0, 256, 384), &[0.0]);
+        for (x0, x1, y0, y1) in [
+            (110, 146, 40, 85),   // head
+            (90, 166, 90, 110),   // shoulders
+            (96, 160, 110, 150),  // chest
+            (101, 155, 150, 180), // waist: narrower than the chest, but not a crease
+            (104, 152, 180, 210), // hips: the narrowest row, where the skirt starts
+            (104, 122, 210, 345), // left leg
+            (134, 152, 210, 345), // right leg
+            (72, 88, 90, 170),    // left arm
+            (168, 184, 90, 170),  // right arm
+        ] {
+            m.fill_rect(Rect::new(x0, y0, x1, y1), &[1.0]);
+        }
+        m
+    }
+
+    /// A dress that only ever tapers must not drag the waist down to its hem: the waist row
+    /// stays well above the narrowest low row instead of following it into the hips.
+    #[test]
+    fn a_silhouette_that_only_tapers_keeps_the_waist_off_the_hem() {
+        let fit = body_fit(&body_anchors(), &tapered_mask()).expect("the synthetic person fits");
+        // The hips band begins where the mask is at its narrowest, at t = (180 - 95) / 105.
+        let hem = (180.0 - 95.0) / (200.0 - 95.0);
+        assert!(fit.waist.t + 0.12 < hem, "the waist {:.2} followed the taper into the hem ({hem:.2})", fit.waist.t);
+        assert!(fit.bust.t < fit.waist.t && fit.waist.t < fit.belly.t && fit.belly.t < fit.hip.t, "{fit:?}");
+    }
+
+    #[test]
+    fn body_fit_refuses_a_blank_mask() {
+        let mut blank = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        blank.fill_rect(Rect::new(0, 0, 64, 64), &[0.0]);
+        assert!(body_fit(&body_anchors(), &blank).is_none());
+    }
+
+    #[test]
+    fn a_stored_fit_replays_the_same_field() {
+        let anchors = body_anchors();
+        let fit = body_fit(&anchors, &body_mask()).expect("the synthetic person fits");
+        let bounds = Rect::new(0, 0, 256, 384);
+        let params = json!({
+            "waist": 100.0,
+            "anchors": serde_json::to_value(&anchors).unwrap(),
+            "fit": serde_json::to_value(&fit).unwrap(),
+        });
+        let (spec, _) = stored_spec(&params, bounds).expect("the stored form");
+        assert_eq!(spec.fit.as_ref(), Some(&fit), "the fit survives the params round-trip");
+        let (f1, _) = field_for(&params, bounds).expect("the field");
+        let (f2, _) = sculpt_field(&spec, bounds, auto_cell(bounds));
+        assert_eq!(f1, f2, "field_for and the stored replay must build the same field");
+        assert!(!f1.is_identity());
+    }
+
+    #[test]
+    fn explicit_anchors_and_a_fit_apply_in_one_step() {
+        let mut s = patterned(256, 384);
+        let before = pixels(&s, 256, 384);
+        let steps = s.active().unwrap().history.past_len();
+        let anchors = body_anchors();
+        let fit = body_fit(&anchors, &body_mask()).expect("the synthetic person fits");
+        let r =
+            s.execute(SCULPT, json!({"waist": 100.0, "anchors": serde_json::to_value(&anchors).unwrap(), "fit": serde_json::to_value(&fit).unwrap()})).unwrap();
+        assert_eq!(r["changed"], json!(true));
+        assert_ne!(before, pixels(&s, 256, 384), "the fitted warp must move pixels");
+        assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "one history step");
+        // The engine reports the body's parts in the reply, not as a silent success.
+        assert!(r["parts"]["applied"].as_array().is_some_and(|a| !a.is_empty()), "{r}");
     }
 
     /// The panel's fast path: the params carry `portrait.analyze`'s anchors, so Apply builds
@@ -523,6 +925,24 @@ mod tests {
         ((last - l) >= w / 10 && (last - l) < w * 9 / 10).then_some((l, last))
     }
 
+    /// The covered run (above half coverage) that holds `xc` in a mask row, when that run is
+    /// neither full-width nor nearly empty. The head row can be several runs — the subject's
+    /// hands sit beside it — and the gauge wants the run the head centre is in.
+    fn row_run(mask: &Surface, y: i32, xc: i32, w: i32) -> Option<(i32, i32)> {
+        let mut start: Option<i32> = None;
+        for x in 0..w {
+            if mask.sample_channel(x, y, 0) > 0.5 {
+                start.get_or_insert(x);
+            } else if let Some(s) = start.take()
+                && s <= xc
+                && xc < x
+            {
+                return ((x - s) >= w / 10 && (x - s) < w * 9 / 10).then_some((s, x - 1));
+            }
+        }
+        start.and_then(|s| ((w - s) >= w / 10 && (w - s) < w * 9 / 10).then_some((s, w - 1)))
+    }
+
     /// The narrowing between two rims, when both rows have one.
     fn narrowing(before: Option<(i32, i32)>, after: Option<(i32, i32)>) -> Option<i32> {
         Some(after?.1 - after?.0 - (before?.1 - before?.0))
@@ -572,6 +992,37 @@ mod tests {
             };
             let anchors = anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other("no pose landmarks in the photo".into()))?;
             let person = analysis.mask(photocraft_portrait::Region::Person).ok_or_else(|| EngineError::Other("no person mask".into()))?.clone();
+            let fit = body_fit(&anchors, &person);
+            if let Some(f) = &fit {
+                eprintln!(
+                    "fit: waist t={:.2} l/r={:.0}/{:.0}, belly t={:.2}, hip t={:.2}, bust t={:.2}",
+                    f.waist.t, f.waist.left, f.waist.right, f.belly.t, f.hip.t, f.bust.t
+                );
+                if std::env::var_os("PHOTOCRAFT_BODY_FIT_DUMP").is_some() {
+                    let vis: Vec<String> = (11..=28).map(|i| format!("{i}:{:.2}/{}", anchors.pose[i][2], if f.inside[i] { "in" } else { "out" })).collect();
+                    eprintln!("  pose visibility (joint:score/silhouette): {}", vis.join(" "));
+                    for (idx, limb) in f.limbs.iter().enumerate() {
+                        let (i, j) = LIMB_SEGMENTS[idx];
+                        eprintln!("  limb {i}->{j}: radius {:.0}, covered t {:.2}..{:.2}", limb.radius, limb.t0, limb.t1);
+                    }
+                    let mid = |a: usize, b: usize| [(anchors.pose[a][0] + anchors.pose[b][0]) * 0.5, (anchors.pose[a][1] + anchors.pose[b][1]) * 0.5];
+                    let (sh, hp) = (mid(11, 12), mid(23, 24));
+                    for row in &f.rows {
+                        let t = (row.y - sh[1]) / (hp[1] - sh[1]);
+                        if !(-0.10..=1.35).contains(&t) {
+                            continue;
+                        }
+                        let ax = sh[0] + (row.y - sh[1]) * (hp[0] - sh[0]) / (hp[1] - sh[1]);
+                        if let Some(run) = row.runs.iter().find(|r| ax >= r[0] && ax <= r[1]) {
+                            eprintln!("  y={:.0} t={t:.2} l={:.0} r={:.0}", row.y, ax - run[0], run[1] - ax);
+                        } else {
+                            eprintln!("  y={:.0} t={t:.2} (axis not in a run: {:?})", row.y, row.runs);
+                        }
+                    }
+                }
+            } else {
+                eprintln!("fit: none (the mask has no measurable silhouette)");
+            }
             let cell = auto_cell(canvas);
 
             // The calibration table: every slider alone at +100.
@@ -601,23 +1052,32 @@ mod tests {
             ];
             eprintln!("slider        rows applied/skipped, max displacement (px)");
             for (name, make) in &singles {
-                let (field, report) = sculpt_field(&SculptSpec { sliders: make(100.0), anchors: anchors.clone() }, canvas, cell);
+                let (field, report) = sculpt_field(&SculptSpec { sliders: make(100.0), anchors: anchors.clone(), fit: fit.clone() }, canvas, cell);
                 let skipped = report.skipped.iter().map(|(n, w)| format!("{n}: {w}")).collect::<Vec<_>>().join("; ");
                 eprintln!("{name:12}  {:>2} applied, {skipped}, max {:.1}px", report.applied.len(), field.max_displacement());
             }
 
             // The silhouette gauge: the waist row narrows with the slider, in proportion;
             // the head row answers head size. Both only where the mask has a rim to read.
+            // The waist row is the field's own measured level, not a fixed fraction: the
+            // gauge must read where the curve actually sits.
             let mid_y = |a: usize, b: usize| ((anchors.pose[a][1] + anchors.pose[b][1]) * 0.5) as i32;
-            let waist_y = (mid_y(11, 12) + mid_y(23, 24)) / 2;
+            let (sh_y, hip_y) = (mid_y(11, 12) as f32, mid_y(23, 24) as f32);
+            let at = |t: f32| (sh_y + (hip_y - sh_y) * t) as i32;
+            let waist_y = fit.as_ref().map_or((mid_y(11, 12) + mid_y(23, 24)) / 2, |f| at(f.waist.t));
+            let waist_band = fit.as_ref().map_or((at(0.30), at(0.78)), |f| (at(f.waist.t - 0.085), at(f.waist.t + 0.085)));
             let head_y = anchors.head.centre[1] as i32;
+            let head_x = anchors.head.centre[0] as i32;
             let w = canvas.width() as i32;
             let rim = |m: &Surface, y: i32| row_rim(m, y, w);
             let waist0 = rim(&person, waist_y);
             let mut rims = vec![waist0];
             for v in [25.0f32, 50.0, 100.0] {
-                let (field, _) =
-                    sculpt_field(&SculptSpec { sliders: SculptSliders { waist: v, ..SculptSliders::default() }, anchors: anchors.clone() }, canvas, cell);
+                let (field, _) = sculpt_field(
+                    &SculptSpec { sliders: SculptSliders { waist: v, ..SculptSliders::default() }, anchors: anchors.clone(), fit: fit.clone() },
+                    canvas,
+                    cell,
+                );
                 rims.push(rim(&apply_liquify(&person, &field), waist_y));
             }
             eprintln!("waist row {waist_y}: rims at 0/25/50/100 = {rims:?}");
@@ -628,10 +1088,14 @@ mod tests {
             } else {
                 eprintln!("waist row reads without a rim — this photo's subject mask cannot gauge the waist; the field itself is covered by the algo tests");
             }
-            let (head_field, _) =
-                sculpt_field(&SculptSpec { sliders: SculptSliders { head_size: 100.0, ..SculptSliders::default() }, anchors: anchors.clone() }, canvas, cell);
-            let head1 = rim(&apply_liquify(&person, &head_field), head_y);
-            let head0 = rim(&person, head_y);
+            let (head_field, _) = sculpt_field(
+                &SculptSpec { sliders: SculptSliders { head_size: 100.0, ..SculptSliders::default() }, anchors: anchors.clone(), fit: fit.clone() },
+                canvas,
+                cell,
+            );
+            let run_at = |m: &Surface, y: i32| row_run(m, y, head_x, w);
+            let head1 = run_at(&apply_liquify(&person, &head_field), head_y);
+            let head0 = run_at(&person, head_y);
             eprintln!("head row {head_y}: {head0:?} → {head1:?}");
             if let Some(step) = narrowing(head0, head1).filter(|_| head0.is_some()) {
                 assert!(step < 0, "head size must shrink the head row: {step}");
@@ -641,14 +1105,15 @@ mod tests {
 
             // The footprint gauge, mask-free: waist at 100 moves pixels in the waist band
             // and only there — the head and legs bands must stay put.
-            let (sh_y, hip_y) = (mid_y(11, 12) as f32, mid_y(23, 24) as f32);
-            let at = |t: f32| (sh_y + (hip_y - sh_y) * t) as i32;
-            let (waist_field, _) =
-                sculpt_field(&SculptSpec { sliders: SculptSliders { waist: 100.0, ..SculptSliders::default() }, anchors: anchors.clone() }, canvas, cell);
+            let (waist_field, _) = sculpt_field(
+                &SculptSpec { sliders: SculptSliders { waist: 100.0, ..SculptSliders::default() }, anchors: anchors.clone(), fit: fit.clone() },
+                canvas,
+                cell,
+            );
             let warped = apply_liquify(&photo, &waist_field);
             let (head_band, waist_band, legs_band) = (
                 band_changed(&photo, &warped, head_y - anchors.head.radius as i32, head_y + anchors.head.radius as i32, w),
-                band_changed(&photo, &warped, at(0.30), at(0.78), w),
+                band_changed(&photo, &warped, waist_band.0, waist_band.1, w),
                 band_changed(&photo, &warped, (hip_y + 40.0) as i32, canvas.height() as i32, w),
             );
             eprintln!("waist-100 footprint: head {head_band:.3}, waist {waist_band:.3}, legs {legs_band:.3}");
@@ -657,6 +1122,17 @@ mod tests {
                 head_band < waist_band / 4.0 && legs_band < waist_band / 4.0,
                 "the warp must stay in its band: head {head_band:.3} legs {legs_band:.3} vs waist {waist_band:.3}"
             );
+
+            // A realistic slimming stack, exported for the eyeball pass: the smart-filter
+            // export below proves replay, this one shows what a user sees.
+            if let Some(path) = std::env::var_os("PHOTOCRAFT_SCULPT_SLIM_OUT") {
+                let stack = json!({"slimBody": 40, "waist": 70, "belly": 60, "arms": 60, "thighs": 60, "calves": 50, "hips": 40, "bust": 30});
+                let r = s.execute(SCULPT, stack)?;
+                assert_eq!(r["changed"], json!(true), "{r}");
+                s.execute("layer.quickExportAsPng", json!({"path": path.to_string_lossy().into_owned()}))?;
+                eprintln!("exported slimming stack: {}", path.to_string_lossy());
+                s.execute("edit.undo", json!({}))?;
+            }
 
             // A smart-object run stores the anchors and replays through the real path.
             s.execute("select.all", json!({}))?;

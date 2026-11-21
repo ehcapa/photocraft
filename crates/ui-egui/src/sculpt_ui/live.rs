@@ -54,6 +54,9 @@ pub struct Live {
     revision: u64,
     /// `portrait.analyze`'s anchors, `Null` when the analysis failed.
     anchors: Value,
+    /// Body Sculpt's measured fit: the visible silhouette the field widths come from. `None`
+    /// for Face, or when the mask has no measurable silhouette.
+    fit: Option<Value>,
     contour: Option<Value>,
     /// Face Sculpt's quality reading: the face box's source and the mesh's geometry. `None`
     /// for Body, or when the analysis failed.
@@ -128,6 +131,7 @@ impl Live {
             size: [0, 0],
             revision: 0,
             anchors: Value::Null,
+            fit: None,
             contour: None,
             quality: None,
             roi: None,
@@ -218,25 +222,27 @@ impl Live {
         match app.session.execute("portrait.analyze", params) {
             Ok(reply) => {
                 let anchors = reply.get("anchors").cloned().unwrap_or(Value::Null);
+                let fit = reply.get("fit").cloned();
                 let contour = reply.get("contour").cloned();
                 let quality = reply.get("quality").cloned();
                 let layer = reply.get("layer").and_then(Value::as_u64);
-                self.finish(app, anchors, contour, quality, layer);
+                self.finish(app, anchors, fit, contour, quality, layer);
             }
             Err(e) => self.fail(e.to_string()),
         }
     }
 
-    /// The analysis's answer into the panel's state: the anchors Apply will carry, the quality
-    /// the panel warns from, and the inline notice when it found nothing or sampled a layer
-    /// Apply cannot warp.
-    fn finish(&mut self, app: &PhotocraftApp, anchors: Value, contour: Option<Value>, quality: Option<Value>, layer: Option<u64>) {
+    /// The analysis's answer into the panel's state: the anchors Apply will carry, the body
+    /// fit the field widths come from, the quality the panel warns from, and the inline notice
+    /// when it found nothing or sampled a layer Apply cannot warp.
+    fn finish(&mut self, app: &PhotocraftApp, anchors: Value, fit: Option<Value>, contour: Option<Value>, quality: Option<Value>, layer: Option<u64>) {
         self.busy = false;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.analysis_pending = None;
         }
         self.anchors = anchors;
+        self.fit = fit;
         self.contour = contour;
         self.quality = quality;
         // `layer` is null when the analysis read the flattened document: the bound layer then
@@ -312,6 +318,7 @@ impl Live {
         self.suspend();
         self.roi = roi;
         self.anchors = Value::Null;
+        self.fit = None;
         self.contour = None;
         self.quality = None;
         self.sampled = false;
@@ -393,6 +400,7 @@ impl Live {
         if !layer_present {
             self.notice = Some(tl!("The sculpt target layer is gone").into());
             self.anchors = Value::Null;
+            self.fit = None;
             self.sampled = false;
             self.suspend();
             return;
@@ -469,7 +477,7 @@ impl Live {
         match result {
             Ok(worker::Output::Analysis(reply)) => {
                 if self.analysis_pending.take().is_some() {
-                    self.finish(app, reply.anchors, reply.contour, reply.quality, reply.layer);
+                    self.finish(app, reply.anchors, reply.fit, reply.contour, reply.quality, reply.layer);
                     ctx.request_repaint();
                 }
             }
@@ -538,12 +546,15 @@ impl Live {
         Some(worker::Job { params: self.merged_params(params), canvas: self.canvas(), face: self.command == super::FACE, proxy, selection })
     }
 
-    /// `params` with the analysed anchors, the person contour and the bound layer — the params
-    /// Apply sends.
+    /// `params` with the analysed anchors, the body fit, the person contour and the bound
+    /// layer — the params Apply sends.
     fn merged_params(&self, params: &Value) -> Value {
         let mut merged = params.clone();
         if let Value::Object(map) = &mut merged {
             map.insert("anchors".into(), self.anchors.clone());
+            if let Some(fit) = &self.fit {
+                map.insert("fit".into(), fit.clone());
+            }
             if let Some(contour) = &self.contour {
                 map.insert("contour".into(), contour.clone());
             }
@@ -684,7 +695,10 @@ pub(crate) fn apply(app: &mut PhotocraftApp, panel: &Panel) {
     let values = panel.params();
     live.suspend();
     match app.run(live.command, params) {
-        Ok(_) => {
+        Ok(reply) => {
+            // A part the pose could not place is not a success to hide: the reply names it,
+            // and the panel says so inline (the CLI and automation read `parts` themselves).
+            live.notice = parts_notice(&reply);
             // Unchanged values never re-preview: the canvas already shows the committed warp.
             live.last_requested = Some(values);
             #[cfg(not(target_arch = "wasm32"))]
@@ -703,6 +717,20 @@ pub(crate) fn apply(app: &mut PhotocraftApp, panel: &Panel) {
         }
     }
     app.sculpt_live = Some(live);
+}
+
+/// What an Apply's `parts` report means for the panel's inline status: a region left out or
+/// placed by inference is said, not hidden. `None` when every asked region ran on landmarks
+/// the pose saw.
+fn parts_notice(reply: &Value) -> Option<String> {
+    let any = |key: &str| reply.get("parts").and_then(|p| p.get(key)).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    if any("skipped") {
+        Some(tl!("Some regions were left out: the pose did not find their landmarks in the person silhouette").into())
+    } else if any("approximate") {
+        Some(tl!("Some regions used inferred landmark positions").into())
+    } else {
+        None
+    }
 }
 
 /// The document shown on the canvas while a preview hides its target layer.
@@ -745,6 +773,7 @@ impl Live {
             size: [st.doc.size.width, st.doc.size.height],
             revision: st.revision,
             anchors,
+            fit: None,
             contour: None,
             quality: None,
             roi: None,
@@ -781,7 +810,7 @@ impl Live {
         }
         let job = worker::AnalysisJob { doc: Arc::clone(&st.doc), layer, kind: self.kind(), roi: self.roi };
         match worker::analyze(&job, &photocraft_engine::jobs::JobCtx::new()) {
-            Ok(worker::Output::Analysis(reply)) => self.finish(app, reply.anchors, reply.contour, reply.quality, reply.layer),
+            Ok(worker::Output::Analysis(reply)) => self.finish(app, reply.anchors, reply.fit, reply.contour, reply.quality, reply.layer),
             Ok(worker::Output::Frame(_)) => {}
             Err(e) => self.fail(e),
         }

@@ -862,10 +862,11 @@ pub(crate) fn analyze_sculpt(
 }
 
 /// `portrait.analyze`'s answer: the anchors in the sculpt commands' stored shape, the Body
-/// contour when there is one, and for Face the quality the panel warns from (`None` for
-/// Body — the pose table has no equivalent honest reading).
+/// contour and measured body fit when there are some, and for Face the quality the panel
+/// warns from (`None` for Body — the pose table has no equivalent honest reading).
 pub struct AnchorsReply {
     pub anchors: Value,
+    pub fit: Option<Value>,
     pub contour: Option<Vec<[f64; 2]>>,
     pub quality: Option<Value>,
 }
@@ -900,10 +901,12 @@ pub fn analyze_anchors(
     match kind {
         SculptKind::Body => {
             let anchors = crate::sculpt_cmds::anchors_from_analysis(analysis).ok_or_else(|| EngineError::Other(crate::sculpt_cmds::NO_PERSON.into()))?;
-            let contour = analysis.mask(photocraft_portrait::Region::Person).and_then(crate::sculpt_cmds::person_contour);
+            let person = analysis.mask(photocraft_portrait::Region::Person);
+            let fit = person.and_then(|mask| crate::sculpt_cmds::body_fit(&anchors, mask));
             Ok(AnchorsReply {
                 anchors: serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?,
-                contour,
+                fit: fit.as_ref().map(serde_json::to_value).transpose().map_err(|e| EngineError::Other(format!("the body fit would not serialise: {e}")))?,
+                contour: person.and_then(crate::sculpt_cmds::person_contour),
                 quality: None,
             })
         }
@@ -912,6 +915,7 @@ pub fn analyze_anchors(
                 crate::face_sculpt_cmds::anchors_from_analysis(analysis).ok_or_else(|| EngineError::Other(crate::face_sculpt_cmds::NO_FACE.into()))?;
             Ok(AnchorsReply {
                 anchors: serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?,
+                fit: None,
                 contour: None,
                 quality: Some(face_quality(&anchors, found.face)),
             })
@@ -1231,6 +1235,9 @@ fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
         move |ctx| analyze_anchors(&doc, target, sample_all, kind, face_box, ctx),
         move |_, found| {
             let mut r = json!({"kind": kind.as_str(), "width": width, "height": height, "layer": target.map(|l| l.0), "anchors": found.anchors, "ms": t0.ms()});
+            if let Some(fit) = found.fit {
+                r["fit"] = fit;
+            }
             if let Some(contour) = found.contour {
                 r["contour"] = json!(contour);
             }
@@ -1269,7 +1276,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Analyze Portrait",
             menu: &[],
             shortcut: None,
-            params: r##"{"kind":"body"|"face"="body","layer":id?,"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none (face only)} → {kind,width,height,layer,anchors,contour?,quality?,ms} (the anchors the sculpt panels hand `filter.bodySculpt`/`filter.faceSculpt`: Body = person mask + pose + the silhouette contour, Face = the face mesh — a detected face box needs no person stage; without one the subject line only gates presence. `roi` is Face Sculpt's drawn face box in document pixels: the mesh runs inside it and a box with no face errors instead of falling back; without it SCRFD's detected box is used, and without that the whole-document mesh. Face `quality` names the box source (`drawn`/`detected`/`wholeDocument`) and the mesh's face width, height, eye-line roll and nose-offset turn, so the panel can warn on the fallback and on a turned head. One lightweight run — no parsing/body/fashion stages, no history step, nothing cached — and Apply with these anchors never analyses again)"##,
+            params: r##"{"kind":"body"|"face"="body","layer":id?,"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none (face only)} → {kind,width,height,layer,anchors,fit?,contour?,quality?,ms} (the anchors the sculpt panels hand `filter.bodySculpt`/`filter.faceSculpt`: Body = person mask + pose + the silhouette contour and the measured body fit, Face = the face mesh — a detected face box needs no person stage; without one the subject line only gates presence. `roi` is Face Sculpt's drawn face box in document pixels: the mesh runs inside it and a box with no face errors instead of falling back; without it SCRFD's detected box is used, and without that the whole-document mesh. Face `quality` names the box source (`drawn`/`detected`/`wholeDocument`) and the mesh's face width, height, eye-line roll and nose-offset turn, so the panel can warn on the fallback and on a turned head. One lightweight run — no parsing/body/fashion stages, no history step, nothing cached — and Apply with these anchors never analyses again)"##,
             enabled,
             run: analyze,
             journal: false,
