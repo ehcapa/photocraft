@@ -12,9 +12,10 @@
 
 use std::sync::Arc;
 
-use craft::behavior::kurbo::Point;
+use craft::behavior::kurbo::{BezPath, Point};
 use craft::imaging::ui::transform_preview::{PreviewPixels, PreviewTextures};
 use craft::imaging::ui::{PreviewMap, TransformPreview};
+use craft::ui::canvas_controls::SelectionOutline;
 use craft::ui::contract::Show as _;
 use photocraft_doc::{BlendMode, DocId, Document, LayerContent, LayerId, LayerMask};
 use photocraft_engine::portrait_cmds::SculptKind;
@@ -761,16 +762,42 @@ pub(crate) fn display_doc(app: &PhotocraftApp, idx: usize) -> Option<(Arc<Docume
     Some((Arc::clone(&preview.without), DISPLAY_KEY + live.serial))
 }
 
-/// The warped proxy over the document's rectangle, as a canvas control.
+/// The warped proxy over the document's rectangle, as a canvas control, and the two placement
+/// rows the panel's line controls move: solid for the waist, dashed for the belly. The lines are
+/// the levels the field acts on (the engine reports the same rows), so what the canvas shows is
+/// where the sliders will pull; the Placement sliders carry the names and values for assistive
+/// technology, the lines themselves are decoration.
 pub(crate) fn show_in_canvas(app: &PhotocraftApp, ui: &mut egui::Ui, rect: egui::Rect) {
     let Some(live) = &app.sculpt_live else { return };
-    let Some(preview) = &live.preview else { return };
     if app.session.active().map(|st| st.doc.id) != live.doc {
         return;
     }
-    let (w, h) = (f64::from(preview.size[0].max(1)), f64::from(preview.size[1].max(1)));
-    let quad = [Point::new(0.0, 0.0), Point::new(w, 0.0), Point::new(w, h), Point::new(0.0, h)];
-    TransformPreview::new(tl!("Sculpt preview"), &preview.textures).map(PreviewMap::quad(quad)).opacity(preview.opacity).clip(preview.size).show_at(ui, rect);
+    if let Some(preview) = &live.preview {
+        let (w, h) = (f64::from(preview.size[0].max(1)), f64::from(preview.size[1].max(1)));
+        let quad = [Point::new(0.0, 0.0), Point::new(w, 0.0), Point::new(w, h), Point::new(0.0, h)];
+        TransformPreview::new(tl!("Sculpt preview"), &preview.textures)
+            .map(PreviewMap::quad(quad))
+            .opacity(preview.opacity)
+            .clip(preview.size)
+            .show_at(ui, rect);
+    }
+    if live.command != super::BODY {
+        return;
+    }
+    let Some(panel) = &app.sculpt else { return };
+    let Some([waist, belly]) = photocraft_engine::sculpt_cmds::placement_lines(&live.merged_params(&panel.params())) else { return };
+    let line = |(y, x0, x1): (f64, f64, f64)| {
+        let mut path = BezPath::new();
+        if [y, x0, x1].iter().all(|v| v.is_finite()) {
+            path.move_to(Point::new(x0, y));
+            path.line_to(Point::new(x1, y));
+        }
+        path
+    };
+    let waist = line(waist);
+    SelectionOutline::solid(tl!("Waist line"), std::slice::from_ref(&waist)).show_at(ui, rect);
+    let belly = line(belly);
+    SelectionOutline::dashed(tl!("Belly line"), std::slice::from_ref(&belly)).show_at(ui, rect);
 }
 
 #[cfg(test)]

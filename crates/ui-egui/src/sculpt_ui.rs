@@ -74,6 +74,9 @@ const BODY_SECTIONS: &[Section] = &[
         pairs: &[],
     },
     Section { name: "Refine", rows: &[r("smooth", "Silhouette Flow"), r("symmetry", "Symmetry")], pairs: &[] },
+    // Where the Waist and Belly rows act, when the outline could not show it: 0 leaves the
+    // measured or anatomical row, and the canvas draws both rows so the line is visible.
+    Section { name: "Placement", rows: &[r("waistLine", "Waist Line"), r("bellyLine", "Belly Line")], pairs: &[] },
 ];
 
 const FACE_SECTIONS: &[Section] = &[

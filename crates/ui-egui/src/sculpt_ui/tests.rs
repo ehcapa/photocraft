@@ -76,6 +76,29 @@ fn each_slider_is_named_after_its_row_label() {
     }
 }
 
+/// The Placement section is where a garment's waistband, or a front-on belly the side outline
+/// cannot show, is placed by eye: both rows exist as named sliders, and a moved line is carried
+/// in the command params. Zero is auto — an untouched panel sends neither key, so the measured
+/// or anatomical row stands.
+#[test]
+fn the_placement_rows_carry_the_line_offsets() {
+    let mut h = harness(egui::vec2(560.0, 700.0));
+    crate::sculpt_ui::open(h.state_mut(), BODY);
+    h.state_mut().sculpt.as_mut().expect("panel open").section = BODY_SECTIONS.len() - 1;
+    h.run_steps(3);
+    let named: Vec<String> =
+        h.query_all_by_role(egui::accesskit::Role::Slider).filter_map(|node| node.accesskit_node().labelled_by().find_map(|label| label.value())).collect();
+    for row in ["Waist Line", "Belly Line"] {
+        assert!(named.iter().any(|name| name == row), "a slider is named {row}: {named:?}");
+    }
+    let panel = h.state_mut().sculpt.as_mut().expect("panel open");
+    assert!(panel.params().get("waistLine").is_none() && panel.params().get("bellyLine").is_none(), "zero is auto and sends nothing: {}", panel.params());
+    panel.set("waistLine", 40.0);
+    panel.set("bellyLine", -30.0);
+    assert_eq!(panel.params()["waistLine"], 40.0, "the moved waist line is sent");
+    assert_eq!(panel.params()["bellyLine"], -30.0, "the moved belly line is sent");
+}
+
 /// The analysis's status line appears inline and is a polite live region: it changes while
 /// focus is elsewhere, so a screen reader must announce the refusal — and the progress before
 /// it — rather than leave Apply disabled without a word.

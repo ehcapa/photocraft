@@ -108,6 +108,117 @@ fn fit_of(p: &Value) -> Option<BodyFit> {
     }
 }
 
+/// The user's placement lines, in torso units. `waistLine` and `bellyLine` are percentages of
+/// the shoulder-mid → hip-mid span, so ±100 moves the row ±0.30 and 0 leaves the measured or
+/// prior row. Out-of-range values are refused rather than clamped: a script that mistypes one
+/// should hear about it instead of getting a silently different line.
+fn line_offsets(p: &Value) -> Result<(f64, f64)> {
+    let one = |key: &str| -> Result<f64> {
+        match p.get(key) {
+            None | Some(Value::Null) => Ok(0.0),
+            Some(v) => {
+                let v =
+                    v.as_f64().ok_or_else(|| bad(format!("`{key}` is a percentage of the shoulder→hip-joint span (-100..100; 0 leaves the measured row)")))?;
+                if !(-100.0..=100.0).contains(&v) {
+                    return Err(bad(format!("`{key}` must be -100..100")));
+                }
+                Ok(v / 100.0 * 0.30)
+            }
+        }
+    };
+    Ok((one("waistLine")?, one("bellyLine")?))
+}
+
+/// Moves a fitted level onto the row a user line names. The widths come from the fit's own
+/// silhouette rows — the run under the torso axis at that row — so a line moved to a garment's
+/// waistband narrows the body where the band actually is, not where the prior guessed. `None`
+/// when the line is zero or no stored row has a measurable run under the axis: the caller keeps
+/// the measured row and reports the line approximate rather than pretending it landed.
+fn line_level(fit: &BodyFit, anchors: &SculptAnchors, level: LevelFit, offset: f64) -> Option<LevelFit> {
+    if offset == 0.0 || !offset.is_finite() {
+        return None;
+    }
+    let mid = |i: usize, j: usize| {
+        let (a, b) = (anchors.pose.get(i)?, anchors.pose.get(j)?);
+        Some([(f64::from(a[0]) + f64::from(b[0])) * 0.5, (f64::from(a[1]) + f64::from(b[1])) * 0.5])
+    };
+    let (s, h) = (mid(11, 12)?, mid(23, 24)?);
+    let ab = [h[0] - s[0], h[1] - s[1]];
+    if ab[1].abs() <= 1e-6 || !ab.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let target = (f64::from(level.t) + offset).clamp(0.04, 1.20);
+    let target_y = s[1] + target * ab[1];
+    // The stored rows are document pixels ordered by y, and t is the fraction of the way down
+    // the shoulder→hip-joint line, so the nearest row in y is the nearest row in t. Rows whose
+    // runs all lie away from the torso axis (a raised arm, a background figure) say nothing
+    // about this line and are skipped.
+    let mut best: Option<(f64, f64, f64, f64)> = None;
+    for row in &fit.rows {
+        let y = f64::from(row.y);
+        let axis = s[0] + (y - s[1]) * ab[0] / ab[1];
+        let Some(run) = row.runs.iter().find(|run| axis >= f64::from(run[0]) && axis <= f64::from(run[1])) else { continue };
+        let (l, r) = (axis - f64::from(run[0]), f64::from(run[1]) - axis);
+        if l < 2.0 || r < 2.0 {
+            continue;
+        }
+        let d = (y - target_y).abs();
+        if best.is_none_or(|b| d < b.0) {
+            best = Some((d, (y - s[1]) / ab[1], l, r));
+        }
+    }
+    let (_, t, l, r) = best?;
+    if !t.is_finite() {
+        return None;
+    }
+    Some(LevelFit { t: t as f32, left: l as f32, right: r as f32 })
+}
+
+/// Why a placement line did not land. Non-zero lines are the user's instruction, so a refusal
+/// to honour one must be reported rather than swallowed (a line that silently does nothing is
+/// the kind of partial success the operator must never be shown as done).
+const LINE_UNPLACED_REASON: &str = "the placement line found no measurable silhouette row; the measured row is used";
+const LINE_NO_FIT_REASON: &str = "there is no measured body fit to place the line on; the anatomical fallback is used";
+
+/// Applies the placement lines to a fit, clearing the prior flag of each row the user placed:
+/// a line drawn on a visible waistband is a measurement by eye, not a guess. The returned notes
+/// name the lines that could not land.
+fn apply_lines(fit: &mut BodyFit, anchors: &SculptAnchors, offsets: (f64, f64)) -> Vec<(&'static str, &'static str)> {
+    let mut notes = Vec::new();
+    if offsets.0 != 0.0 {
+        match line_level(fit, anchors, fit.waist, offsets.0) {
+            Some(level) => {
+                fit.waist = level;
+                fit.waist_prior = false;
+            }
+            None => notes.push(("waist", LINE_UNPLACED_REASON)),
+        }
+    }
+    if offsets.1 != 0.0 {
+        match line_level(fit, anchors, fit.belly, offsets.1) {
+            Some(level) => {
+                fit.belly = level;
+                fit.belly_prior = false;
+            }
+            None => notes.push(("belly", LINE_UNPLACED_REASON)),
+        }
+    }
+    notes
+}
+
+/// The notes a line needs when the run has no fit at all (a script sent anchors but no fit and
+/// no mask was available): the part still acts from its anatomical fallback.
+fn line_notes_without_fit(offsets: (f64, f64)) -> Vec<(&'static str, &'static str)> {
+    let mut notes = Vec::new();
+    if offsets.0 != 0.0 {
+        notes.push(("waist", LINE_NO_FIT_REASON));
+    }
+    if offsets.1 != 0.0 {
+        notes.push(("belly", LINE_NO_FIT_REASON));
+    }
+    notes
+}
+
 /// The params' own anchors — the panel's one analysis (`portrait.analyze`), or a script's.
 /// `None` when absent: the lightweight analysis answers instead. Present but malformed is
 /// refused by its shape rather than warping from garbage — the field builders index every
@@ -277,6 +388,21 @@ pub(crate) fn person_contour(mask: &Surface, anchors: &SculptAnchors) -> Option<
     Some(left)
 }
 
+/// The lower abdomen's widest row in `[lo, hi]` and whether the outline confirms it as a bump:
+/// the apex must be measurably wider than the profile at both ends of the range. `None` when
+/// the range holds no rows. A monotonic slope puts the apex at an end, where it cannot be wider
+/// than that end, so it reads as unconfirmed rather than as a measured belly.
+fn belly_apex(profile: &[(f64, f64, f64)], lo: f64, hi: f64) -> Option<((f64, f64, f64), bool)> {
+    let width_near = |t: f64| profile.iter().copied().min_by(|a, b| (a.0 - t).abs().total_cmp(&(b.0 - t).abs())).map_or(0.0, |p| p.1 + p.2);
+    let rows: Vec<(f64, f64, f64)> = profile.iter().copied().filter(|&(t, _, _)| t >= lo && t <= hi).collect();
+    let max = rows.iter().map(|p| p.1 + p.2).max_by(f64::total_cmp)?;
+    let band: Vec<(f64, f64, f64)> = rows.iter().copied().filter(|p| p.1 + p.2 >= max * 0.98 - 1.0).collect();
+    let apex = band.get(band.len() / 2).copied()?;
+    let w = apex.1 + apex.2;
+    let margin = (0.01 * w).max(2.0);
+    Some((apex, w > width_near(lo) + margin && w > width_near(hi) + margin))
+}
+
 /// The person silhouette fitted to the body: the torso's waist, belly, hip and bust levels,
 /// each limb's thickness at its bone, and the mask rows the field clips to. This is what makes
 /// the slimming rows act on the visible outline instead of somewhere inside it: a part's
@@ -355,13 +481,9 @@ pub fn body_fit(anchors: &SculptAnchors, mask: &Surface) -> Option<BodyFit> {
         return None;
     }
 
-    let pose = |i: usize| {
-        anchors
-            .pose
-            .get(i)
-            .map(|q| [(f64::from(q[0]) - f64::from(b.x0)) / scale as f64, (f64::from(q[1]) - f64::from(b.y0)) / scale as f64])
-            .unwrap_or([0.0, 0.0])
-    };
+    let joints: Vec<[f64; 2]> =
+        anchors.pose.iter().map(|q| [(f64::from(q[0]) - f64::from(b.x0)) / scale as f64, (f64::from(q[1]) - f64::from(b.y0)) / scale as f64]).collect();
+    let pose = |i: usize| joints.get(i).copied().unwrap_or([0.0, 0.0]);
     let shoulder = [(pose(11)[0] + pose(12)[0]) * 0.5, (pose(11)[1] + pose(12)[1]) * 0.5];
     let hip = [(pose(23)[0] + pose(24)[0]) * 0.5, (pose(23)[1] + pose(24)[1]) * 0.5];
     let ab = [hip[0] - shoulder[0], hip[1] - shoulder[1]];
@@ -439,37 +561,69 @@ pub fn body_fit(anchors: &SculptAnchors, mask: &Surface) -> Option<BodyFit> {
         let margin = (0.01 * w).max(2.0);
         w + margin < width_at(0.35) && w + margin < width_at(0.90)
     });
-    // Without a crease, where the waist row goes depends on why it is missing. A silhouette
-    // that widens again by the hip row is a body under clothes whose waist the mask cannot
-    // narrow — a loose cut or the sleeves beside the torso keep the outline from cinching, so
-    // the garment's waistband never shows in it. On a clothed subject the pose's hip joints
-    // mark the visible hip line and the waistband sits at or just above it, so the hip row
-    // stands in. A silhouette that only narrows into the hip row is a taper (a straight dress,
-    // a skirt), where the body's waist is above the visible shape and the anatomical middle
-    // stands. The old fixed middle put the waist on the ribs on every clothed silhouette the
-    // crease test rejected, which is what made the slider read as squeezing the chest.
-    let hip_w = width_at(hip.0);
-    let low = hip_w > width_at(0.62) + (0.01 * hip_w).max(2.0);
-    let mut waist = crease.unwrap_or_else(|| if low { hip } else { near(0.62) });
+    // Without a crease the mask cannot say where the waist is, and the row it widens into is
+    // not a substitute: a fuller body, a pregnancy and a low-slung garment all widen into the
+    // hip row, but only the garment's cinch is there — on the other two that row is the belly
+    // itself. The anatomical waist between the lower ribs and the hip joints, about 0.70 of
+    // the shoulder→hip-joint span, is the body-type-stable prior; the panel's line control
+    // moves it to a visible waistband, and the report names the prior so no one reads it as a
+    // measurement. The older 0.54/0.62 middles sat on the ribs, which is what made the slider
+    // read as squeezing the chest.
+    const WAIST_PRIOR_T: f64 = 0.70;
+    let mut waist = crease.unwrap_or_else(|| near(WAIST_PRIOR_T));
     // The waist row fell to a prior rather than to a measured crease: the report says so.
-    let waist_prior = crease.is_none() && low;
+    let mut waist_prior = crease.is_none();
     let bust = near(0.30f64.min(waist.0 - 0.10));
     if bust.0 >= waist.0 {
         // No room above the waist for the bust: the waist measurement is suspect, so the
-        // anatomical middle takes over and the bust keeps its third.
-        waist = near(0.62f64.max(bust.0 + 0.10));
+        // anatomical prior takes over and the bust keeps its third.
+        waist = near(WAIST_PRIOR_T.max(bust.0 + 0.10));
+        waist_prior = true;
     }
-    // The belly sits between a measured waist and the hips; with the waist on the hip row
-    // there is no room below it, so the belly takes the lower abdomen just above the band.
-    let belly = if waist.0 + 0.12 > hip.0 { near((waist.0 - 0.10).max(0.70)) } else { near((waist.0 + hip.0) * 0.5) };
     waist.0 = waist.0.clamp(0.04, 1.02);
+
+    // The belly is measured, not assumed: its centre is the lower abdomen's widest row below
+    // the waist, where a fuller or pregnant belly's own silhouette peaks. When that row sits
+    // at the edge of the range — a monotonic widening, or a low waistband with no room below
+    // it — the outline shows no bump to confirm; the row is still the widest lower abdomen,
+    // and the report says the position is approximate rather than calling it measured.
+    let belly_lo = (waist.0 + 0.08).max(0.55);
+    let belly_hi = (hip.0 - 0.04).min(1.15);
+    let (belly, belly_prior) = if belly_hi > belly_lo + 0.02 {
+        match belly_apex(&profile, belly_lo, belly_hi) {
+            Some((apex, bump)) => (apex, !bump),
+            None => (near(((waist.0 + hip.0) * 0.5).clamp(0.72, 0.95)), true),
+        }
+    } else {
+        // No room below the waist (a low waistband): the belly sits above it.
+        (near((waist.0 - 0.12).clamp(0.72, 0.95)), true)
+    };
     let level = |p: (f64, f64, f64)| LevelFit { t: p.0 as f32, left: (p.1 * scale as f64) as f32, right: (p.2 * scale as f64) as f32 };
 
-    // Each limb: the mask's thickness at its bone and the fraction of the bone the mask covers.
+    let limbs = limb_fits(&joints, &inside, &dist, fw, fh, scale);
+
+    let mut joint_inside = vec![false; POSE_COUNT];
+    for (i, flag) in joint_inside.iter_mut().enumerate() {
+        if let Some(q) = anchors.pose.get(i) {
+            let x = (f64::from(q[0]) - f64::from(b.x0)) / scale as f64;
+            let y = (f64::from(q[1]) - f64::from(b.y0)) / scale as f64;
+            *flag = inside_near(&inside, fw, fh, x, y, 2);
+        }
+    }
+
+    Some(BodyFit { rows, waist: level(waist), belly: level(belly), hip: level(hip), bust: level(bust), limbs, inside: joint_inside, waist_prior, belly_prior })
+}
+
+/// Each limb's fitted thickness and the fraction of its bone the mask covers, read on the
+/// reduced grid: the median distance to the nearest background at samples along the bone is the
+/// limb's half-thickness there, capped by the bone's own length so a torso next to the bone
+/// cannot inflate an arm. A bone shorter than a few cells, or one whose samples all miss the
+/// mask, contributes nothing and the field falls back to the joint spacing for that limb.
+fn limb_fits(joints: &[[f64; 2]], inside: &[bool], dist: &[f32], fw: usize, fh: usize, scale: usize) -> [LimbFit; 8] {
     let mut limbs = [LimbFit::default(); LIMB_SEGMENTS.len()];
     for (idx, &(i, j)) in LIMB_SEGMENTS.iter().enumerate() {
-        let a = pose(i);
-        let c = pose(j);
+        let a = joints.get(i).copied().unwrap_or([0.0, 0.0]);
+        let c = joints.get(j).copied().unwrap_or([0.0, 0.0]);
         let len = (c[0] - a[0]).hypot(c[1] - a[1]);
         if len < 4.0 {
             continue;
@@ -514,17 +668,7 @@ pub fn body_fit(anchors: &SculptAnchors, mask: &Surface) -> Option<BodyFit> {
         let radius = if median > 0.0 { median.clamp(floor, cap) } else { 0.0 };
         limbs[idx] = LimbFit { radius: (radius * scale as f64) as f32, t0: t0 as f32, t1: t1 as f32 };
     }
-
-    let mut joint_inside = vec![false; POSE_COUNT];
-    for (i, flag) in joint_inside.iter_mut().enumerate() {
-        if let Some(q) = anchors.pose.get(i) {
-            let x = (f64::from(q[0]) - f64::from(b.x0)) / scale as f64;
-            let y = (f64::from(q[1]) - f64::from(b.y0)) / scale as f64;
-            *flag = inside_near(&inside, fw, fh, x, y, 2);
-        }
-    }
-
-    Some(BodyFit { rows, waist: level(waist), belly: level(belly), hip: level(hip), bust: level(bust), limbs, inside: joint_inside, waist_prior })
+    limbs
 }
 
 /// Whether `(x, y)` or a small neighbourhood around it is inside `mask`; the tolerance keeps a
@@ -631,8 +775,59 @@ pub fn field_for(p: &Value, canvas: Rect) -> Result<(LiquifyField, SculptReport)
     let values = sliders(p)?;
     let anchors = anchors_from_params(p)?.ok_or_else(|| bad("`anchors` are required here — `portrait.analyze` supplies them"))?;
     let cell = cell(p, canvas)?;
-    let spec = SculptSpec { sliders: values, anchors, fit: fit_of(p) };
-    Ok(field_with(spec, contour_of(p).as_deref(), symmetry_of(p), smooth_of(p), canvas, cell))
+    let offsets = line_offsets(p)?;
+    let mut fit = fit_of(p);
+    let line_notes = match fit.as_mut() {
+        Some(fit) => apply_lines(fit, &anchors, offsets),
+        None => line_notes_without_fit(offsets),
+    };
+    let spec = SculptSpec { sliders: values, anchors, fit };
+    let (field, mut report) = field_with(spec, contour_of(p).as_deref(), symmetry_of(p), smooth_of(p), canvas, cell);
+    report.approximate.extend(line_notes);
+    Ok((field, report))
+}
+
+/// What a smart filter stores: the params the dialog sent plus the anchors they were resolved
+/// against, the fitted rows and the contour, so the re-render rebuilds this exact field with no
+/// analysis. The placement lines were baked into `fit` by the caller and are dropped here —
+/// keeping them would move the rows a second time on every re-render.
+fn stored_params(p: &Value, anchors: &SculptAnchors, fit: Option<&BodyFit>, contour: Option<&[[f64; 2]]>) -> Result<Value> {
+    let mut stored = p.clone();
+    if let Value::Object(m) = &mut stored {
+        m.insert("anchors".into(), serde_json::to_value(anchors).map_err(|e| bad(format!("the anchors would not serialise: {e}")))?);
+        if let Some(fit) = fit {
+            m.insert("fit".into(), serde_json::to_value(fit).map_err(|e| bad(format!("the body fit would not serialise: {e}")))?);
+        }
+        if let Some(pts) = contour {
+            m.insert("contour".into(), serde_json::to_value(pts).map_err(|e| bad(format!("the contour would not serialise: {e}")))?);
+        }
+        m.remove("waistLine");
+        m.remove("bellyLine");
+    }
+    Ok(stored)
+}
+
+/// The two placement rows the panel draws, in document pixels: `(y, x0, x1)` for the waist
+/// (solid) and the belly (dashed), after the user's line offsets. These are the levels the
+/// field acts on — the same `apply_lines` the preview and Apply run — so the drawn line cannot
+/// disagree with the warp. `None` when the params carry no usable fit to place a line on.
+pub fn placement_lines(p: &Value) -> Option<[(f64, f64, f64); 2]> {
+    let anchors = anchors_from_params(p).ok()??;
+    let mut fit = fit_of(p)?;
+    apply_lines(&mut fit, &anchors, line_offsets(p).ok()?);
+    let mid = |i: usize, j: usize| {
+        let (a, b) = (anchors.pose.get(i)?, anchors.pose.get(j)?);
+        Some([(f64::from(a[0]) + f64::from(b[0])) * 0.5, (f64::from(a[1]) + f64::from(b[1])) * 0.5])
+    };
+    let (s, h) = (mid(11, 12)?, mid(23, 24)?);
+    // t is the fraction along the straight shoulder-mid → hip-mid line, so the row's y and
+    // axis x are one lerp; the fitted half-widths give the span the row's kernel acts over.
+    let line = |level: LevelFit| {
+        let t = f64::from(level.t);
+        let (y, x) = (s[1] + t * (h[1] - s[1]), s[0] + t * (h[0] - s[0]));
+        (y, x - f64::from(level.left), x + f64::from(level.right))
+    };
+    Some([line(fit.waist), line(fit.belly)])
 }
 
 /// The one lightweight analysis a run without anchors needs: the person mask and the
@@ -648,6 +843,7 @@ fn lightweight(s: &Session, all_layers: bool) -> Result<std::sync::Arc<photocraf
 
 fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let values = sliders(p)?;
+    let offsets = line_offsets(p)?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let canvas = d.doc.bounds();
     let id = crate::commands::layer_param(s, p)?;
@@ -697,24 +893,20 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     {
         fit = body_fit(&anchors, mask);
     }
+    // The user's placement lines move the fitted rows before the field is built; the fitted
+    // widths follow the row they land on, so preview, Apply and the replay agree.
+    let line_notes = match fit.as_mut() {
+        Some(fit) => apply_lines(fit, &anchors, offsets),
+        None => line_notes_without_fit(offsets),
+    };
     let spec = SculptSpec { sliders: values, anchors: anchors.clone(), fit: fit.clone() };
-    let (field, report) = field_with(spec, contour.as_deref(), symmetry, smooth, canvas, cell);
+    let (field, mut report) = field_with(spec, contour.as_deref(), symmetry, smooth, canvas, cell);
+    report.approximate.extend(line_notes);
     let smart = matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Smart(_)));
     if field.is_identity() && !smart {
         return Ok(json!({"layer": id.0, "changed": false, "parts": parts(&report)}));
     }
-    // What a smart filter stores: the sliders the dialog sent plus the anchors they were
-    // resolved against, so the re-render rebuilds this exact field with no analysis.
-    let mut stored = p.clone();
-    if let Value::Object(m) = &mut stored {
-        m.insert("anchors".into(), serde_json::to_value(&anchors).map_err(|e| bad(format!("the anchors would not serialise: {e}")))?);
-        if let Some(fit) = &fit {
-            m.insert("fit".into(), serde_json::to_value(fit).map_err(|e| bad(format!("the body fit would not serialise: {e}")))?);
-        }
-        if let Some(pts) = &contour {
-            m.insert("contour".into(), serde_json::to_value(pts).map_err(|e| bad(format!("the contour would not serialise: {e}")))?);
-        }
-    }
+    let stored = stored_params(p, &anchors, fit.as_ref(), contour.as_deref())?;
     let r = crate::distort_cmds::run_on_layer(
         s,
         SCULPT,
@@ -755,7 +947,7 @@ pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> 
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"symmetry":0..100=0 (对称液化·上半身: the paired joints align toward each other's mirror about the torso axis),"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action — Waist narrows, Hips rounds, Leg Length lengthens; with `anchors` the analysis never runs on Apply),"anchors":{…}? (`portrait.analyze`'s document-pixel anchors — the panel supplies them so Apply is a field build and a warp; without them one lightweight pose analysis runs. Stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"waistLine":-100..100=0 (placement: moves the fitted waist row by up to 30% of the shoulder→hip-joint span, positive downward; 0 leaves the measured or prior row. Set it on a visible waistband the outline's crease test missed; the row's own silhouette width follows),"bellyLine":-100..100=0 (placement: the same for the belly row, so a front-on belly the side outline cannot confirm still gets a line the user trusts),"symmetry":0..100=0 (对称液化·上半身: the paired joints align toward each other's mirror about the torso axis),"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action — Waist narrows, Hips rounds, Leg Length lengthens; with `anchors` the analysis never runs on Apply),"anchors":{…}? (`portrait.analyze`'s document-pixel anchors — the panel supplies them so Apply is a field build and a warp; without them one lightweight pose analysis runs. Stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: SCULPT,
         label: "Body Sculpt…",
@@ -927,18 +1119,20 @@ mod tests {
         m
     }
 
-    /// A silhouette that widens into the hip row has no crease to measure, so the waist takes
-    /// the pose's hip line and the belly takes the lower abdomen just above it — not the
-    /// anatomical middle, which on a clothed subject is the ribs.
+    /// A silhouette that widens into the hip row has no crease to measure. It could be a fuller
+    /// body, a pregnancy or a low-slung garment; on the first two the row it widens into is the
+    /// belly, not a waist, so the hip row is not a safe stand-in. The anatomical waist is used
+    /// and flagged, and the belly takes the widest lower-abdomen row — a monotonic widening has
+    /// no bump to confirm, so that row is flagged too.
     #[test]
-    fn a_silhouette_that_widens_into_the_hips_puts_the_waist_on_the_hip_line() {
+    fn a_silhouette_that_widens_into_the_hips_uses_the_anatomical_waist_and_flags_it() {
         let fit = body_fit(&body_anchors(), &widening_mask()).expect("the synthetic person fits");
         assert!(fit.is_valid(), "{fit:?}");
-        assert!(fit.waist_prior, "the waist fell back to the hip joints, not a measured crease");
-        assert!(fit.waist.t > 0.85, "the waist sits on the hip line, not the ribs: {:.2}", fit.waist.t);
-        assert!((fit.waist.t - fit.hip.t).abs() < 0.08, "waist {:.2} vs hip {:.2}", fit.waist.t, fit.hip.t);
-        assert!(fit.belly.t < fit.waist.t, "the belly sits above the waistband: {:.2}", fit.belly.t);
-        assert!((0.82..=0.96).contains(&fit.belly.t), "the belly row is the lower abdomen: {:.2}", fit.belly.t);
+        assert!(fit.waist_prior, "the waist fell back to the anatomical prior, not a measured crease");
+        assert!((0.62..=0.78).contains(&fit.waist.t), "the waist sits at the anatomical waist, not the hip line: {:.2}", fit.waist.t);
+        assert!(fit.hip.t - fit.waist.t > 0.15, "waist {:.2} vs hip {:.2}", fit.waist.t, fit.hip.t);
+        assert!(fit.belly_prior, "a monotonic widening gives no bump to confirm the belly");
+        assert!(fit.belly.t > fit.waist.t + 0.08 && fit.belly.t < fit.hip.t, "the belly sits in the lower abdomen: {:.2}", fit.belly.t);
     }
 
     /// A dress that only ever tapers must not drag the waist down to its hem: the waist row
@@ -948,8 +1142,142 @@ mod tests {
         let fit = body_fit(&body_anchors(), &tapered_mask()).expect("the synthetic person fits");
         // The hips band begins where the mask is at its narrowest, at t = (180 - 95) / 105.
         let hem = (180.0 - 95.0) / (200.0 - 95.0);
-        assert!(fit.waist.t + 0.12 < hem, "the waist {:.2} followed the taper into the hem ({hem:.2})", fit.waist.t);
+        assert!(fit.waist.t < hem - 0.05, "the waist {:.2} followed the taper into the hem ({hem:.2})", fit.waist.t);
+        assert!(fit.waist_prior && fit.belly_prior, "a taper confirms neither a waist nor a belly");
         assert!(fit.bust.t < fit.waist.t && fit.waist.t < fit.belly.t && fit.belly.t < fit.hip.t, "{fit:?}");
+    }
+
+    /// The same person with a lower-abdomen bump that the outline does confirm: the profile
+    /// narrows again below the bump before the hip row, so the apex is measurably wider than
+    /// both ends of the belly range.
+    fn belied_mask() -> Surface {
+        let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        m.fill_rect(Rect::new(0, 0, 256, 384), &[0.0]);
+        for (x0, x1, y0, y1) in [
+            (110, 146, 40, 85),   // head
+            (90, 166, 90, 110),   // shoulders
+            (94, 162, 110, 150),  // chest
+            (99, 157, 150, 170),  // waist crease
+            (97, 159, 170, 180),  // upper belly
+            (94, 162, 180, 195),  // belly apex: wider than both ends of the lower abdomen
+            (100, 156, 195, 210), // lower belly, narrowing again into the hip row
+            (104, 122, 210, 345), // left leg
+            (134, 152, 210, 345), // right leg
+            (72, 88, 90, 170),    // left arm
+            (168, 184, 90, 170),  // right arm
+        ] {
+            m.fill_rect(Rect::new(x0, y0, x1, y1), &[1.0]);
+        }
+        m
+    }
+
+    #[test]
+    fn a_belly_the_outline_confirms_is_measured_at_its_apex() {
+        let fit = body_fit(&body_anchors(), &belied_mask()).expect("the synthetic person fits");
+        assert!(!fit.belly_prior, "the bump is wider than both ends of its range: it is measured");
+        assert!((0.80..=0.93).contains(&fit.belly.t), "the belly row is the lower-abdomen apex: {:.2}", fit.belly.t);
+        assert!(fit.belly.t > fit.waist.t, "belly {:.2} below waist {:.2}", fit.belly.t, fit.waist.t);
+        assert!(fit.belly.left > fit.waist.left + 2.0, "the apex is wider than the crease: {:.1} vs {:.1}", fit.belly.left, fit.waist.left);
+        assert!(!fit.waist_prior, "the crease is measured, not a prior");
+    }
+
+    /// The panel's line control moves a fitted row onto the row the user names, and the moved
+    /// row keeps the silhouette's own widths; a line placed by eye is a measurement, so its
+    /// prior flag clears. A zero line is the Reset: the measured fit is untouched.
+    #[test]
+    fn a_placement_line_moves_the_row_and_reads_the_width_there() {
+        let anchors = body_anchors();
+        let fit = body_fit(&anchors, &widening_mask()).expect("the synthetic person fits");
+        let before = fit.waist;
+        let mut moved = fit.clone();
+        assert!(apply_lines(&mut moved, &anchors, (0.0, 0.0)).is_empty());
+        assert_eq!(moved, fit, "zero is auto: nothing moves");
+        let notes = apply_lines(&mut moved, &anchors, (0.30, -0.30));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(moved.waist.t > before.t + 0.15, "waist line moved down: {:.2} -> {:.2}", before.t, moved.waist.t);
+        assert!(!moved.waist_prior, "a placed waist is not the prior any more");
+        assert!(moved.waist.left + moved.waist.right > before.left + before.right + 2.0, "the widths follow the row it landed on");
+        assert!(moved.belly.t < fit.belly.t - 0.10, "belly line moved up: {:.2} -> {:.2}", fit.belly.t, moved.belly.t);
+        assert!(!moved.belly_prior, "a placed belly is not the prior any more");
+    }
+
+    #[test]
+    fn placement_lines_refuse_values_outside_the_span() {
+        assert!(line_offsets(&json!({"waistLine": 101})).is_err());
+        assert!(line_offsets(&json!({"bellyLine": -101})).is_err());
+        assert!(line_offsets(&json!({"waistLine": "low"})).is_err());
+        assert_eq!(line_offsets(&json!({"waistLine": 100, "bellyLine": -100})).unwrap(), (0.30, -0.30));
+    }
+
+    /// The panel draws the rows the field acts on: the moved waist line sits on the hip row and
+    /// spans the fitted hip width, and the untouched belly line sits on the measured row.
+    #[test]
+    fn the_drawn_lines_are_the_rows_the_field_uses() {
+        let anchors = body_anchors();
+        let fit = body_fit(&anchors, &widening_mask()).expect("the synthetic person fits");
+        let auto_belly_y = 95.0 + f64::from(fit.belly.t) * (200.0 - 95.0);
+        let params = json!({"anchors": anchors, "fit": fit, "waistLine": 100});
+        let [waist, belly] = placement_lines(&params).expect("the fit places both lines");
+        assert!((waist.0 - 200.0).abs() < 6.0, "the waist line follows the moved row: {:.1}", waist.0);
+        assert!((74.0..=86.0).contains(&(waist.2 - waist.1)), "the span is the hip row's width: {:.1}", waist.2 - waist.1);
+        assert!((belly.0 - auto_belly_y).abs() < 0.5, "the belly line is on its measured row: {:.1} vs {auto_belly_y:.1}", belly.0);
+        assert!(belly.1 < belly.2, "the belly line spans the silhouette");
+    }
+
+    /// A line without a fit has nowhere to land. The field still runs from the anatomical
+    /// fallback, but the reply must say so rather than imply the user's line was honoured.
+    #[test]
+    fn a_line_without_a_fit_is_reported_not_silently_ignored() {
+        let params = json!({"anchors": body_anchors(), "waist": 50, "waistLine": 40});
+        let (_, report) = field_for(&params, Rect::new(0, 0, 256, 384)).expect("the field builds");
+        assert!(
+            report.approximate.iter().any(|(part, why)| *part == "waist" && why.contains("no measured body fit")),
+            "the unplaced line is named approximate: {report:?}"
+        );
+    }
+
+    /// A stored smart filter replays its params with no session and no analysis. The moved fit
+    /// is stored, so the line offsets must not be kept as well: replaying both moved the rows a
+    /// second time on every re-render.
+    #[test]
+    fn a_placement_line_is_baked_into_the_stored_fit_and_not_kept() {
+        let anchors = body_anchors();
+        let mut fit = body_fit(&anchors, &widening_mask()).expect("the synthetic person fits");
+        let auto = fit.clone();
+        apply_lines(&mut fit, &anchors, line_offsets(&json!({"waistLine": 100})).unwrap());
+        let params = json!({"waist": 50.0, "waistLine": 100, "anchors": serde_json::to_value(&anchors).unwrap(), "fit": auto});
+        let stored = stored_params(&params, &anchors, Some(&fit), None).expect("the params serialise");
+        assert!(stored.get("waistLine").is_none(), "the offset is baked, not replayed: {stored}");
+        assert_eq!(stored["fit"]["waist"], serde_json::to_value(fit.waist).unwrap(), "the moved row is what is stored");
+        // The stored form rebuilds the same field as the params that produced it.
+        let bounds = Rect::new(0, 0, 256, 384);
+        let (direct, _) = field_for(&params, bounds).expect("the run's field");
+        let (replay, _) = field_for(&stored, bounds).expect("the replayed field");
+        assert_eq!(direct, replay, "a smart filter re-renders the committed warp");
+    }
+
+    /// The line reaches the field the panel previews and Apply commits, and the prior's
+    /// approximate note goes away with it: a placed row must not still be reported as a guess.
+    #[test]
+    fn a_placement_line_reaches_the_field_and_clears_the_prior_report() {
+        let anchors = body_anchors();
+        let fit = body_fit(&anchors, &widening_mask()).expect("the synthetic person fits");
+        let canvas = Rect::new(0, 0, 256, 384);
+        let auto = json!({"anchors": anchors, "fit": fit, "waist": 50});
+        let (before, report) = field_for(&auto, canvas).expect("the auto field builds");
+        assert!(report.approximate.iter().any(|(part, why)| *part == "waist" && why.contains("anatomical waist")), "{report:?}");
+        let mut placed = auto.clone();
+        placed["waistLine"] = json!(100);
+        let (after, report) = field_for(&placed, canvas).expect("the placed field builds");
+        assert!(!report.approximate.iter().any(|(part, _)| *part == "waist"), "the placed waist is not approximate: {report:?}");
+        // The field is an inverse map, so a contraction at the left rim pushes the sample
+        // outward (negative x). The row moved down onto the hip line: that rim's outward pull
+        // grows, and the old waist rim's pull shrinks.
+        let (hip_rim, old_rim) = ([88.0, 200.0], [92.0, 168.5]);
+        let (before_hip, after_hip) = (before.sample(hip_rim[0], hip_rim[1])[0], after.sample(hip_rim[0], hip_rim[1])[0]);
+        assert!(after_hip < before_hip - 1.0, "the pull follows the line: {before_hip} -> {after_hip}");
+        let (before_old, after_old) = (before.sample(old_rim[0], old_rim[1])[0], after.sample(old_rim[0], old_rim[1])[0]);
+        assert!(after_old > before_old, "the old row's pull weakens: {before_old} -> {after_old}");
     }
 
     #[test]
@@ -1291,11 +1619,11 @@ mod tests {
             let mid_y = |a: usize, b: usize| ((anchors.pose[a][1] + anchors.pose[b][1]) * 0.5) as i32;
             let (sh_y, hip_y) = (mid_y(11, 12) as f32, mid_y(23, 24) as f32);
             let at = |t: f32| (sh_y + (hip_y - sh_y) * t) as i32;
-            // With no fit the field's own fallback row is the hip line (waist) with the belly
-            // just above it, so the gauges read where the field acts rather than at the
+            // With no fit the field's own fallback row is the anatomical waist (0.70) with the
+            // belly just below it, so the gauges read where the field acts rather than at the
             // anatomical middle.
-            let waist_y = fit.as_ref().map_or(at(1.0), |f| at(f.waist.t));
-            let waist_band = fit.as_ref().map_or((at(0.74), at(1.26)), |f| (at(f.waist.t - 0.085), at(f.waist.t + 0.085)));
+            let waist_y = fit.as_ref().map_or(at(0.70), |f| at(f.waist.t));
+            let waist_band = fit.as_ref().map_or((at(0.44), at(0.96)), |f| (at(f.waist.t - 0.085), at(f.waist.t + 0.085)));
             let head_y = anchors.head.centre[1] as i32;
             let head_x = anchors.head.centre[0] as i32;
             let w = canvas.width() as i32;
@@ -1344,8 +1672,8 @@ mod tests {
             let (head_band, waist_band, legs_band) = (
                 band_changed(&photo, &warped, head_y - anchors.head.radius as i32, head_y + anchors.head.radius as i32, w),
                 band_changed(&photo, &warped, waist_band.0, waist_band.1, w),
-                // Below the waist band's own reach: the fallback row now sits on the hip line,
-                // so the legs start past the band rather than past the hip joints.
+                // Below the waist band's own reach: the fallback row sits at the anatomical
+                // waist, so the legs start past the band rather than past the hip joints.
                 band_changed(&photo, &warped, waist_band.1 + 40, canvas.height() as i32, w),
             );
             eprintln!("waist-100 footprint: head {head_band:.3}, waist {waist_band:.3}, legs {legs_band:.3}");
