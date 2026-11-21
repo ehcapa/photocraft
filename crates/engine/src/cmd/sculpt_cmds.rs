@@ -429,25 +429,39 @@ pub fn body_fit(anchors: &SculptAnchors, mask: &Surface) -> Option<BodyFit> {
     // a straight-cut coat tapers all the way into its hem, so "narrowest" would put the waist
     // on the hips and the waist slider would squeeze the top of the skirt. The row counts
     // only when it is also measurably narrower than the torso at 35% and at 90% of the
-    // shoulder→hip span; otherwise the anatomical middle stands in. The bust is anatomical too, near a
-    // third of the way down: above that the arms merge with the chest, so "widest above the
-    // waist" always returns the armpit, not the bust. The belly sits between the measured
-    // waist and the hip joints, and the hips are the joints' own row — a skirt's widest hem
-    // is not the body.
+    // shoulder→hip span. The bust is anatomical too, near a third of the way down: above
+    // that the arms merge with the chest, so "widest above the waist" always returns the
+    // armpit, not the bust. The hips are the joints' own row — a skirt's widest hem is not
+    // the body.
+    let hip = near(1.0);
     let crease = narrowest(0.40, 0.80).filter(|&(_, l, r)| {
         let w = l + r;
         let margin = (0.01 * w).max(2.0);
         w + margin < width_at(0.35) && w + margin < width_at(0.90)
     });
-    let mut waist = crease.unwrap_or_else(|| near(0.62));
+    // Without a crease, where the waist row goes depends on why it is missing. A silhouette
+    // that widens again by the hip row is a body under clothes whose waist the mask cannot
+    // narrow — a loose cut or the sleeves beside the torso keep the outline from cinching, so
+    // the garment's waistband never shows in it. On a clothed subject the pose's hip joints
+    // mark the visible hip line and the waistband sits at or just above it, so the hip row
+    // stands in. A silhouette that only narrows into the hip row is a taper (a straight dress,
+    // a skirt), where the body's waist is above the visible shape and the anatomical middle
+    // stands. The old fixed middle put the waist on the ribs on every clothed silhouette the
+    // crease test rejected, which is what made the slider read as squeezing the chest.
+    let hip_w = width_at(hip.0);
+    let low = hip_w > width_at(0.62) + (0.01 * hip_w).max(2.0);
+    let mut waist = crease.unwrap_or_else(|| if low { hip } else { near(0.62) });
+    // The waist row fell to a prior rather than to a measured crease: the report says so.
+    let waist_prior = crease.is_none() && low;
     let bust = near(0.30f64.min(waist.0 - 0.10));
     if bust.0 >= waist.0 {
         // No room above the waist for the bust: the waist measurement is suspect, so the
         // anatomical middle takes over and the bust keeps its third.
         waist = near(0.62f64.max(bust.0 + 0.10));
     }
-    let belly = near((waist.0 + 1.0) * 0.5);
-    let hip = near(1.0);
+    // The belly sits between a measured waist and the hips; with the waist on the hip row
+    // there is no room below it, so the belly takes the lower abdomen just above the band.
+    let belly = if waist.0 + 0.12 > hip.0 { near((waist.0 - 0.10).max(0.70)) } else { near((waist.0 + hip.0) * 0.5) };
     waist.0 = waist.0.clamp(0.04, 1.02);
     let level = |p: (f64, f64, f64)| LevelFit { t: p.0 as f32, left: (p.1 * scale as f64) as f32, right: (p.2 * scale as f64) as f32 };
 
@@ -510,7 +524,7 @@ pub fn body_fit(anchors: &SculptAnchors, mask: &Surface) -> Option<BodyFit> {
         }
     }
 
-    Some(BodyFit { rows, waist: level(waist), belly: level(belly), hip: level(hip), bust: level(bust), limbs, inside: joint_inside })
+    Some(BodyFit { rows, waist: level(waist), belly: level(belly), hip: level(hip), bust: level(bust), limbs, inside: joint_inside, waist_prior })
 }
 
 /// Whether `(x, y)` or a small neighbourhood around it is inside `mask`; the tolerance keeps a
@@ -888,6 +902,45 @@ mod tests {
         m
     }
 
+    /// The same person in a jacket whose mask shows no waist crease: the torso's own run
+    /// widens down into the hips (the sleeves hang beside it as separate runs). The pose's
+    /// hip joints are then the only visible hip line and the waistband sits at or just above
+    /// them; the old fixed middle put the slider on the ribs.
+    fn widening_mask() -> Surface {
+        let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        m.fill_rect(Rect::new(0, 0, 256, 384), &[0.0]);
+        for (x0, x1, y0, y1) in [
+            (110, 146, 40, 85),   // head
+            (64, 86, 90, 130),    // left sleeve, hanging wide of the torso
+            (170, 192, 90, 130),  // right sleeve
+            (66, 88, 130, 170),   // left sleeve, closer in
+            (168, 190, 130, 170), // right sleeve
+            (90, 166, 90, 110),   // shoulders
+            (94, 162, 110, 150),  // chest
+            (92, 164, 150, 180),  // waist: a little wider than the chest
+            (88, 168, 180, 210),  // hips: the widest torso row
+            (104, 122, 210, 345), // left leg
+            (134, 152, 210, 345), // right leg
+        ] {
+            m.fill_rect(Rect::new(x0, y0, x1, y1), &[1.0]);
+        }
+        m
+    }
+
+    /// A silhouette that widens into the hip row has no crease to measure, so the waist takes
+    /// the pose's hip line and the belly takes the lower abdomen just above it — not the
+    /// anatomical middle, which on a clothed subject is the ribs.
+    #[test]
+    fn a_silhouette_that_widens_into_the_hips_puts_the_waist_on_the_hip_line() {
+        let fit = body_fit(&body_anchors(), &widening_mask()).expect("the synthetic person fits");
+        assert!(fit.is_valid(), "{fit:?}");
+        assert!(fit.waist_prior, "the waist fell back to the hip joints, not a measured crease");
+        assert!(fit.waist.t > 0.85, "the waist sits on the hip line, not the ribs: {:.2}", fit.waist.t);
+        assert!((fit.waist.t - fit.hip.t).abs() < 0.08, "waist {:.2} vs hip {:.2}", fit.waist.t, fit.hip.t);
+        assert!(fit.belly.t < fit.waist.t, "the belly sits above the waistband: {:.2}", fit.belly.t);
+        assert!((0.82..=0.96).contains(&fit.belly.t), "the belly row is the lower abdomen: {:.2}", fit.belly.t);
+    }
+
     /// A dress that only ever tapers must not drag the waist down to its hem: the waist row
     /// stays well above the narrowest low row instead of following it into the hips.
     #[test]
@@ -1238,8 +1291,11 @@ mod tests {
             let mid_y = |a: usize, b: usize| ((anchors.pose[a][1] + anchors.pose[b][1]) * 0.5) as i32;
             let (sh_y, hip_y) = (mid_y(11, 12) as f32, mid_y(23, 24) as f32);
             let at = |t: f32| (sh_y + (hip_y - sh_y) * t) as i32;
-            let waist_y = fit.as_ref().map_or((mid_y(11, 12) + mid_y(23, 24)) / 2, |f| at(f.waist.t));
-            let waist_band = fit.as_ref().map_or((at(0.30), at(0.78)), |f| (at(f.waist.t - 0.085), at(f.waist.t + 0.085)));
+            // With no fit the field's own fallback row is the hip line (waist) with the belly
+            // just above it, so the gauges read where the field acts rather than at the
+            // anatomical middle.
+            let waist_y = fit.as_ref().map_or(at(1.0), |f| at(f.waist.t));
+            let waist_band = fit.as_ref().map_or((at(0.74), at(1.26)), |f| (at(f.waist.t - 0.085), at(f.waist.t + 0.085)));
             let head_y = anchors.head.centre[1] as i32;
             let head_x = anchors.head.centre[0] as i32;
             let w = canvas.width() as i32;
@@ -1288,7 +1344,9 @@ mod tests {
             let (head_band, waist_band, legs_band) = (
                 band_changed(&photo, &warped, head_y - anchors.head.radius as i32, head_y + anchors.head.radius as i32, w),
                 band_changed(&photo, &warped, waist_band.0, waist_band.1, w),
-                band_changed(&photo, &warped, (hip_y + 40.0) as i32, canvas.height() as i32, w),
+                // Below the waist band's own reach: the fallback row now sits on the hip line,
+                // so the legs start past the band rather than past the hip joints.
+                band_changed(&photo, &warped, waist_band.1 + 40, canvas.height() as i32, w),
             );
             eprintln!("waist-100 footprint: head {head_band:.3}, waist {waist_band:.3}, legs {legs_band:.3}");
             assert!(waist_band > 0.01, "waist at 100 must move the waist band: {waist_band:.3}");

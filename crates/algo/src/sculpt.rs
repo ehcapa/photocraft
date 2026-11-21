@@ -43,6 +43,7 @@ const LIMB_COVERED: f64 = 0.45;
 /// Why a row that ran anyway is reported approximate.
 const INFERRED_REASON: &str = "the pose barely sees those landmarks; the position is inferred from the silhouette";
 const COVERED_REASON: &str = "a landmark lies outside the person silhouette; the covered part of the limb is used";
+const WAIST_PRIOR_REASON: &str = "the outline shows no waist, so the row follows the hip joints; the garment's waistband sits at or just above them";
 
 /// How far each part's full effect reaches toward its rim (Liquify's Density, 0..1): the
 /// body parts want a broad plateau with the feather at the rim only.
@@ -200,6 +201,11 @@ pub struct BodyFit {
     /// it is a limb whose covered bone span is long enough to shape. A `Vec` rather than
     /// `[bool; POSE_COUNT]` because serde has no array impl past 32.
     pub inside: Vec<bool>,
+    /// The waist row fell back to the hip joints because the mask showed no crease, rather
+    /// than to a measured waist: the field reports the waist and belly as approximate so a
+    /// garment whose outline hides the cinch is not mistaken for an exact measurement.
+    #[serde(default)]
+    pub waist_prior: bool,
 }
 
 impl Default for BodyFit {
@@ -212,6 +218,7 @@ impl Default for BodyFit {
             bust: LevelFit::default(),
             limbs: std::array::from_fn(|_| LimbFit::default()),
             inside: vec![false; POSE_COUNT],
+            waist_prior: false,
         }
     }
 }
@@ -588,10 +595,13 @@ const PARTS: &[Part] = &[
             // and the hips below: the old ±8.5% window acted on a narrow band and left the
             // torso dented above and below it. The level's `t` still places the peak; the
             // tail is what makes the slider read as a continuous narrowing.
-            // Without a fit the anatomical middle stands, the same fallback the fit itself
-            // uses when the silhouette shows no crease. It used to sit higher (0.54), which
-            // put the slider on the ribs whenever the matte could not measure a waist.
-            let centre = f.fit.map_or(0.62, |fit| f64::from(fit.waist.t));
+            // Without a fit nothing measured the torso, so the pose's hip row stands in: on a
+            // clothed subject the hip joints mark the visible hip line, and a garment's
+            // waistband sits at or just above it, so the slider lands where the photo cinches.
+            // The old anatomical middles (0.54, then 0.62) assumed bare anatomy; under any
+            // garment they put the slider on the ribs, which is what made the fallback read
+            // as squeezing the chest.
+            let centre = f.fit.map_or(1.0, |fit| f64::from(fit.waist.t));
             let gain = if f.fit.is_some() { 0.18 } else { 0.10 };
             f.profile(f.shoulder_mid(), f.hip_mid(), f.torso_levels(), Kernel::Bump { centre, half: 0.26 }, gain)
         },
@@ -601,7 +611,10 @@ const PARTS: &[Part] = &[
         slider: |s| s.belly,
         needs: &[11, 12, 23, 24],
         shape: |f| {
-            let centre = f.fit.map_or(0.81, |fit| f64::from(fit.belly.t));
+            // The measured row when the silhouette has one. Without a fit the lower abdomen
+            // sits about a tenth of the torso above the hip line the waist fallback uses, so
+            // the belly reads above the waistband and neither fallback touches the ribs.
+            let centre = f.fit.map_or(0.90, |fit| f64::from(fit.belly.t));
             let gain = if f.fit.is_some() { 0.17 } else { 0.08 };
             f.profile(f.shoulder_mid(), f.hip_mid(), f.torso_levels(), Kernel::Bump { centre, half: 0.22 }, gain)
         },
@@ -828,6 +841,16 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
         for (part, ..) in &asked {
             if fit_placed(part.name) {
                 report.approximate.push((part.name, "the photo's background blends with the body, so the region follows the pose, not the visible outline"));
+            }
+        }
+    }
+    // The fit measured no crease and placed the waist from the hip joints instead: the rows
+    // that row feeds are approximate, and the report says so rather than showing them as a
+    // measured waist.
+    if spec.fit.as_ref().is_some_and(|fit| fit.waist_prior) {
+        for (part, ..) in &asked {
+            if matches!(part.name, "slim body" | "waist" | "belly") {
+                report.approximate.push((part.name, WAIST_PRIOR_REASON));
             }
         }
     }
@@ -1396,6 +1419,7 @@ mod tests {
                 LimbFit { radius: 26.0, t0: 0.05, t1: 0.95 },
             ],
             inside: vec![true; POSE_COUNT],
+            waist_prior: false,
         }
     }
 
@@ -1405,6 +1429,22 @@ mod tests {
 
     fn build(sliders: SculptSliders) -> (LiquifyField, SculptReport) {
         sculpt_field(&spec(sliders), bounds(), CELL)
+    }
+
+    /// The field's largest displacement and the document point it sits at.
+    fn field_peak(field: &LiquifyField) -> (f32, [f64; 2]) {
+        let (mut peak, mut at) = (0.0f32, [0.0f64; 2]);
+        for j in 0..field.h {
+            for i in 0..field.w {
+                let d = field.d[j * field.w + i];
+                let m = d[0].hypot(d[1]);
+                if m > peak {
+                    peak = m;
+                    at = field.node_pos(i, j);
+                }
+            }
+        }
+        (peak, at)
     }
 
     #[test]
@@ -1456,27 +1496,37 @@ mod tests {
         }
     }
 
-    /// Without a fitted silhouette the waist falls back to the anatomical middle. The old
-    /// fallback sat at 0.54 of the shoulder→hip span — on the ribs, which is why the slider
-    /// read as squeezing the chest whenever the matte could not measure a waist.
+    /// Without a fitted silhouette the waist falls back to the pose's hip row: on a clothed
+    /// subject the hip joints mark the visible hip line, and the garment's waistband sits at
+    /// or just above it. The old fallbacks sat at 0.54, then 0.62, of the shoulder→hip span —
+    /// on the ribs — which is why the slider read as squeezing the chest whenever the matte
+    /// could not measure a waist.
     #[test]
-    fn without_a_fit_the_waist_peak_sits_between_the_ribs_and_the_hips() {
+    fn without_a_fit_the_waist_peak_sits_on_the_hip_line() {
         let (field, report) = build(SculptSliders { waist: 100.0, ..SculptSliders::default() });
         assert!(report.applied.contains(&"waist"), "{report:?}");
-        let (mut peak, mut at) = (0.0f32, [0.0f64; 2]);
-        for j in 0..field.h {
-            for i in 0..field.w {
-                let d = field.d[j * field.w + i];
-                let m = d[0].hypot(d[1]);
-                if m > peak {
-                    peak = m;
-                    at = field.node_pos(i, j);
-                }
-            }
-        }
+        let (peak, at) = field_peak(&field);
         assert!(peak > 2.0, "the waist must pull: {peak:.2}px");
         let t = (at[1] - 180.0) / (400.0 - 180.0); // shoulder mid → hip mid
-        assert!((0.55..=0.70).contains(&t), "the waist peak t={t:.2} sits on the ribs, not the waist");
+        assert!((0.90..=1.10).contains(&t), "the waist peak t={t:.2} left the hip line");
+        // The ribs the old fallback squeezed stay still.
+        let chest = field.sample(306.0, 180.0 + 0.62 * 220.0);
+        assert!(chest[0].hypot(chest[1]) < 0.5, "the chest must stay still: {chest:?}");
+    }
+
+    /// The belly fallback follows the waist one down: with no fit it sits on the lower
+    /// abdomen just above the hip line, so the rows read as belly above, waist at the band.
+    /// The old 0.81 row started inside the ribs.
+    #[test]
+    fn without_a_fit_the_belly_peak_sits_on_the_lower_abdomen() {
+        let (field, report) = build(SculptSliders { belly: 100.0, ..SculptSliders::default() });
+        assert!(report.applied.contains(&"belly"), "{report:?}");
+        let (peak, at) = field_peak(&field);
+        assert!(peak > 1.0, "the belly must pull: {peak:.2}px");
+        let t = (at[1] - 180.0) / (400.0 - 180.0); // shoulder mid → hip mid
+        assert!((0.84..=0.96).contains(&t), "the belly peak t={t:.2} left the lower abdomen");
+        let ribs = field.sample(306.0, 180.0 + 0.60 * 220.0);
+        assert!(ribs[0].hypot(ribs[1]) < 0.5, "the ribs must stay still: {ribs:?}");
     }
 
     /// A torso row placed from the joints alone is approximate and must say so; with a
@@ -1489,6 +1539,19 @@ mod tests {
         assert!(!loose.skipped.iter().any(|(n, _)| *n == "waist"), "{loose:?}");
         let (_, fitted) = sculpt_field(&fitted_spec(SculptSliders { waist: 100.0, ..SculptSliders::default() }), bounds(), CELL);
         assert!(fitted.approximate.iter().all(|(n, _)| *n != "waist"), "{fitted:?}");
+    }
+
+    /// A fit whose waist came from the hip joints rather than a measured crease says so: the
+    /// waist and belly rows it places are approximate. Presenting a row placed from the pose
+    /// as a measured one is what let the slider sit on the ribs and still read as precise.
+    #[test]
+    fn a_waist_placed_from_the_hip_joints_is_named_approximate() {
+        let mut fit = fitted();
+        fit.waist_prior = true;
+        let sliders = SculptSliders { waist: 100.0, belly: 60.0, ..SculptSliders::default() };
+        let (_, report) = sculpt_field(&SculptSpec { sliders, anchors: standing(), fit: Some(fit) }, bounds(), CELL);
+        assert!(report.approximate.iter().any(|(n, why)| *n == "waist" && why.contains("hip joints")), "{report:?}");
+        assert!(report.approximate.iter().any(|(n, _)| *n == "belly"), "{report:?}");
     }
 
     /// The shoulders slider narrows the shoulder the photo shows — the sleeve and the
@@ -1508,9 +1571,10 @@ mod tests {
 
     #[test]
     fn the_waist_slider_pulls_the_rim_in_proportion_to_its_value() {
-        // A point on the waist band's rim, to the axis's right. The inverse map points
-        // outward there (the rim samples farther out, which reads as pulled in).
-        let (x, y) = (294.0, 299.0);
+        // A point on the waist band's rim, to the axis's right, just above the hip row the
+        // fallback centres on. The inverse map points outward there (the rim samples farther
+        // out, which reads as pulled in).
+        let (x, y) = (294.0, 396.0);
         let m = |v: f32| {
             let (field, _) = build(SculptSliders { waist: v, ..SculptSliders::default() });
             let d = field.sample(x, y);
@@ -1524,7 +1588,7 @@ mod tests {
         }
         let (field, _) = build(SculptSliders { waist: 100.0, ..SculptSliders::default() });
         let right = field.sample(x, y);
-        let left = field.sample(219.0, 299.0);
+        let left = field.sample(219.0, 396.0);
         assert!(right[0] > 0.5 && left[0] < -0.5, "the field must point outward on both rims ({right:?} {left:?})");
     }
 
