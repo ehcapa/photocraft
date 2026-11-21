@@ -145,6 +145,22 @@ fn apply_with_anchors_is_one_step_and_keeps_the_panel_open() {
     assert!(h.state().sculpt_live.as_ref().is_some_and(|live| !live.has_preview()), "the preview gives way to the commit");
 }
 
+/// Height and Leg Length stretch from the ankles; a pose that only guessed the feet moves the
+/// photo by a few invisible pixels. The panel says so before Apply instead of leaving the
+/// sliders looking dead.
+#[test]
+fn the_length_sliders_warn_when_the_pose_did_not_see_the_feet() {
+    let mut app = app(blank(256, 384));
+    let seen = Live::test(&mut app, BODY, body_anchors(256.0, 384.0));
+    assert_eq!(seen.warning_text(), None, "feet in view raise no warning");
+    let mut anchors = body_anchors(256.0, 384.0);
+    for i in [27usize, 28] {
+        anchors["pose"][i][2] = json!(0.3);
+    }
+    let guessed = Live::test(&mut app, BODY, anchors);
+    assert!(guessed.warning_text().is_some_and(|t| t.contains("feet")), "a guessed foot is said before Apply");
+}
+
 /// An Apply whose reply leaves a region out, or places one by inference, says so inline. A
 /// clean reply leaves the status line alone.
 #[test]

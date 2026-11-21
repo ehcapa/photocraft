@@ -906,7 +906,7 @@ pub fn analyze_anchors(
             Ok(AnchorsReply {
                 anchors: serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?,
                 fit: fit.as_ref().map(serde_json::to_value).transpose().map_err(|e| EngineError::Other(format!("the body fit would not serialise: {e}")))?,
-                contour: person.and_then(crate::sculpt_cmds::person_contour),
+                contour: person.and_then(|mask| crate::sculpt_cmds::person_contour(mask, &anchors)),
                 quality: None,
             })
         }

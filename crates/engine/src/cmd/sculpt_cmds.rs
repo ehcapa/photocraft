@@ -31,6 +31,11 @@ pub const SCULPT: &str = "filter.bodySculpt";
 /// The refusal a run without usable anchors answers (`portrait.analyze` reports it too).
 pub(crate) const NO_PERSON: &str = "no person found — Body Sculpt needs the body-pose landmarks";
 
+/// The pose visibility a symmetry joint needs before it may be moved: below this the pose is
+/// guessing, and the guess often lands on whatever is behind the joint (a raised arm's elbow on
+/// the cheek, a cropped leg's knee on the jacket).
+const SYMMETRY_SEEN: f32 = 0.5;
+
 fn bad(msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: SCULPT.into(), msg: msg.into() }
 }
@@ -151,41 +156,124 @@ pub(crate) fn anchors_from_analysis(a: &photocraft_portrait::Analysis) -> Option
     Some(SculptAnchors { doc: [a.width as f32, a.height as f32], pose, head, chin })
 }
 
-/// The person mask's silhouette as a closed polyline: the left and right rims of every
-/// sampled row, walked down one side and back up the other. Rows that read empty — or
-/// edge-to-edge, a subject tier that cannot separate this photo's background — contribute
-/// nothing, so a full-width mask yields no contour and the smooth slider says so instead of
-/// smoothing the frame's box.
-pub(crate) fn person_contour(mask: &Surface) -> Option<Vec<[f64; 2]>> {
-    let b = mask.content_bounds();
-    let w = b.x1.max(0);
-    let rows: usize = b.height() as usize;
-    let step = (rows / 120).max(1);
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-    let mut y = b.y0;
-    while y < b.y1 {
-        let (mut l, mut r) = (None, None);
-        for x in 0..w {
-            if mask.sample_channel(x, y, 0) > 0.5 {
-                l.get_or_insert(x);
-                r = Some(x);
-            }
-        }
-        if let (Some(l), Some(r)) = (l, r)
-            && r - l < w * 9 / 10
-            && r - l > 4
-        {
-            left.push([l as f64 + 0.5, y as f64 + 0.5]);
-            right.push([r as f64 + 0.5, y as f64 + 0.5]);
-        }
-        y += step as i32;
-    }
-    if left.len() < 8 {
+/// The x of the pose's torso axis (shoulder mid → hip mid, extended to `y`) on a document row,
+/// when the shoulders name a torso; `None` otherwise. The contour is seeded on this axis so the
+/// subject is chosen by its landmarks rather than by whatever the mask happened to pick up
+/// beside it.
+fn torso_axis_x(anchors: &SculptAnchors, y: f64) -> Option<f64> {
+    let mid = |i: usize, j: usize| {
+        let (a, b) = (anchors.pose.get(i)?, anchors.pose.get(j)?);
+        Some([(f64::from(a[0]) + f64::from(b[0])) * 0.5, (f64::from(a[1]) + f64::from(b[1])) * 0.5])
+    };
+    let (s, h) = (mid(11, 12)?, mid(23, 24)?);
+    if !s.into_iter().chain(h).all(f64::is_finite) {
         return None;
     }
-    right.reverse();
-    left.extend(right);
+    let dy = h[1] - s[1];
+    Some(if dy.abs() > 1.0 { s[0] + (y - s[1]) * (h[0] - s[0]) / dy } else { s[0] })
+}
+
+/// The person mask's silhouette as a closed polyline: the left and right rims of the subject's
+/// own span in every sampled row, walked down one side and back up the other. The span is not
+/// the row's outermost mask pixels: a person matte often carries a background figure, a crowd
+/// or the sky on the same row, and taking the union rim made the contour jump hundreds of pixels
+/// between rows — the low-pass then read the jump as a bump and smeared the whole neighbourhood
+/// with a huge circular warp. The span is tracked row to row: each row takes every run that
+/// overlaps the previous span, so legs between torso rows stay whole, while a disconnected
+/// background figure beside the subject is left out. Rows that read empty — or edge-to-edge, a
+/// subject tier that cannot separate this photo's background — contribute nothing, and a row
+/// whose span widens implausibly fast is the mask fusing the subject with the background: the
+/// walk stops there rather than following the fusion into the crowd, so the contour covers only
+/// the part of the silhouette the mask can actually resolve.
+pub(crate) fn person_contour(mask: &Surface, anchors: &SculptAnchors) -> Option<Vec<[f64; 2]>> {
+    let b = mask.content_bounds();
+    if b.width() < 8 || b.height() < 16 {
+        return None;
+    }
+    let rows: usize = b.height() as usize;
+    let step = (rows / 120).max(1);
+    let full = b.x1 - b.x0;
+    // Every sampled row's usable runs: at least a few pixels wide, and not the whole width.
+    let mut ys: Vec<i32> = Vec::new();
+    let mut runs: Vec<Vec<(i32, i32)>> = Vec::new();
+    let mut y = b.y0;
+    while y < b.y1 {
+        let mut row: Vec<(i32, i32)> = Vec::new();
+        let mut start: Option<i32> = None;
+        for x in b.x0..b.x1 {
+            if mask.sample_channel(x, y, 0) > 0.5 {
+                start.get_or_insert(x);
+            } else if let Some(s) = start.take()
+                && x - s > 4
+                && x - s < full * 9 / 10
+            {
+                row.push((s, x - 1));
+            }
+        }
+        if let Some(s) = start
+            && b.x1 - s > 4
+            && b.x1 - s < full * 9 / 10
+        {
+            row.push((s, b.x1 - 1));
+        }
+        ys.push(y);
+        runs.push(row);
+        y += step as i32;
+    }
+    // The seed is the row nearest the content's vertical middle — the torso or hips on a
+    // standing person — not the widest row anywhere: on a photo whose background fuses with the
+    // subject, the widest row is the fusion, and starting there centred the whole contour on it.
+    // Within that row the runs are taken around the pose's own torso axis, so a background
+    // figure beside a standing subject is not the seed even when it is the widest thing there,
+    // and two separated legs are both seeded.
+    let mid = (b.y0 + b.y1) / 2;
+    let seed = runs.iter().enumerate().filter(|(_, r)| !r.is_empty()).min_by_key(|&(k, _)| (ys[k] - mid).abs())?.0;
+    let axis = torso_axis_x(anchors, f64::from(ys[seed])).unwrap_or(f64::from(b.x0 + full / 2));
+    let shoulder_w = anchors.pose.get(11).zip(anchors.pose.get(12)).map_or(full as f32, |(a, b)| (a[0] - b[0]).hypot(a[1] - b[1])).max(8.0);
+    // At the waist the torso, and the legs when they are apart, lie within about half a
+    // shoulder width of the axis; a background figure that is its own run sits farther out.
+    let window = f64::from(shoulder_w) * 0.5;
+    let mut seeded: Vec<(i32, i32)> = runs[seed].iter().copied().filter(|&(l, r)| f64::from(r) >= axis - window && f64::from(l) <= axis + window).collect();
+    if seeded.is_empty() {
+        let near = |&&(l, r): &&(i32, i32)| ((f64::from(l) + f64::from(r)) * 0.5 - axis).abs();
+        seeded.push(*runs[seed].iter().min_by(|a, b| near(a).total_cmp(&near(b)))?);
+    }
+    let widest = (seeded.iter().map(|&(l, _)| l).min()?, seeded.iter().map(|&(_, r)| r).max()?);
+    let seed_w = f64::from(widest.1 - widest.0);
+    let mut span: Vec<(i32, i32, i32)> = vec![(ys[seed], widest.0, widest.1)];
+    let prev = (widest.0, widest.1);
+    // Walk both ways from the seed; a row joins the contour when any of its runs overlaps the
+    // previous span in x, and the span becomes the union of the overlapping runs. A span that
+    // grows by more than a quarter of its width (plus a few pixels for a coarse row step) is the
+    // mask running into the background, not the subject's own outline: the walk ends below it.
+    let total_cap = seed_w * 3.0;
+    for dir in [1isize, -1] {
+        let mut here = prev;
+        let mut k = seed as isize + dir;
+        while (0..runs.len() as isize).contains(&k) {
+            let row = &runs[k as usize];
+            let joining: Vec<(i32, i32)> = row.iter().copied().filter(|&(l, r)| l <= here.1 && r >= here.0).collect();
+            if joining.is_empty() {
+                break;
+            }
+            let l = joining.iter().map(|r| r.0).min()?;
+            let r = joining.iter().map(|r| r.1).max()?;
+            let grow = f64::from(here.1 - here.0) * 0.25 + 8.0;
+            if f64::from(r - l) > f64::from(here.1 - here.0) + grow || f64::from(r - l) > total_cap {
+                break;
+            }
+            span.push((ys[k as usize], l, r));
+            here = (l, r);
+            k += dir;
+        }
+    }
+    if span.len() < 8 {
+        return None;
+    }
+    span.sort_by_key(|s| s.0);
+    let mut left: Vec<[f64; 2]> = span.iter().map(|&(y, l, _)| [l as f64 + 0.5, y as f64 + 0.5]).collect();
+    let mut right: Vec<[f64; 2]> = span.iter().rev().map(|&(y, _, r)| [r as f64 + 0.5, y as f64 + 0.5]).collect();
+    left.append(&mut right);
     Some(left)
 }
 
@@ -450,10 +538,10 @@ fn contour_of(p: &Value) -> Option<Vec<[f64; 2]>> {
 
 /// Stamps the contour relaxation into a built field (the run path builds it from the
 /// analysis, the replay path reads it back from the stored params — same stamp either way).
-fn stamp_contour(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64; 2]], smooth: f32) {
+fn stamp_contour(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64; 2]], smooth: f32) -> usize {
     let len: f64 = pts.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum::<f64>()
         + (pts[0][0] - pts[pts.len() - 1][0]).hypot(pts[0][1] - pts[pts.len() - 1][1]);
-    contour::stamp(field, pts, len / pts.len() as f64, f64::from(smooth));
+    contour::stamp(field, pts, len / pts.len() as f64, f64::from(smooth))
 }
 
 /// The field every path builds: the slider warp, the symmetry pair alignment and the
@@ -462,22 +550,40 @@ fn stamp_contour(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64
 fn field_with(spec: SculptSpec, contour: Option<&[[f64; 2]]>, symmetry: f32, smooth: f32, canvas: Rect, cell: f64) -> (LiquifyField, SculptReport) {
     let (mut field, mut report) = sculpt_field(&spec, canvas, cell);
     // 对称液化·上半身: the paired joints align toward each other's mirror about the
-    // torso axis — pure geometry of the stored joints, replayed for free.
+    // torso axis — pure geometry of the stored joints, replayed for free. Only a local touch
+    // of asymmetry is aligned: a joint the pose guessed, or a pair in a genuinely different
+    // pose (one arm raised), is left alone instead of dragging its whole falloff disc across
+    // the photo. The report names the part approximate when only some pairs qualified.
     if symmetry > 0.0 {
         let pts: Vec<[f64; 2]> = spec.anchors.pose.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
-        let shoulder_mid = [(pts[11][0] + pts[12][0]) * 0.5, (pts[11][1] + pts[12][1]) * 0.5];
-        let hip_mid = [(pts[23][0] + pts[24][0]) * 0.5, (pts[23][1] + pts[24][1]) * 0.5];
-        let reach = ((pts[11][0] - pts[12][0]).hypot(pts[11][1] - pts[12][1]) * 0.5).max(8.0);
-        contour::align_pairs(
-            &mut field,
-            &pts,
-            SYMMETRY_PAIRS,
-            shoulder_mid,
-            [hip_mid[0] - shoulder_mid[0], hip_mid[1] - shoulder_mid[1]],
-            f64::from(symmetry),
-            reach,
-        );
-        report.applied.push("symmetry");
+        let vis: Vec<f32> = spec.anchors.pose.iter().map(|q| q[2]).collect();
+        let seen = |i: usize| vis.get(i).copied().unwrap_or(0.0) >= SYMMETRY_SEEN;
+        if !seen(11) || !seen(12) {
+            report.skipped.push(("symmetry", "the pose does not see both shoulders"));
+        } else {
+            let shoulder_mid = [(pts[11][0] + pts[12][0]) * 0.5, (pts[11][1] + pts[12][1]) * 0.5];
+            let reach = ((pts[11][0] - pts[12][0]).hypot(pts[11][1] - pts[12][1]) * 0.5).max(8.0);
+            // The torso axis runs shoulder mid to hip mid when the pose sees the hips; when it
+            // does not, the shoulder line's own downward normal is the torso's direction.
+            let dir = if seen(23) && seen(24) {
+                let hip_mid = [(pts[23][0] + pts[24][0]) * 0.5, (pts[23][1] + pts[24][1]) * 0.5];
+                [hip_mid[0] - shoulder_mid[0], hip_mid[1] - shoulder_mid[1]]
+            } else {
+                let u = [pts[11][0] - pts[12][0], pts[11][1] - pts[12][1]];
+                let p = [-u[1], u[0]];
+                if p[1] < 0.0 { [-p[0], -p[1]] } else { p }
+            };
+            let pairs = contour::alignable_pairs(&pts, &vis, SYMMETRY_PAIRS, shoulder_mid, dir, reach);
+            if pairs.is_empty() {
+                report.skipped.push(("symmetry", "the pose's paired joints are too far from symmetric to align"));
+            } else {
+                contour::align_pairs(&mut field, &pts, &pairs, shoulder_mid, dir, f64::from(symmetry), reach);
+                if pairs.len() < SYMMETRY_PAIRS.len() {
+                    report.approximate.push(("symmetry", "joints the pose missed or saw far from their mirror are left alone"));
+                }
+                report.applied.push("symmetry");
+            }
+        }
     }
     // 身型流畅: the silhouette's own contour, low-passed and stamped over the parts. The
     // contour rides the stored params like the anchors, so the re-render replays it with
@@ -485,7 +591,10 @@ fn field_with(spec: SculptSpec, contour: Option<&[[f64; 2]]>, symmetry: f32, smo
     if smooth > 0.0 {
         match contour {
             Some(pts) => {
-                stamp_contour(&mut field, pts, smooth);
+                let dropped = stamp_contour(&mut field, pts, smooth);
+                if dropped > 0 {
+                    report.approximate.push(("smooth", "parts of the subject outline merge into the background; only its own bumps are relaxed there"));
+                }
                 report.applied.push("smooth");
             }
             None => report.skipped.push(("smooth", "the subject mask has no contour to relax")),
@@ -552,7 +661,7 @@ fn sculpt(s: &mut Session, p: &Value) -> Result<Value> {
                 if analysis.is_none() {
                     analysis = lightweight(s, all_layers).ok();
                 }
-                analysis.as_ref().and_then(|a| a.mask(photocraft_portrait::Region::Person)).and_then(person_contour)
+                analysis.as_ref().and_then(|a| a.mask(photocraft_portrait::Region::Person)).and_then(|m| person_contour(m, &anchors))
             }
         }
     } else {
@@ -788,6 +897,54 @@ mod tests {
         let mut blank = Surface::new(photocraft_color::PixelFormat::GRAY8);
         blank.fill_rect(Rect::new(0, 0, 64, 64), &[0.0]);
         assert!(body_fit(&body_anchors(), &blank).is_none());
+    }
+
+    /// The smooth contour is the subject's own rim, not the row's outermost mask pixel: a
+    /// background figure beside the subject used to join the contour on every row it shared,
+    /// and the low-pass then read the jump as a silhouette bump — a circular smear at the
+    /// subject's waist, drawn from a person standing ten metres behind her.
+    #[test]
+    fn the_contour_follows_the_subject_and_leaves_a_background_figure_out() {
+        let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        m.fill_rect(Rect::new(0, 0, 256, 384), &[0.0]);
+        m.fill_rect(Rect::new(120, 40, 200, 340), &[1.0]); // the subject
+        m.fill_rect(Rect::new(20, 100, 60, 300), &[1.0]); // a disconnected background figure
+        let contour = person_contour(&m, &body_anchors()).expect("the subject has a contour");
+        let min_x = contour.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+        assert!(min_x > 110.0, "the contour must stay on the subject, got x={min_x}");
+    }
+
+    /// The mask can also fuse the subject with the background into one run (a blurred sky or
+    /// crowd touching the shoulders). The contour must stop where the fusion begins instead of
+    /// following it across the frame: a row whose span jumps to the background is not the
+    /// subject's outline, and the low-pass would turn the jump into a huge circular smear.
+    #[test]
+    fn a_mask_fused_with_the_background_stops_the_contour() {
+        let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        m.fill_rect(Rect::new(0, 0, 256, 384), &[0.0]);
+        m.fill_rect(Rect::new(120, 40, 200, 340), &[1.0]); // the subject
+        m.fill_rect(Rect::new(0, 60, 250, 100), &[1.0]); // a background band touching the subject
+        let contour = person_contour(&m, &body_anchors()).expect("the subject has a contour");
+        let min_x = contour.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+        assert!(min_x > 110.0, "the contour followed the fused band into the background, got x={min_x}");
+        let max_x = contour.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
+        assert!(max_x < 210.0, "the contour followed the fused band into the background, got x={max_x}");
+    }
+
+    /// 对称液化 at 100 is a touch of asymmetry, not a pose transplant: a wrist raised to the
+    /// head must not be dragged down to the other wrist's mirror through a disc of the photo.
+    /// The pairs the pose saw in a plausible pose still align; the report says some were left.
+    #[test]
+    fn the_symmetry_pass_leaves_a_raised_arm_alone() {
+        let mut anchors = body_anchors();
+        anchors.pose[15] = [80.0, 60.0, 1.0]; // the left wrist up by the head
+        let fit = body_fit(&anchors, &body_mask()).expect("the synthetic person fits");
+        let bounds = Rect::new(0, 0, 256, 384);
+        let (field, report) =
+            field_with(SculptSpec { sliders: SculptSliders::default(), anchors, fit: Some(fit) }, None, 100.0, 0.0, bounds, auto_cell(bounds));
+        assert!(field.max_displacement() < 5.0, "the raised wrist must not teleport: {:.1}px", field.max_displacement());
+        assert!(report.applied.contains(&"symmetry"), "{report:?}");
+        assert!(report.approximate.iter().any(|(n, _)| *n == "symmetry"), "the skipped pair must be named: {report:?}");
     }
 
     #[test]

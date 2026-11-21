@@ -294,16 +294,24 @@ impl Live {
         self.suppress.map(|why| crate::i18n::t(why).to_owned())
     }
 
-    /// The question Face Sculpt should warn about before its warp is trusted: the
-    /// whole-document fallback (no face box) or a turned head. `None` when the analysis is
-    /// fine, for Body, or before one has landed.
+    /// The question the analysis raises before the warp is trusted: for Face, the
+    /// whole-document fallback (no face box) or a turned head; for Body, feet the pose did not
+    /// see — Height and Leg Length need the ankles, and without them the sliders cannot move
+    /// the legs at all. `None` when the analysis is fine, or before one has landed.
     pub fn warning_text(&self) -> Option<String> {
-        let q = self.quality.as_ref()?;
-        if q.get("source").and_then(Value::as_str) == Some("wholeDocument") {
-            return Some(tl!("No face box was found, so the landmarks came from the whole photo; select the face and re-analyse for a closer fit").into());
+        if let Some(q) = &self.quality {
+            if q.get("source").and_then(Value::as_str) == Some("wholeDocument") {
+                return Some(tl!("No face box was found, so the landmarks came from the whole photo; select the face and re-analyse for a closer fit").into());
+            }
+            let turn = q.get("turnDeg").and_then(Value::as_f64).unwrap_or(0.0);
+            return (turn.abs() > 20.0).then(|| tl!("The face is turned; Face Sculpt is least accurate on a profile").to_string());
         }
-        let turn = q.get("turnDeg").and_then(Value::as_f64).unwrap_or(0.0);
-        (turn.abs() > 20.0).then(|| tl!("The face is turned; Face Sculpt is least accurate on a profile").to_string())
+        // The same gate the field uses (the engine's pose visibility floor): below it the pose
+        // is guessing, and the length rows are skipped rather than stretching the wrong part.
+        const SEEN: f64 = 0.5;
+        let pose = self.anchors.get("pose")?.as_array()?;
+        let seen = |i: usize| pose.get(i).and_then(|p| p.get(2)).and_then(Value::as_f64).unwrap_or(0.0) >= SEEN;
+        (!seen(27) || !seen(28)).then(|| tl!("The feet are not in view, so Height and Leg Length cannot lengthen the legs").to_string())
     }
 
     /// The face box the current anchors were meshed inside, if the user drew one.

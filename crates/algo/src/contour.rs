@@ -9,8 +9,41 @@
 use crate::liquify::{LiquifyField, falloff};
 
 /// How far each contour point's correction reaches into its neighbourhood, in multiples of
-/// the contour's own point spacing: the smoothing scale follows the feature it relaxes.
-const REACH: f64 = 6.0;
+/// the contour's own point spacing: the smoothing scale follows the feature it relaxes. It
+/// stays a few spacings wide so the stamp reads as the outline relaxing, not as a brush disc
+/// drawn over the photo; it must also stay above the falloff's peak slope times the largest
+/// correction allowed below (about 1.9 × `MAX_CORRECTION`) or the warp folds.
+const REACH: f64 = 3.0;
+
+/// A contour point this close to the field's border lies on a frame edge, where the silhouette
+/// is cut by the photo rather than shaped by the subject: it is held out of the smoothing, so a
+/// corner at the frame cannot lever the whole side of the subject inward.
+const BORDER: f64 = 0.75;
+
+/// The smallest pose visibility a joint needs before a symmetry pass may move it. Below this
+/// the pose is guessing (a hand out of frame, a shoulder behind the head point), and aligning
+/// the guess would warp whatever the guess happened to land on.
+const SEEN: f32 = 0.5;
+
+/// How much of the stamp's disc a symmetry correction may use. A pair needing more than this is
+/// not an asymmetry to smooth but a different pose — one arm raised, a hand on the hip — and
+/// teleporting it would drag the whole disc with it.
+const ALIGN_LIMIT: f64 = 0.35;
+
+/// How far a contour point may move in one smoothing pass, in multiples of the contour's own
+/// spacing. A correction beyond this is not a bump the low-pass relaxed: it is the silhouette
+/// changing plan — a handbag jutting out, the gap between two legs, the person mask fusing with
+/// a crowd — and stamping it drags a disc of the photo with it (the circular smears the smooth
+/// slider drew from a real mask). Such points are left where they are: the pass relaxes the
+/// outline's bumps and leaves its real concavities alone.
+const MAX_CORRECTION: f64 = 1.0;
+
+/// The largest step between neighbouring contour points that is still one contour, in multiples
+/// of the point spacing. A bigger step is a cut — where the tracked silhouette ends (the mask
+/// fused with the background, the frame clipped it) or where two limbs cross — and the low-pass
+/// must hold its ends there instead of averaging across the cut: a closed-ring smoother saw the
+/// chord across such a cut as a bump and dragged its corners hundreds of pixels.
+const MAX_STEP: f64 = 2.5;
 
 /// Smooths `pts` in place with `strength` (0..100) passes of the binomial kernel
 /// `[1, 2, 1] / 4` (a closed contour wraps; an open one holds its ends). The kernel is the
@@ -37,18 +70,102 @@ pub fn low_pass(pts: &mut [[f64; 2]], closed: bool, strength: f64) {
 
 /// Stamps a contour's relaxation into `field`: each point's correction (its low-passed
 /// position minus itself — inward where the contour bulges, outward where it dips) moves
-/// its neighbourhood on a falloff disc of `REACH` spacings, the correction's own scale. The
-/// stamps superpose; a straight run corrects nothing, a bulge pulls its whole rim in.
+/// its neighbourhood on a falloff disc of `REACH` spacings, the correction's own scale.
+/// Overlapping stamps blend as a weighted mean; a straight run corrects nothing, a bulge pulls
+/// its whole rim in.
 ///
 /// The forward motion is the correction itself (a bulge's rim moves inward), so the
 /// inverse-map displacement points against it.
-pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength: f64) {
-    if pts.len() < 3 {
-        return;
+///
+/// A closed contour with no cut is smoothed whole. One that touches the frame edge, or whose
+/// points step farther than [`MAX_STEP`] (a cut where the tracked silhouette ends or two limbs
+/// cross), is split there into open runs first: a cut is not a silhouette feature, and letting
+/// the closed-ring low-pass see it pulled the frame-clipped side of a portrait inward by more
+/// than a hundred pixels, and dragged the corners of a stopped body contour hundreds of pixels —
+/// circular bulges, not a smoother outline. An open run holds its ends, so the correction fades
+/// to nothing at a cut.
+///
+/// Returns how many corrections were left out because they exceeded [`MAX_CORRECTION`]; the
+/// caller reports the pass approximate when any were, instead of showing a large warp as a
+/// faithful smoother.
+pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength: f64) -> usize {
+    if pts.len() < 3 || !spacing.is_finite() || spacing <= 1e-9 {
+        return 0;
     }
-    let mut smoothed = pts.to_vec();
-    low_pass(&mut smoothed, true, strength);
     let reach = (spacing * REACH).max(6.0);
+    let limit = spacing * MAX_CORRECTION;
+    let step = spacing * MAX_STEP;
+    let n = pts.len();
+    let gap = |i: usize| (pts[(i + 1) % n][0] - pts[i][0]).hypot(pts[(i + 1) % n][1] - pts[i][1]) > step;
+    // A cut precedes every run. Starting at one keeps a run from wrapping across the seam.
+    let start = (0..n).find(|&i| on_border(field, pts[i]) || gap(i) || gap((i + n - 1) % n));
+    let mut items: Vec<([f64; 2], [f64; 2])> = Vec::new();
+    let mut dropped = 0;
+    match start {
+        None => {
+            // No cut anywhere: the contour closes on itself and is smoothed as one ring.
+            let mut smoothed = pts.to_vec();
+            low_pass(&mut smoothed, true, strength);
+            dropped = push_corrections(&mut items, pts, &smoothed, limit);
+        }
+        Some(start) => {
+            let mut run: Vec<[f64; 2]> = Vec::new();
+            for k in 0..n {
+                let i = (start + k) % n;
+                if on_border(field, pts[i]) {
+                    dropped += smooth_run(&mut items, &run, strength, limit);
+                    run.clear();
+                    continue;
+                }
+                run.push(pts[i]);
+                if gap(i) {
+                    dropped += smooth_run(&mut items, &run, strength, limit);
+                    run.clear();
+                }
+            }
+            dropped += smooth_run(&mut items, &run, strength, limit);
+        }
+    }
+    stamp_corrections(field, &items, reach, 2);
+    dropped
+}
+
+/// A point cut by the frame, held out of the contour smoothing.
+fn on_border(field: &LiquifyField, p: [f64; 2]) -> bool {
+    let b = field.bounds;
+    p[0] <= f64::from(b.x0) + BORDER || p[0] >= f64::from(b.x1) - BORDER || p[1] <= f64::from(b.y0) + BORDER || p[1] >= f64::from(b.y1) - BORDER
+}
+
+/// The corrections of one open contour run, low-passed with its ends held. Returns how many
+/// exceeded the limit and were left out.
+fn smooth_run(items: &mut Vec<([f64; 2], [f64; 2])>, run: &[[f64; 2]], strength: f64, limit: f64) -> usize {
+    if run.len() < 3 {
+        return 0;
+    }
+    let mut smoothed = run.to_vec();
+    low_pass(&mut smoothed, false, strength);
+    push_corrections(items, run, &smoothed, limit)
+}
+
+fn push_corrections(items: &mut Vec<([f64; 2], [f64; 2])>, pts: &[[f64; 2]], smoothed: &[[f64; 2]], limit: f64) -> usize {
+    let mut dropped = 0;
+    for (p, q) in pts.iter().zip(smoothed) {
+        let delta = [q[0] - p[0], q[1] - p[1]];
+        let mag = delta[0].hypot(delta[1]);
+        if mag < 1e-9 {
+            continue;
+        }
+        if mag > limit {
+            dropped += 1;
+            continue;
+        }
+        items.push((*p, delta));
+    }
+    dropped
+}
+
+/// Stamps `(point, correction)` pairs as a falloff-weighted mean and relaxes the field.
+fn stamp_corrections(field: &mut LiquifyField, items: &[([f64; 2], [f64; 2])], reach: f64, passes: usize) {
     let inv = 1.0 / field.cell;
     let (bx, by) = (f64::from(field.bounds.x0) + 0.5, f64::from(field.bounds.y0) + 0.5);
     // Scattered interpolation, not a sum: overlapping discs carry coherent corrections, and
@@ -56,10 +173,8 @@ pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength:
     // takes the corrections' falloff-weighted mean.
     let mut num = vec![[0.0f64; 2]; field.w * field.h];
     let mut den = vec![0.0f64; field.w * field.h];
-    for (p, q) in pts.iter().zip(&smoothed) {
-        let delta = [q[0] - p[0], q[1] - p[1]];
-        let mag0 = delta[0].hypot(delta[1]);
-        if mag0 < 1e-9 {
+    for &(p, delta) in items {
+        if delta[0].hypot(delta[1]) < 1e-9 {
             continue;
         }
         let (i0, j0, i1, j1) = (
@@ -89,7 +204,7 @@ pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength:
             d[1] -= (nv[1] / w) as f32;
         }
     }
-    relax(field, 2);
+    relax(field, passes);
 }
 
 /// 3D塑颜: rotates the mesh's own 3D points about their centre (yaw about the vertical
@@ -134,6 +249,37 @@ fn reflect(p: [f64; 2], a: [f64; 2], u: [f64; 2]) -> [f64; 2] {
     [a[0] + along * u[0] - perp[0], a[1] + along * u[1] - perp[1]]
 }
 
+/// The pairs [`align_pairs`] may move: both joints seen by the pose, and the mirror correction
+/// no larger than [`ALIGN_LIMIT`] of the stamp's `reach`. A pair failing either is not a touch
+/// of asymmetry — it is a different pose (one arm raised, a hand on the hip) or a joint the
+/// pose guessed — and aligning it would drag a disc of the photo across the frame, which is
+/// what turned the symmetry slider into circular smears on a real photo.
+pub fn alignable_pairs(pts: &[[f64; 2]], visibility: &[f32], pairs: &[(usize, usize)], axis: [f64; 2], dir: [f64; 2], reach: f64) -> Vec<(usize, usize)> {
+    let n = len_unit(dir);
+    if n < 1e-9 || reach < 4.0 {
+        return Vec::new();
+    }
+    let u = [dir[0] / n, dir[1] / n];
+    let limit = reach * ALIGN_LIMIT;
+    let seen = |i: usize| visibility.get(i).copied().unwrap_or(0.0) >= SEEN;
+    pairs
+        .iter()
+        .copied()
+        .filter(|&(i, j)| {
+            let (Some(&pi), Some(&pj)) = (pts.get(i), pts.get(j)) else {
+                return false;
+            };
+            if !seen(i) || !seen(j) {
+                return false;
+            }
+            let (mi, mj) = (reflect(pi, axis, u), reflect(pj, axis, u));
+            let a = (mj[0] - pi[0]).hypot(mj[1] - pi[1]);
+            let b = (mi[0] - pj[0]).hypot(mi[1] - pj[1]);
+            a.max(b) <= limit
+        })
+        .collect()
+}
+
 /// 对称液化: aligns landmark `pairs` toward symmetry about the line (`axis` point, `dir`
 /// unit direction) — each pair's two points move toward each other's mirror by `strength`
 /// (0..100; 100 is full alignment, at both ends simultaneously), each correction stamped on
@@ -168,43 +314,7 @@ pub fn stamp_deltas(field: &mut LiquifyField, items: &[([f64; 2], [f64; 2])], re
     if items.is_empty() || reach < 4.0 {
         return;
     }
-    let inv = 1.0 / field.cell;
-    let (bx, by) = (f64::from(field.bounds.x0) + 0.5, f64::from(field.bounds.y0) + 0.5);
-    let mut num = vec![[0.0f64; 2]; field.w * field.h];
-    let mut den = vec![0.0f64; field.w * field.h];
-    for &(p, delta) in items {
-        let mag0 = delta[0].hypot(delta[1]);
-        if mag0 < 1e-9 {
-            continue;
-        }
-        let (i0, j0, i1, j1) = (
-            (((p[0] - reach - bx) * inv).floor().max(0.0)) as usize,
-            (((p[1] - reach - by) * inv).floor().max(0.0)) as usize,
-            (((p[0] + reach - bx) * inv).ceil().min(field.w as f64 - 1.0)).max(0.0) as usize,
-            (((p[1] + reach - by) * inv).ceil().min(field.h as f64 - 1.0)).max(0.0) as usize,
-        );
-        for j in j0..=j1 {
-            for i in i0..=i1 {
-                let n = field.node_pos(i, j);
-                let rho = (n[0] - p[0]).hypot(n[1] - p[1]);
-                if rho >= reach {
-                    continue;
-                }
-                let lat = falloff((rho / reach) * (rho / reach), 0.6);
-                let idx = j * field.w + i;
-                num[idx][0] += delta[0] * lat;
-                num[idx][1] += delta[1] * lat;
-                den[idx] += lat;
-            }
-        }
-    }
-    for (d, (nv, w)) in field.d.iter_mut().zip(num.iter().zip(&den)) {
-        if *w > 1e-9 {
-            d[0] -= (nv[0] / w) as f32;
-            d[1] -= (nv[1] / w) as f32;
-        }
-    }
-    relax(field, 1);
+    stamp_corrections(field, items, reach, 1);
 }
 
 fn len_unit(d: [f64; 2]) -> f64 {
@@ -329,6 +439,90 @@ mod tests {
         stamp(&mut a, &pts, spacing, 45.0);
         stamp(&mut b, &pts, spacing, 45.0);
         assert_eq!(a, b);
+    }
+
+    /// A pose with the left arm raised: the wrists are nowhere near mirrored, the rest is
+    /// close. The axis is the vertical x = 130.
+    fn raised_arm() -> (Vec<[f64; 2]>, Vec<f32>) {
+        let mut pts = vec![[0.0; 2]; 33];
+        let mut vis = vec![0.0f32; 33];
+        for &(i, x, y) in &[
+            (11usize, 100.0, 100.0),
+            (12, 160.0, 106.0),
+            (13, 105.0, 150.0),
+            (14, 155.0, 155.0),
+            (15, 108.0, 60.0),
+            (16, 158.0, 240.0),
+            (23, 105.0, 220.0),
+            (24, 155.0, 220.0),
+            (25, 110.0, 300.0),
+            (26, 150.0, 300.0),
+            (27, 112.0, 380.0),
+            (28, 148.0, 380.0),
+        ] {
+            pts[i] = [x, y];
+            vis[i] = 1.0;
+        }
+        (pts, vis)
+    }
+
+    #[test]
+    fn only_a_pair_near_its_mirror_is_alignable() {
+        let (pts, vis) = raised_arm();
+        let pairs = alignable_pairs(&pts, &vis, &[(11, 12), (15, 16)], [130.0, 100.0], [0.0, 1.0], 40.0);
+        assert_eq!(pairs, vec![(11, 12)], "the raised wrist pair is a different pose, not an asymmetry");
+    }
+
+    #[test]
+    fn a_pair_the_pose_did_not_see_is_not_alignable() {
+        let (pts, mut vis) = raised_arm();
+        vis[16] = 0.2;
+        let pairs = alignable_pairs(&pts, &vis, &[(15, 16)], [130.0, 100.0], [0.0, 1.0], 40.0);
+        assert!(pairs.is_empty(), "a guessed joint must not be moved: {pairs:?}");
+    }
+
+    #[test]
+    fn a_contour_cut_by_the_frame_does_not_pull_the_subject_inward() {
+        // A subject rectangle whose top and left sides lie on the frame: its contour runs
+        // along x = 0.5 and y = 0.5. Low-passing the closed ring used to round those frame
+        // corners and drag the top-left neighbourhood inward by tens of pixels.
+        let mut pts = Vec::new();
+        let (x0, y0, x1, y1) = (0.5, 0.5, 200.5, 200.5);
+        for k in 0..=20 {
+            let t = k as f64 / 20.0;
+            pts.push([x0 + (x1 - x0) * t, y0]);
+        }
+        for k in 1..=20 {
+            let t = k as f64 / 20.0;
+            pts.push([x1, y0 + (y1 - y0) * t]);
+        }
+        for k in 1..=20 {
+            let t = k as f64 / 20.0;
+            pts.push([x1 - (x1 - x0) * t, y1]);
+        }
+        for k in 1..=19 {
+            let t = k as f64 / 20.0;
+            pts.push([x0, y1 - (y1 - y0) * t]);
+        }
+        let mut field = LiquifyField::new(bounds(), 2.0);
+        stamp(&mut field, &pts, 10.0, 100.0);
+        let near = field.sample(20.0, 20.0);
+        assert!(near[0].hypot(near[1]) < 2.0, "the frame corner must not drag the subject: {near:?}");
+        let corner = field.sample(198.0, 198.0);
+        assert!(corner[0].hypot(corner[1]) > 0.5, "the interior corner still smooths: {corner:?}");
+    }
+
+    /// A contour that jumps to another edge — the person mask fusing into the crowd behind the
+    /// subject — is a cut, not a bump: the low-pass holds at the jump instead of averaging
+    /// across it, so no disc of the photo is dragged hundreds of pixels.
+    #[test]
+    fn a_contour_break_is_held_not_smoothed_across() {
+        let (mut pts, spacing) = wobbly_circle();
+        pts[0] = [pts[0][0] + 200.0, pts[0][1]];
+        let mut field = LiquifyField::new(bounds(), 2.0);
+        stamp(&mut field, &pts, spacing, 100.0);
+        let d = field.sample(pts[0][0], pts[0][1]);
+        assert!(d[0].hypot(d[1]) < spacing * 4.0, "the break was stamped as a bump: {d:?}");
     }
 
     #[test]

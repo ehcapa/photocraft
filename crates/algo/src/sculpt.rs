@@ -542,6 +542,15 @@ impl Part {
             _ => None,
         }
     }
+
+    /// Whether the row stretches the whole figure from the ankles: Height and Leg Length. These
+    /// move everything above their lower joint, so a feet position the pose only guessed would
+    /// stretch the wrong part of the frame at a strength the user cannot see — on a portrait
+    /// whose legs are out of frame they moved the picture by a handful of pixels and read as a
+    /// dead slider. Unlike a local shaping row, they need the pose to have *seen* both feet.
+    fn needs_both_feet(&self) -> bool {
+        self.needs.contains(&27) && self.needs.contains(&28)
+    }
 }
 
 /// The parts, table order = build order (the superposition is order-stable, which is part of
@@ -770,6 +779,10 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
         let slider = (part.slider)(&sliders);
         if slider.abs() < 0.5 {
             continue; // the slider is at zero: nothing was asked of this row
+        }
+        if part.needs_both_feet() && !(frame.visible(27) && frame.visible(28)) {
+            report.skipped.push((part.name, "the pose does not see both feet, so the photo does not show the legs to stretch"));
+            continue;
         }
         let (confidence, approximate) = match frame.confidence(part.needs) {
             Ok(found) => found,
@@ -1662,6 +1675,22 @@ mod tests {
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         let step = max_adjacent_step(&field);
         assert!(step < CELL, "adjacent nodes step {step:.2}px past the {CELL}px cell — the fitted stack folds");
+    }
+
+    /// Height and Leg Length stretch everything above the ankles: a feet position the pose only
+    /// guessed must not move the frame at a strength nobody can see, dressed up as a success.
+    #[test]
+    fn guessed_feet_do_not_lengthen_the_legs() {
+        let mut anchors = standing();
+        for i in [27usize, 28] {
+            anchors.pose[i][2] = 0.3; // the pose guessed the feet; the photo may not show them
+        }
+        let sliders = SculptSliders { height: 100.0, leg_length: 100.0, ..SculptSliders::default() };
+        let (field, report) = sculpt_field(&SculptSpec { sliders, anchors, fit: Some(fitted()) }, bounds(), CELL);
+        assert!(field.is_identity(), "a guessed foot must not stretch anything");
+        let skipped: Vec<_> = report.skipped.iter().map(|(n, _)| *n).collect();
+        assert!(skipped.contains(&"height") && skipped.contains(&"legs"), "{skipped:?}");
+        assert!(report.skipped.iter().all(|(n, why)| !matches!(*n, "height" | "legs") || why.contains("feet")), "{report:?}");
     }
 
     #[test]
