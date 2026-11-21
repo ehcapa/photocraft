@@ -624,9 +624,23 @@ impl FaceMask {
     }
 }
 
-/// Whether a part must leave the eye or lip interior alone. Eye parts own the eyes, mouth
-/// parts own the lips; everything else — the outline, the nose, the brows — protects both.
+/// Whether a part must leave the eye or lip interior alone, as `(eyes, lips)`.
+///
+/// The whole-face rows — the uniform scale, the width and the two full-face slims — carry
+/// the features with them. Holding the eyes and mouth still while the face around them
+/// shrinks or narrows is what reads as a warped photograph: the features keep their old
+/// size and spacing inside a face that no longer has room for them. The face-length rows
+/// are the same case for the mouth, which sits inside their ramp; the eyes are above it.
+///
+/// Every other row reshapes one region around the features — the jaw, the temples, the
+/// brows, the nose — and must leave them still. Eye and mouth parts own their feature.
 fn protects(name: &str) -> (bool, bool) {
+    if matches!(name, "face slim" | "face size" | "v face" | "face width") {
+        return (false, false);
+    }
+    if matches!(name, "mid face" | "lower face") {
+        return (true, false);
+    }
     let eye = name.contains("eye") || name.contains("pupil") || name.contains("lid");
     let mouth = name.contains("mouth") || name.contains("lip") || name.contains("gum") || name.contains("philtrum");
     (!eye, !mouth)
@@ -1268,11 +1282,10 @@ mod tests {
     }
 
     /// The field belongs to the face: a whole-face part must not reach the hair or the
-    /// background outside the FACE_OVAL ring, and it must leave the eyes and the mouth
-    /// still for the parts that own them. Before the clip, `face_size` pulled on the whole
-    /// canvas and on the eyes and lips as if they were cheek.
+    /// background outside the FACE_OVAL ring. Before the clip, `face_size` pulled on the
+    /// whole canvas.
     #[test]
-    fn the_outline_parts_stop_at_the_face_and_leave_the_features_still() {
+    fn the_face_parts_stop_at_the_face_outline() {
         let (field, _) = build(FaceSliders { face_size: 100.0, ..Default::default() });
         let at = |x: f64, y: f64| {
             let d = field.sample(x, y);
@@ -1281,13 +1294,78 @@ mod tests {
         for (x, y) in [(40.0, 40.0), (480.0, 480.0), (256.0, 470.0), (40.0, 244.0), (470.0, 244.0)] {
             assert!(at(x, y) < 0.5, "outside the face stays still at ({x}, {y}): {}", at(x, y));
         }
-        // The centres and points just inside each ring's outline: the eye ring is only
-        // sixteen pixels tall on this face, and a protection ramp centred on the outline
-        // left its inner edge free to ride the outline sliders.
-        for (x, y) in [(306.0, 232.0), (206.0, 232.0), (256.0, 343.0), (306.0, 238.0), (206.0, 226.0), (256.0, 333.0)] {
-            assert!(at(x, y) < 0.5, "the protected feature at ({x}, {y}) must not ride the outline: {}", at(x, y));
-        }
         assert!(at(330.0, 340.0) > 1.0, "the cheek inside the face still shapes: {}", at(330.0, 340.0));
+    }
+
+    /// A local reshape of the face's edge must leave the eyes and the mouth still. The
+    /// forehead-width row reaches both eyes; the jaw reaches the mouth. Neither is a
+    /// whole-face change, so neither may drag a feature it does not own — the points just
+    /// inside each ring stand for the interior, since the protection ramp lies outside.
+    /// The mid-face row is a length change: the mouth rides its ramp, but the eyes are above
+    /// it and stay.
+    #[test]
+    fn the_local_outline_parts_leave_the_features_still() {
+        let at = |field: &LiquifyField, x: f64, y: f64| {
+            let d = field.sample(x, y);
+            d[0].hypot(d[1])
+        };
+        let (field, _) = build(FaceSliders { forehead_width: 100.0, ..Default::default() });
+        for (x, y) in [(306.0, 232.0), (206.0, 232.0), (306.0, 238.0), (206.0, 226.0)] {
+            assert!(at(&field, x, y) < 0.5, "the eye's own pixels must not ride the forehead at ({x}, {y}): {}", at(&field, x, y));
+        }
+        assert!(at(&field, 340.0, 168.0) > 1.0, "the forehead still shapes: {}", at(&field, 340.0, 168.0));
+
+        let (field, _) = build(FaceSliders { jaw: 100.0, ..Default::default() });
+        for (x, y) in [(256.0, 343.0), (256.0, 333.0), (280.0, 348.0)] {
+            assert!(at(&field, x, y) < 0.5, "the lips must not ride the jaw at ({x}, {y}): {}", at(&field, x, y));
+        }
+        assert!(at(&field, 300.0, 380.0) > 1.0, "the jaw still shapes: {}", at(&field, 300.0, 380.0));
+
+        let (field, _) = build(FaceSliders { mid_face: 100.0, ..Default::default() });
+        for (x, y) in [(306.0, 232.0), (206.0, 232.0)] {
+            assert!(at(&field, x, y) < 0.5, "the eyes must not ride the mid face at ({x}, {y}): {}", at(&field, x, y));
+        }
+    }
+
+    /// The whole-face rows are uniform changes, so the features ride them: a smaller or
+    /// narrower face keeps its features in proportion. Pinning the mouth inside a face that
+    /// shrinks or narrows around it is what reads as a warped photograph. The face-length
+    /// rows are the same case for the mouth, which sits inside their ramp.
+    #[test]
+    fn the_whole_face_parts_carry_the_mouth_with_them() {
+        let rows = [
+            ("face size", FaceSliders { face_size: 100.0, ..Default::default() }),
+            ("face width", FaceSliders { face_width: 100.0, ..Default::default() }),
+            ("face slim", FaceSliders { face_slim: 100.0, ..Default::default() }),
+            ("v face", FaceSliders { v_face: 100.0, ..Default::default() }),
+            ("mid face", FaceSliders { mid_face: 100.0, ..Default::default() }),
+            ("lower face", FaceSliders { lower_face: 100.0, ..Default::default() }),
+        ];
+        for (name, sliders) in rows {
+            let (field, _) = build(sliders);
+            let corner = field.sample(296.0, 343.0); // the mouth's corner
+            let rim = field.sample(330.0, 340.0); // the cheek, moving the way the row moves the face
+            let mag = corner[0].hypot(corner[1]);
+            assert!(mag > 0.5, "{name}: the mouth rides the whole-face row: {corner:?}");
+            assert!(corner[0] * rim[0] + corner[1] * rim[1] > 0.0, "{name}: the mouth moves with the face's edge (mouth {corner:?}, rim {rim:?})");
+        }
+    }
+
+    /// The scale and width rows reach the eyes too, so the eyes ride them with the face; the
+    /// slims start at the mouth's height and end above the eyes, so their band leaves the
+    /// eyes alone — a slim face does not change where the eyes sit.
+    #[test]
+    fn the_face_size_and_width_carry_the_eyes_with_them() {
+        for (name, sliders) in
+            [("face size", FaceSliders { face_size: 100.0, ..Default::default() }), ("face width", FaceSliders { face_width: 100.0, ..Default::default() })]
+        {
+            let (field, _) = build(sliders);
+            let eye = field.sample(306.0, 232.0);
+            let rim = field.sample(330.0, 340.0);
+            let mag = eye[0].hypot(eye[1]);
+            assert!(mag > 0.5, "{name}: the eye rides the whole-face row: {eye:?}");
+            assert!(eye[0] * rim[0] + eye[1] * rim[1] > 0.0, "{name}: the eye moves with the face's edge (eye {eye:?}, rim {rim:?})");
+        }
     }
 
     /// The protection is per feature, not a blanket freeze: the mouth rows still move the
