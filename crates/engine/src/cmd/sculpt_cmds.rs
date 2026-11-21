@@ -383,7 +383,14 @@ pub fn body_fit(anchors: &SculptAnchors, mask: &Surface) -> Option<BodyFit> {
             continue;
         }
         let ax = axis_x(yl as f64);
-        let Some(&(x0, x1)) = runs.iter().find(|&&(x0, x1)| ax >= x0 as f64 && ax <= x1 as f64 + 1.0) else { continue };
+        // The run must show the subject's own edges on both sides: a run clipped by the mask's
+        // content bounds measures distance to the frame (or to wherever the matte stops), not
+        // the silhouette. A matte that fuses the background into the person is one full-width
+        // run per row, and trusting it put the waist's envelope across the whole photo — the
+        // slider read as warping the chest and the water, not the waist. Such rows carry no
+        // width, so the fit as a whole has to answer `None` and the joints stand in.
+        let bounded = |&&(x0, x1): &&(usize, usize)| x0 > 0 && x1 + 1 < fw;
+        let Some(&(x0, x1)) = runs.iter().find(|run| bounded(run) && ax >= run.0 as f64 && ax <= run.1 as f64 + 1.0) else { continue };
         let (l, r) = (ax - x0 as f64, x1 as f64 + 1.0 - ax);
         if l >= 2.0 && r >= 2.0 {
             profile.push((t, l, r));
@@ -897,6 +904,16 @@ mod tests {
         let mut blank = Surface::new(photocraft_color::PixelFormat::GRAY8);
         blank.fill_rect(Rect::new(0, 0, 64, 64), &[0.0]);
         assert!(body_fit(&body_anchors(), &blank).is_none());
+    }
+
+    /// A matte that fuses the background into the person is one full-width run per row: its
+    /// edges are the frame's, not the body's. Trusting them put the waist's envelope across
+    /// the whole photo. The fit has to answer `None` so the joints stand in instead.
+    #[test]
+    fn body_fit_refuses_a_matte_that_fills_the_frame() {
+        let mut full = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        full.fill_rect(Rect::new(0, 0, 256, 384), &[1.0]);
+        assert!(body_fit(&body_anchors(), &full).is_none());
     }
 
     /// The smooth contour is the subject's own rim, not the row's outermost mask pixel: a

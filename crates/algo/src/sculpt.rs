@@ -553,6 +553,13 @@ impl Part {
     }
 }
 
+/// Whether a row is placed off the fitted silhouette when there is one, and so is only
+/// approximate when there is none: the torso width profile and the hip and bust radials.
+/// Limb and shoulder rows are joint geometry in either case.
+fn fit_placed(name: &str) -> bool {
+    matches!(name, "slim body" | "waist" | "belly" | "left hip" | "right hip" | "left bust" | "right bust")
+}
+
 /// The parts, table order = build order (the superposition is order-stable, which is part of
 /// the determinism the smart filter relies on).
 const PARTS: &[Part] = &[
@@ -581,7 +588,10 @@ const PARTS: &[Part] = &[
             // and the hips below: the old ±8.5% window acted on a narrow band and left the
             // torso dented above and below it. The level's `t` still places the peak; the
             // tail is what makes the slider read as a continuous narrowing.
-            let centre = f.fit.map_or(0.54, |fit| f64::from(fit.waist.t));
+            // Without a fit the anatomical middle stands, the same fallback the fit itself
+            // uses when the silhouette shows no crease. It used to sit higher (0.54), which
+            // put the slider on the ribs whenever the matte could not measure a waist.
+            let centre = f.fit.map_or(0.62, |fit| f64::from(fit.waist.t));
             let gain = if f.fit.is_some() { 0.18 } else { 0.10 };
             f.profile(f.shoulder_mid(), f.hip_mid(), f.torso_levels(), Kernel::Bump { centre, half: 0.26 }, gain)
         },
@@ -591,7 +601,7 @@ const PARTS: &[Part] = &[
         slider: |s| s.belly,
         needs: &[11, 12, 23, 24],
         shape: |f| {
-            let centre = f.fit.map_or(0.75, |fit| f64::from(fit.belly.t));
+            let centre = f.fit.map_or(0.81, |fit| f64::from(fit.belly.t));
             let gain = if f.fit.is_some() { 0.17 } else { 0.08 };
             f.profile(f.shoulder_mid(), f.hip_mid(), f.torso_levels(), Kernel::Bump { centre, half: 0.22 }, gain)
         },
@@ -603,7 +613,12 @@ const PARTS: &[Part] = &[
         shape: |f| {
             let a = add(f.shoulder_mid(), scale(f.u_torso(), -0.12 * f.torso_len()));
             let b = add(f.shoulder_mid(), scale(f.u_torso(), 0.28 * f.torso_len()));
-            f.contract(a, b, (0.0, 1.0), f.shoulder_w() * 0.75, 0.07)
+            // The contract's lateral falloff peaks near half its width from the axis, and the
+            // visible shoulder line (a sleeve, the deltoid) sits well outside the joint span:
+            // the old 0.75 of that span put the peak inside the shoulder and left the rim
+            // almost still, so the slider read as a dent rather than a narrower shoulder.
+            // The ramp width is the one reach that covers the whole silhouette, arms included.
+            f.contract(a, b, (0.0, 1.0), f.ramp_width(), 0.07)
         },
     },
     // Straight shoulders: the trapezius slope contracts toward the shoulder line itself
@@ -805,6 +820,16 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
             continue;
         };
         asked.push((part, f64::from(slider / 100.0).clamp(-1.0, 1.0) * confidence, shape, approximate));
+    }
+    // Without a fitted silhouette every torso row places itself from the joints alone: the
+    // photo's own outline was not measurable (a matte fused with the background), so the
+    // region is approximate and the report says so rather than showing it as measured.
+    if spec.fit.is_none() {
+        for (part, ..) in &asked {
+            if fit_placed(part.name) {
+                report.approximate.push((part.name, "the photo's background blends with the body, so the region follows the pose, not the visible outline"));
+            }
+        }
     }
     let budget = RAMP_BUDGET * frame.ramp_width();
     let ramp_sum: f64 = asked.iter().map(|&(_, k, ref s, _)| ramp_magnitude(s, k)).sum();
@@ -1429,6 +1454,56 @@ mod tests {
             assert!(!field.is_identity(), "the slider left the field untouched");
             assert!(report.skipped.is_empty(), "a clean pose skipped {:?}", report.skipped);
         }
+    }
+
+    /// Without a fitted silhouette the waist falls back to the anatomical middle. The old
+    /// fallback sat at 0.54 of the shoulder→hip span — on the ribs, which is why the slider
+    /// read as squeezing the chest whenever the matte could not measure a waist.
+    #[test]
+    fn without_a_fit_the_waist_peak_sits_between_the_ribs_and_the_hips() {
+        let (field, report) = build(SculptSliders { waist: 100.0, ..SculptSliders::default() });
+        assert!(report.applied.contains(&"waist"), "{report:?}");
+        let (mut peak, mut at) = (0.0f32, [0.0f64; 2]);
+        for j in 0..field.h {
+            for i in 0..field.w {
+                let d = field.d[j * field.w + i];
+                let m = d[0].hypot(d[1]);
+                if m > peak {
+                    peak = m;
+                    at = field.node_pos(i, j);
+                }
+            }
+        }
+        assert!(peak > 2.0, "the waist must pull: {peak:.2}px");
+        let t = (at[1] - 180.0) / (400.0 - 180.0); // shoulder mid → hip mid
+        assert!((0.55..=0.70).contains(&t), "the waist peak t={t:.2} sits on the ribs, not the waist");
+    }
+
+    /// A torso row placed from the joints alone is approximate and must say so; with a
+    /// fitted silhouette the same row is measured and must not. Presenting the fallback as
+    /// measured is what made "the slider is precise" impossible to trust.
+    #[test]
+    fn a_missing_silhouette_names_the_torso_rows_approximate() {
+        let (_, loose) = build(SculptSliders { waist: 100.0, ..SculptSliders::default() });
+        assert!(loose.approximate.iter().any(|(n, _)| *n == "waist"), "{loose:?}");
+        assert!(!loose.skipped.iter().any(|(n, _)| *n == "waist"), "{loose:?}");
+        let (_, fitted) = sculpt_field(&fitted_spec(SculptSliders { waist: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        assert!(fitted.approximate.iter().all(|(n, _)| *n != "waist"), "{fitted:?}");
+    }
+
+    /// The shoulders slider narrows the shoulder the photo shows — the sleeve and the
+    /// deltoid beside the joint — not just the strip between the joints. The old falloff
+    /// was narrower than that visible width, so its peak sat inside the joint and the rim
+    /// beside it barely moved: the slider read as a dent.
+    #[test]
+    fn the_shoulders_slider_moves_the_whole_shoulder_width() {
+        let (field, report) = build(SculptSliders { shoulders: 100.0, ..SculptSliders::default() });
+        assert!(report.applied.contains(&"shoulders"), "{report:?}");
+        let y = 200.0; // inside the contract's band
+        let joint = field.sample(308.0, y)[0].abs();
+        let sleeve = field.sample(338.0, y)[0].abs();
+        assert!(joint > 1.0, "the joint must move: {joint:.2}px");
+        assert!(sleeve > 0.3 * joint, "the sleeve beside the joint must move with it: {sleeve:.2}px vs {joint:.2}px");
     }
 
     #[test]
