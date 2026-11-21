@@ -991,26 +991,13 @@ const FACE_PARTS: &[FacePart] = &[
     FacePart { name: "nose tip", slider: |s| s.nose_tip, shape: |f| f.radial(f.pt(mesh::NOSE_TIP), f.nose_w() * 0.60, 0.28) },
     // ---------- the mouth ----------
     FacePart { name: "mouth size", slider: |s| s.mouth_size, shape: |f| f.radial(f.mouth_c(), f.mouth_w() * 0.65, -0.30) },
-    FacePart {
-        name: "left mouth width",
-        slider: |s| s.sides.mouth_width[SIDE_L].unwrap_or(s.mouth_width),
-        shape: |f| f.radial(f.pt(mesh::MOUTH_CORNER_L), f.mouth_w() * 0.25, -0.35),
-    },
-    FacePart {
-        name: "right mouth width",
-        slider: |s| s.sides.mouth_width[SIDE_R].unwrap_or(s.mouth_width),
-        shape: |f| f.radial(f.pt(mesh::MOUTH_CORNER_R), f.mouth_w() * 0.25, -0.10),
-    },
-    FacePart {
-        name: "mouth height",
-        slider: |s| s.mouth_height,
-        shape: |f| f.shift_band(f.pt(mesh::MOUTH_CORNER_L), f.pt(mesh::LOWER_LIP_LOW), v(f.up(), -1.0), (0.1, 0.9), f.mouth_w() * 0.60, 0.18),
-    },
-    FacePart {
-        name: "mouth shift",
-        slider: |s| s.mouth_shift,
-        shape: |f| f.shift_band(f.pt(mesh::MOUTH_CORNER_L), f.pt(mesh::LOWER_LIP_LOW), v(f.left(), 1.0), (0.1, 0.9), f.mouth_w() * 0.60, 0.18),
-    },
+    FacePart { name: "left mouth width", slider: |s| s.sides.mouth_width[SIDE_L].unwrap_or(s.mouth_width), shape: |f| f.mouth_side_band(SIDE_L, 0.10) },
+    FacePart { name: "right mouth width", slider: |s| s.sides.mouth_width[SIDE_R].unwrap_or(s.mouth_width), shape: |f| f.mouth_side_band(SIDE_R, 0.10) },
+    // Both vertical rows carry the whole mouth: the band spans corner to corner along the
+    // mouth line, so the lips move together instead of only the side the old band started on.
+    // The positive direction follows the label, as the other height/shift rows do.
+    FacePart { name: "mouth height", slider: |s| s.mouth_height, shape: |f| f.mouth_band(v(f.up(), 1.0), 0.04) },
+    FacePart { name: "mouth shift", slider: |s| s.mouth_shift, shape: |f| f.mouth_band(v(f.left(), 1.0), 0.04) },
     FacePart {
         name: "gum smile",
         slider: |s| s.gum_smile,
@@ -1116,6 +1103,38 @@ impl FaceFrame {
         let m = self.mid(mesh::MOUTH_CORNER_L, mesh::MOUTH_CORNER_R);
         let b = self.toward(m, self.pt(mesh::CHIN), 1.35);
         self.shift_band(m, b, v(self.up(), 1.0), (0.15, 0.95), self.face_w * 0.45, gain)
+    }
+
+    /// A band that carries the whole mouth along `dir`: the axis runs along the mouth line,
+    /// from past one corner to past the other, so both corners sit inside the plateau and
+    /// the lips move as one piece. The old band started at the left corner and ended on the
+    /// lower lip: its plateau held a short strip beside the left corner and the right corner
+    /// lay beyond its lateral reach, so only one side of the mouth moved.
+    fn mouth_band(&self, dir: [f64; 2], gain: f64) -> Option<Shape> {
+        let c = self.mouth_c();
+        let (l, r) = (self.pt(mesh::MOUTH_CORNER_L), self.pt(mesh::MOUTH_CORNER_R));
+        // Extending each corner 2.2 lengths from the centre puts the corners at t ≈
+        // 0.27/0.73 — inside the plateau (0.25..0.75) with room for an uneven mouth; the
+        // feather then runs out past them into the cheeks.
+        // The lateral width carries the lips (about a sixth of the mouth's width each way)
+        // and feathers out well before the nose base and the chin.
+        self.shift_band(self.toward(c, r, 2.2), self.toward(c, l, 2.2), dir, (0.0, 1.0), self.mouth_w() * 0.35, gain)
+    }
+
+    /// One half of the mouth, along the mouth line from its centre out past that side's
+    /// corner: the slider widens (positive) or narrows the mouth from both corners. A radial
+    /// at the corner moved mostly the skin around it and nothing at the corner point itself,
+    /// and the two sides carried unequal gains, so a linked slider read as one corner
+    /// twitching rather than the mouth changing width.
+    fn mouth_side_band(&self, side: usize, gain: f64) -> Option<Shape> {
+        let c = self.mouth_c();
+        let corner = self.pt(if side == SIDE_L { mesh::MOUTH_CORNER_L } else { mesh::MOUTH_CORNER_R });
+        let d = down(c, corner);
+        let n = len_of(d);
+        if n < 1e-9 {
+            return None;
+        }
+        self.shift_band(c, self.toward(c, corner, 1.6), v(d, 1.0 / n), (0.0, 1.0), self.mouth_w() * 0.45, gain)
     }
 }
 
@@ -1642,6 +1661,55 @@ mod tests {
         let (field, _) = build(FaceSliders { mouth_size: 100.0, ..Default::default() });
         let corner = field.sample(296.0, 342.0);
         assert!(corner[0].hypot(corner[1]) > 0.5, "the mouth corner moves: {corner:?}");
+    }
+
+    /// `mouth height` carries the whole mouth: both corners and the lips between them rise
+    /// together at +100 (the label's action; the inverse map points down) and drop at −100.
+    /// The old band started at the left corner and ended on the lower lip, so its plateau
+    /// held a strip beside the left corner and the right corner lay beyond its reach — one
+    /// side moved and the mouth read as rotating.
+    #[test]
+    fn mouth_height_carries_both_corners_and_the_lips() {
+        let (up, _) = build(FaceSliders { mouth_height: 100.0, ..Default::default() });
+        let (l, r, lip) = (up.sample(296.0, 342.0), up.sample(216.0, 342.0), up.sample(256.0, 338.0));
+        assert!(l[1] > 1.5 && r[1] > 1.5 && lip[1] > 1.5, "the whole mouth rises (left {l:?}, right {r:?}, lip {lip:?})");
+        assert!((l[1] - r[1]).abs() < 0.5, "the corners rise together (left {l:?}, right {r:?})");
+        let (down, _) = build(FaceSliders { mouth_height: -100.0, ..Default::default() });
+        let (l, r) = (down.sample(296.0, 342.0), down.sample(216.0, 342.0));
+        assert!(l[1] < -1.5 && r[1] < -1.5, "the whole mouth drops at the other stop (left {l:?}, right {r:?})");
+    }
+
+    /// `mouth shift` slides the whole mouth sideways: both corners and the lips travel
+    /// together, so the mouth keeps its shape. The old band had the same one-sided axis as
+    /// `mouth height`.
+    #[test]
+    fn mouth_shift_moves_the_whole_mouth_sideways() {
+        let (field, _) = build(FaceSliders { mouth_shift: 100.0, ..Default::default() });
+        let (l, r, lip) = (field.sample(296.0, 342.0), field.sample(216.0, 342.0), field.sample(256.0, 338.0));
+        // The inverse map points against `left()` while the content moves image right.
+        assert!(l[0] < -1.5 && r[0] < -1.5 && lip[0] < -1.5, "the whole mouth moves (left {l:?}, right {r:?}, lip {lip:?})");
+        assert!((l[0] - r[0]).abs() < 0.5, "the corners move together (left {l:?}, right {r:?})");
+    }
+
+    /// `mouth width` moves both corners outward together, and a per-side override flips
+    /// only its own corner. The old pair of radials peaked in the skin beside each corner —
+    /// the corner point itself stood still — and the right one carried less than a third of
+    /// the left's gain, so a linked slider read as one corner twitching.
+    #[test]
+    fn mouth_width_widens_both_corners() {
+        let (field, _) = build(FaceSliders { mouth_width: 100.0, ..Default::default() });
+        let (l, r, centre) = (field.sample(296.0, 342.0), field.sample(216.0, 342.0), field.sample(256.0, 343.0));
+        assert!(l[0] < -1.5, "the left corner moves outward (the inverse map points inward): {l:?}");
+        assert!(r[0] > 1.5, "the right corner moves outward: {r:?}");
+        assert!((l[0] + r[0]).abs() < 0.5, "the corners widen equally (left {l:?}, right {r:?})");
+        assert!(centre[0].hypot(centre[1]) < 0.2, "the mouth's centre stays: {centre:?}");
+        // A side override takes its own row: the left corner narrows while the right widens.
+        let mut sliders = FaceSliders { mouth_width: 100.0, ..Default::default() };
+        sliders.sides.mouth_width[SIDE_L] = Some(-100.0);
+        let (field, _) = build(sliders);
+        let (l, r) = (field.sample(296.0, 342.0), field.sample(216.0, 342.0));
+        assert!(l[0] > 1.5, "the overridden corner narrows: {l:?}");
+        assert!(r[0] > 1.5, "the linked corner still widens: {r:?}");
     }
 
     #[test]
