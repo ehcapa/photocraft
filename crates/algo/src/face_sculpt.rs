@@ -343,6 +343,14 @@ mod mesh {
     pub const LOWER_LIP_LOW: usize = 17;
 }
 
+/// The whole-face rows' coupling to the head, as a multiple of their local displacement: the
+/// participation weight is 1 inside and on the FACE_OVAL ring and decays to nothing over
+/// twice the family's displacement there. The smoothstep's steepest slope is 1.5/L, so the
+/// weight adds at most 0.75 to the map's slope however many whole-face rows stack — under
+/// the fold limit of 1. The old fixed 40 px clip had half the support the rows' displacement
+/// needed and rippled the hair at the jaw.
+const FACE_COUPLING: f64 = 2.0;
+
 /// The symmetry pairs (left index, right index) 对称液化 aligns: the eye corners and
 /// rims, the brows, the mouth corners, the nose wings, the cheekbones, the temples, the
 /// jaw — every paired feature the mesh names.
@@ -542,40 +550,60 @@ fn signed_distance(p: [f64; 2], poly: &[[f64; 2]]) -> f64 {
 }
 
 /// The face field's soft bounds, computed over the face's own node window so a large
-/// document does not pay a canvas-sized mask: `clip` is the FACE_OVAL hull (1 inside, 0
-/// outside, a feather across the outline), `eye` and `lip` are 0 inside the eye rings and
-/// the lip ring and 1 outside. The outline parts must not move the eyes or the mouth; an
-/// eye or mouth part is exempt from its own feature's protection.
+/// document does not pay a canvas-sized mask: `sdf` is the signed distance to the FACE_OVAL
+/// hull, `clip` the local rows' tight clip (1 inside, 0 past a short feather outside),
+/// `eye` and `lip` are 0 inside the eye rings and the lip ring and 1 outside. The local
+/// outline parts must stop at the outline and leave the eyes and mouth still; an eye or
+/// mouth part is exempt from its own feature's protection. The window reaches as far as the
+/// whole-face rows' coupling needs, so `whole_weights` can follow the hair beside the face.
 struct FaceMask {
     i0: usize,
     j0: usize,
     w: usize,
     h: usize,
+    sdf: Vec<f32>,
     clip: Vec<f32>,
     eye: Vec<f32>,
     lip: Vec<f32>,
+    /// The shortest whole-face coupling length, in document pixels.
+    min_length: f64,
 }
 
 impl FaceMask {
-    fn new(frame: &FaceFrame, field: &LiquifyField) -> Option<FaceMask> {
+    /// `reach` is the furthest outside the ring the whole-face weight is nonzero (twice the
+    /// whole-face family's largest displacement); the window covers it.
+    fn new(frame: &FaceFrame, field: &LiquifyField, reach: f64) -> Option<FaceMask> {
         let oval = hull(frame.ring(mesh::FACE_OVAL))?;
         let eye_l = hull(frame.ring(mesh::EYE_RING_L));
         let eye_r = hull(frame.ring(mesh::EYE_RING_R));
         let lip = hull(frame.ring(mesh::LIPS_RING));
         let (min_x, max_x) = oval.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
         let (min_y, max_y) = oval.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
-        // The clip's outward feather is the furthest the mask is nonzero outside the ring.
+        // The local clip's outward feather is the furthest a local part is nonzero outside
+        // the ring; the window must also hold the whole-face coupling's longer reach.
         let inward = (frame.face_w * 0.02).max(2.0);
-        let outward = (frame.face_w * 0.05).clamp(4.0, 40.0);
+        let clip_outward = (frame.face_w * 0.05).clamp(4.0, 40.0);
+        let reach = if reach.is_finite() { reach.max(0.0) } else { 0.0 };
+        let window = clip_outward.max(reach);
         let (bx, by) = (f64::from(field.bounds.x0) + 0.5, f64::from(field.bounds.y0) + 0.5);
         let node_x = |x: f64| ((x - bx) / field.cell).floor();
         let node_y = |y: f64| ((y - by) / field.cell).floor();
-        let i0 = node_x(min_x - outward).max(0.0) as usize;
-        let j0 = node_y(min_y - outward).max(0.0) as usize;
-        let i1 = node_x(max_x + outward).min(field.w as f64 - 1.0).max(i0 as f64) as usize;
-        let j1 = node_y(max_y + outward).min(field.h as f64 - 1.0).max(j0 as f64) as usize;
+        let i0 = node_x(min_x - window).max(0.0) as usize;
+        let j0 = node_y(min_y - window).max(0.0) as usize;
+        let i1 = node_x(max_x + window).min(field.w as f64 - 1.0).max(i0 as f64) as usize;
+        let j1 = node_y(max_y + window).min(field.h as f64 - 1.0).max(j0 as f64) as usize;
         let (w, h) = (i1 - i0 + 1, j1 - j0 + 1);
-        let mut mask = FaceMask { i0, j0, w, h, clip: vec![0.0; w * h], eye: vec![1.0; w * h], lip: vec![1.0; w * h] };
+        let mut mask = FaceMask {
+            i0,
+            j0,
+            w,
+            h,
+            sdf: vec![0.0; w * h],
+            clip: vec![0.0; w * h],
+            eye: vec![1.0; w * h],
+            lip: vec![1.0; w * h],
+            min_length: (frame.face_w * 0.04).max(2.0),
+        };
         // The rings' whole interiors stay still and the weight ramps to 1 outside them: an
         // eye ring is only a few pixels tall, so a ramp centred on its outline (as the face
         // clip's is) would leave the pupil partly free to ride the outline sliders. The
@@ -586,7 +614,9 @@ impl FaceMask {
             for i in i0..=i1 {
                 let p = field.node_pos(i, j);
                 let idx = (j - j0) * w + (i - i0);
-                mask.clip[idx] = (1.0 - crate::sculpt::smoothstep(-inward, outward, signed_distance(p, &oval))).clamp(0.0, 1.0) as f32;
+                let sdf = signed_distance(p, &oval);
+                mask.sdf[idx] = sdf as f32;
+                mask.clip[idx] = (1.0 - crate::sculpt::smoothstep(-inward, clip_outward, sdf)).clamp(0.0, 1.0) as f32;
                 let mut eye = 1.0f64;
                 for ring in [&eye_l, &eye_r].into_iter().flatten() {
                     eye = eye.min(crate::sculpt::smoothstep(0.0, feather, signed_distance(p, ring)));
@@ -600,18 +630,11 @@ impl FaceMask {
         Some(mask)
     }
 
-    /// The weight closure one part writes through. Outside the window the face clip is 0,
+    /// The weight closure a local part writes through. Outside the window the face clip is 0,
     /// which is also every face part's answer there.
     fn weights(&self, protect_eyes: bool, protect_lips: bool) -> impl Fn(usize, usize) -> f32 + '_ {
         move |i, j| {
-            if i < self.i0 || j < self.j0 {
-                return 0.0;
-            }
-            let (x, y) = (i - self.i0, j - self.j0);
-            if x >= self.w || y >= self.h {
-                return 0.0;
-            }
-            let idx = y * self.w + x;
+            let Some(idx) = self.index(i, j) else { return 0.0 };
             let mut weight = self.clip[idx];
             if protect_eyes {
                 weight *= self.eye[idx];
@@ -622,6 +645,46 @@ impl FaceMask {
             weight
         }
     }
+
+    /// The weight closure the whole-face family writes through: 1 inside the ring — the rim
+    /// itself included, with no inward feather, so the outline's own skin rides the row —
+    /// and a smooth decay outside over `coupling`, the family's shared decay length. The
+    /// face therefore carries the hair beside it as one piece instead of compressing it
+    /// inside a fixed 40 px clip: the old clip's short support against the rows' ~8% face
+    /// width displacement was what rippled the hair along the jaw.
+    ///
+    /// `coupling` is twice the family's **largest** displacement, not twice the node's own:
+    /// outside the ring the shaping envelope and the weight both fall off, and a length
+    /// scaled to the local displacement makes the two decays compound — on the local
+    /// reference photo that put the product's slope past 1 and folded the hair beside the
+    /// cheek. One length for the whole family keeps the product's slope under the fold bound.
+    fn whole_weights<'a>(&'a self, coupling: f64) -> impl Fn(usize, usize) -> f32 + 'a {
+        let l = if coupling.is_finite() { coupling.max(self.min_length) } else { self.min_length };
+        move |i, j| {
+            let Some(idx) = self.index(i, j) else { return 0.0 };
+            let sdf = f64::from(self.sdf[idx]);
+            if sdf <= 0.0 {
+                return 1.0;
+            }
+            (1.0 - crate::sculpt::smoothstep(0.0, l, sdf)) as f32
+        }
+    }
+
+    fn index(&self, i: usize, j: usize) -> Option<usize> {
+        if i < self.i0 || j < self.j0 {
+            return None;
+        }
+        let (x, y) = (i - self.i0, j - self.j0);
+        (x < self.w && y < self.h).then_some(y * self.w + x)
+    }
+}
+
+/// Whether a row is a whole-face change — the uniform scale, the width and the full-face
+/// slims — which carries the features with it and is coupled to the head around the ring
+/// rather than clipped to the ring's inside. The slim rows are two components of one slider,
+/// so the prefix covers both.
+fn whole_face(name: &str) -> bool {
+    name.starts_with("face slim") || matches!(name, "face size" | "v face" | "face width")
 }
 
 /// Whether a part must leave the eye or lip interior alone, as `(eyes, lips)`.
@@ -635,8 +698,7 @@ impl FaceMask {
 /// Every other row reshapes one region around the features — the jaw, the temples, the
 /// brows, the nose — and must leave them still. Eye and mouth parts own their feature.
 fn protects(name: &str) -> (bool, bool) {
-    // The slim rows are two components of one whole-face slider, so the prefix covers both.
-    if name.starts_with("face slim") || matches!(name, "face size" | "v face" | "face width") {
+    if whole_face(name) {
         return (false, false);
     }
     if matches!(name, "mid face" | "lower face") {
@@ -998,10 +1060,6 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
     let mut field = LiquifyField::new(bounds, cell);
     let mut report = FaceReport::default();
     let Some(frame) = FaceFrame::new(&spec.anchors) else { return (field, report) };
-    // The face's own bounds: every part is clipped to the FACE_OVAL hull, and the outline,
-    // nose and brow parts cannot move the eyes or the mouth — the field used to run to the
-    // canvas edge, dragging hair and background with the cheek.
-    let mask = FaceMask::new(&frame, &field);
     let mut asked: Vec<(&'static FacePart, f64, Shape)> = Vec::new();
     let sliders = spec.sliders.composed();
     for part in FACE_PARTS {
@@ -1041,11 +1099,32 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
         if contract_sum > contract_pool && contract_sum > 0.0 { contract_pool / contract_sum } else { 1.0 },
         if ride_sum > ride_pool && ride_sum > 0.0 { ride_pool / ride_sum } else { 1.0 },
     );
+    let scale_of = |shape: &Shape, k: f64| match shape {
+        Shape::Contract { .. } | Shape::Profile { .. } | Shape::Radial { .. } => k * c_scale,
+        Shape::Ramp { .. } | Shape::Shift { .. } => k * r_scale,
+    };
+    // The whole-face rows are shaped as one family in their own field: their participation
+    // weight decays over a length set by the family's largest displacement, and the mask's
+    // window must reach as far as that weight does. The mask is built after them, then every
+    // local row is written through its tight clip as before, and the whole family is merged
+    // last with the head-level weight.
+    let mut whole = LiquifyField::new(bounds, cell);
+    for (part, k, shape) in &asked {
+        if whole_face(part.name) {
+            write_shape(&mut whole, shape, scale_of(shape, *k), None);
+        }
+    }
+    let whole_max = whole.d.iter().fold(0.0f64, |acc, d| acc.max(f64::from(d[0].hypot(d[1]))));
+    // The face's own bounds: the local rows are clipped to the FACE_OVAL hull and cannot
+    // move the eyes or the mouth (the field used to run to the canvas edge, dragging hair
+    // and background with the cheek); the whole-face rows carry the near head instead.
+    let mask = FaceMask::new(&frame, &field, FACE_COUPLING * whole_max);
     for (part, k, shape) in asked {
-        let k = match shape {
-            Shape::Contract { .. } | Shape::Radial { .. } => k * c_scale,
-            Shape::Ramp { .. } | Shape::Shift { .. } => k * r_scale,
-        };
+        report.applied.push(part.name);
+        if whole_face(part.name) {
+            continue; // merged below as one family
+        }
+        let k = scale_of(&shape, k);
         match &mask {
             Some(mask) => {
                 let (protect_eyes, protect_lips) = protects(part.name);
@@ -1054,7 +1133,28 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
             }
             None => write_shape(&mut field, &shape, k, None),
         }
-        report.applied.push(part.name);
+    }
+    match &mask {
+        Some(mask) => {
+            let weight = mask.whole_weights(FACE_COUPLING * whole_max);
+            for (idx, d) in whole.d.iter().enumerate() {
+                if d[0] == 0.0 && d[1] == 0.0 {
+                    continue;
+                }
+                let w = f64::from(weight(idx % field.w, idx / field.w).clamp(0.0, 1.0));
+                if w <= 0.0 {
+                    continue;
+                }
+                field.d[idx][0] += (f64::from(d[0]) * w) as f32;
+                field.d[idx][1] += (f64::from(d[1]) * w) as f32;
+            }
+        }
+        None => {
+            for (idx, d) in whole.d.iter().enumerate() {
+                field.d[idx][0] += d[0];
+                field.d[idx][1] += d[1];
+            }
+        }
     }
     (field, report)
 }
@@ -1308,7 +1408,10 @@ mod tests {
     /// whole canvas.
     #[test]
     fn the_face_parts_stop_at_the_face_outline() {
-        let (field, _) = build(FaceSliders { face_size: 100.0, ..Default::default() });
+        // A local row — the jaw here — reshapes the face's own skin through its tight
+        // clip; only the whole-face rows carry the head, so the hair just outside the rim
+        // keeps still while the cheek a few pixels inside shapes.
+        let (field, _) = build(FaceSliders { jaw: 100.0, ..Default::default() });
         let at = |x: f64, y: f64| {
             let d = field.sample(x, y);
             d[0].hypot(d[1])
@@ -1316,6 +1419,7 @@ mod tests {
         for (x, y) in [(40.0, 40.0), (480.0, 480.0), (256.0, 470.0), (40.0, 244.0), (470.0, 244.0)] {
             assert!(at(x, y) < 0.5, "outside the face stays still at ({x}, {y}): {}", at(x, y));
         }
+        assert!(at(360.0, 340.0) < 0.5, "the jaw stops at the outline: {}", at(360.0, 340.0));
         assert!(at(330.0, 340.0) > 1.0, "the cheek inside the face still shapes: {}", at(330.0, 340.0));
     }
 
@@ -1528,5 +1632,74 @@ mod tests {
         let mut short = face();
         short.pts.truncate(MESH_COUNT - 1);
         assert!(short.quality().is_none(), "a truncated mesh is not a face");
+    }
+
+    /// The whole-face rows are not a local reshape. A slimmer or uniformly smaller face
+    /// must carry the head beside its rim, or the skin at the rim shears against hair or a
+    /// crop that stays put — the ripple the old fixed 40 px clip produced wherever a row's
+    /// own displacement was longer than the clip's support. The weight is 1 on the ring,
+    /// decays smoothly outside over twice the family's largest displacement, and is gone
+    /// further out; the same direction, so the edge and the head beside it move as one piece.
+    #[test]
+    fn the_whole_face_rows_carry_the_head_beside_the_rim() {
+        // The test face's oval rim at the jaw height (y = 340) sits near x = 347.
+        let field_of = |sliders| build(FaceSliders { ..sliders }).0;
+        let mag = |field: &LiquifyField, x: f64, y: f64| {
+            let d = field.sample(x, y);
+            d[0].hypot(d[1])
+        };
+        for (name, sliders) in
+            [("face slim", FaceSliders { face_slim: 100.0, ..Default::default() }), ("face size", FaceSliders { face_size: 100.0, ..Default::default() })]
+        {
+            let field = field_of(sliders);
+            let (rim, beside, farther, far) = (mag(&field, 347.0, 340.0), mag(&field, 355.0, 340.0), mag(&field, 362.0, 340.0), mag(&field, 400.0, 340.0));
+            assert!(rim > 1.0, "{name} shapes the rim: {rim}");
+            assert!(beside > 1.0, "{name} carries the head beside the rim: {beside}");
+            assert!(beside > 0.4 * rim, "{name} keeps the carry substantial 8 px out: {beside} vs {rim}");
+            assert!(farther < beside, "{name} decays outward: {farther} vs {beside}");
+            assert!(far < 0.5, "{name} leaves the far background still: {far}");
+            let (rim_d, beside_d) = (field.sample(347.0, 340.0), field.sample(355.0, 340.0));
+            assert!(rim_d[0] * beside_d[0] > 0.0 && rim_d[1] * beside_d[1] >= 0.0, "{name} moves the rim and the head together: {rim_d:?} {beside_d:?}");
+        }
+    }
+
+    /// The whole-face coupling multiplies the shaping envelope, and outside the ring both
+    /// fall off. Coupling each node over twice its own displacement made the two decays
+    /// compound — the product's slope passed 1 and the hair beside the cheek rippled on the
+    /// local reference photo, while the stacked full-slider guard's per-step bound missed
+    /// it. One shared coupling length per family keeps the product's slope under the fold
+    /// bound. The face is jaw-tapered (a narrower oval below the cheekbones, as many meshes
+    /// are), which puts substantial shaping envelope outside the ring: the per-node coupling
+    /// folds here at the widest cheek (jacobian −0.08), the shared length stays clearly
+    /// positive, as the inverse map must.
+    #[test]
+    fn the_slim_field_does_not_fold_beside_the_oval() {
+        let mut anchors = face();
+        for &i in mesh::FACE_OVAL {
+            let k = 1.0 - 0.25 * crate::sculpt::smoothstep(244.0, 392.0, f64::from(anchors.pts[i][1]));
+            anchors.pts[i][0] = (256.0 + (f64::from(anchors.pts[i][0]) - 256.0) * k) as f32;
+        }
+        let (field, report) = face_field(&FaceSpec { sliders: FaceSliders { face_slim: 100.0, ..Default::default() }, anchors }, bounds(), CELL);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let (mut worst, mut at) = (1.0f64, [0.0, 0.0]);
+        for j in 0..field.h.saturating_sub(1) {
+            for i in 0..field.w.saturating_sub(1) {
+                let d0 = field.d[j * field.w + i];
+                let dx = field.d[j * field.w + i + 1];
+                let dy = field.d[(j + 1) * field.w + i];
+                let (a, b, c, e) = (
+                    1.0 + f64::from(dx[0] - d0[0]) / CELL,
+                    f64::from(dy[0] - d0[0]) / CELL,
+                    f64::from(dx[1] - d0[1]) / CELL,
+                    1.0 + f64::from(dy[1] - d0[1]) / CELL,
+                );
+                let det = a * e - b * c;
+                if det < worst {
+                    worst = det;
+                    at = field.node_pos(i, j);
+                }
+            }
+        }
+        assert!(worst > 0.2, "the slim field folds beside the oval: jacobian {worst:.2} at ({:.0}, {:.0})", at[0], at[1]);
     }
 }
