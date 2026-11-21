@@ -771,11 +771,43 @@ impl SculptKind {
     }
 }
 
+/// Where the face mesh's crop box came from — what the panel's quality line names when the
+/// landmarks are less trustworthy than a drawn box would make them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceSource {
+    /// The user's box (`roi`): the mesh ran where they asked.
+    Drawn,
+    /// SCRFD's largest face.
+    Detected,
+    /// No box at all: the mesh ran over the whole document, the fallback that puts a small
+    /// face into a handful of pixels.
+    WholeDocument,
+}
+
+impl FaceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FaceSource::Drawn => "drawn",
+            FaceSource::Detected => "detected",
+            FaceSource::WholeDocument => "wholeDocument",
+        }
+    }
+}
+
+/// A lightweight analysis plus where its face box came from. The source is the panel's one
+/// honest quality signal that needs no extra stage: a whole-document mesh is the known-worse
+/// case, and it is actionable (draw a box).
+pub(crate) struct SculptAnalysis {
+    pub analysis: Arc<photocraft_portrait::Analysis>,
+    pub face: FaceSource,
+}
+
 /// The lightweight analysis a sculpt command needs — no Smart Portrait parsing, body or
-/// fashion stages. Body: the person mask and the pose, with a boxed mesh when a detector
-/// finds a face. Face: SCRFD's box and the FaceMesh when the detector answers, so a photo
-/// the subject line cannot segment still gets its face; without a box the whole-document
-/// mesh runs, with the subject line only as the liveness gate the embedded mesh lacks.
+/// fashion stages. Body: the person mask and the pose, with a boxed mesh when the detector
+/// or the drawn `roi` finds a face. Face: the drawn `roi` or SCRFD's box and the FaceMesh,
+/// so a photo the subject line cannot segment still gets its face; without a box the
+/// whole-document mesh runs, with the subject line only as the liveness gate the embedded
+/// mesh lacks.
 ///
 /// Never stored in `portrait_cache`: the partial `Analysis` lacks the regions
 /// `portrait.create` and Select Region read.
@@ -784,8 +816,9 @@ pub(crate) fn analyze_sculpt(
     target: Option<photocraft_doc::LayerId>,
     sample_all: bool,
     kind: SculptKind,
+    roi: Option<photocraft_geom::Rect>,
     ctx: &crate::jobs::JobCtx,
-) -> Result<Arc<photocraft_portrait::Analysis>> {
+) -> Result<SculptAnalysis> {
     let mut analysis = photocraft_portrait::Analysis::new(doc.size.width, doc.size.height);
     let person = match kind {
         SculptKind::Body => Some(person_surface(doc, target, sample_all, ctx)?.ok_or_else(|| EngineError::Other(crate::sculpt_cmds::NO_PERSON.into()))?),
@@ -794,8 +827,14 @@ pub(crate) fn analyze_sculpt(
     if let Some(person) = &person {
         analysis.set(photocraft_portrait::Region::Person, person.clone());
     }
-    let face_box = detected_face_box(doc, target, sample_all, ctx);
-    let boxed = boxed_mesh(doc, target, sample_all, face_box, false, ctx)?;
+    let face_box = roi.or_else(|| detected_face_box(doc, target, sample_all, ctx));
+    let drawn = roi.is_some();
+    let boxed = boxed_mesh(doc, target, sample_all, face_box, drawn, ctx)?;
+    let face = match (drawn, boxed.is_some()) {
+        (true, _) => FaceSource::Drawn,
+        (false, true) => FaceSource::Detected,
+        (false, false) => FaceSource::WholeDocument,
+    };
     analysis.landmarks = match boxed {
         Some((pts, _)) => pts,
         None => {
@@ -819,7 +858,29 @@ pub(crate) fn analyze_sculpt(
             })
             .unwrap_or_default();
     }
-    Ok(Arc::new(analysis))
+    Ok(SculptAnalysis { analysis: Arc::new(analysis), face })
+}
+
+/// `portrait.analyze`'s answer: the anchors in the sculpt commands' stored shape, the Body
+/// contour when there is one, and for Face the quality the panel warns from (`None` for
+/// Body — the pose table has no equivalent honest reading).
+pub struct AnchorsReply {
+    pub anchors: Value,
+    pub contour: Option<Vec<[f64; 2]>>,
+    pub quality: Option<Value>,
+}
+
+/// The face's quality reply: where the box came from plus the mesh's own geometry. The
+/// `source` is what the panel can act on; the angles are what it warns about.
+fn face_quality(anchors: &photocraft_algo::face_sculpt::FaceAnchors, source: FaceSource) -> Value {
+    let mut v = json!({"source": source.as_str()});
+    if let Some(q) = anchors.quality() {
+        v["faceWidth"] = json!(q.face_width);
+        v["faceHeight"] = json!(q.face_height);
+        v["rollDeg"] = json!(q.roll_deg);
+        v["turnDeg"] = json!(q.turn_deg);
+    }
+    v
 }
 
 /// The anchors and contour `portrait.analyze` reports, straight from a document — the
@@ -831,19 +892,29 @@ pub fn analyze_anchors(
     target: Option<photocraft_doc::LayerId>,
     sample_all: bool,
     kind: SculptKind,
+    roi: Option<photocraft_geom::Rect>,
     ctx: &crate::jobs::JobCtx,
-) -> Result<(Value, Option<Vec<[f64; 2]>>)> {
-    let analysis = analyze_sculpt(doc, target, sample_all, kind, ctx)?;
+) -> Result<AnchorsReply> {
+    let found = analyze_sculpt(doc, target, sample_all, kind, roi, ctx)?;
+    let analysis = &found.analysis;
     match kind {
         SculptKind::Body => {
-            let anchors = crate::sculpt_cmds::anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other(crate::sculpt_cmds::NO_PERSON.into()))?;
+            let anchors = crate::sculpt_cmds::anchors_from_analysis(analysis).ok_or_else(|| EngineError::Other(crate::sculpt_cmds::NO_PERSON.into()))?;
             let contour = analysis.mask(photocraft_portrait::Region::Person).and_then(crate::sculpt_cmds::person_contour);
-            Ok((serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?, contour))
+            Ok(AnchorsReply {
+                anchors: serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?,
+                contour,
+                quality: None,
+            })
         }
         SculptKind::Face => {
             let anchors =
-                crate::face_sculpt_cmds::anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other(crate::face_sculpt_cmds::NO_FACE.into()))?;
-            Ok((serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?, None))
+                crate::face_sculpt_cmds::anchors_from_analysis(analysis).ok_or_else(|| EngineError::Other(crate::face_sculpt_cmds::NO_FACE.into()))?;
+            Ok(AnchorsReply {
+                anchors: serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?,
+                contour: None,
+                quality: Some(face_quality(&anchors, found.face)),
+            })
         }
     }
 }
@@ -1137,6 +1208,10 @@ fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
         other => return Err(EngineError::BadParams { cmd: "portrait.analyze".into(), msg: format!("`kind` is \"body\" or \"face\", not {other:?}") }),
     };
     let sample_all = p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false);
+    let has_roi = p.get("roi").is_some_and(|v| !v.is_null());
+    if kind == SculptKind::Body && has_roi {
+        return Err(EngineError::BadParams { cmd: "portrait.analyze".into(), msg: "`roi` is Face Sculpt's face box; Body Sculpt's pose needs no box".into() });
+    }
     let st = s.active().ok_or(EngineError::NoDocument)?;
     let mut target = st.active_layer;
     if p.get("layer").is_some() {
@@ -1145,6 +1220,7 @@ fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
     // As the sculpt commands resolve it: a layer that is not a raster surface has no pixels
     // of its own to sample, so the sampler reads the flattened document instead.
     let target = target.filter(|l| !sample_all && st.doc.layer(*l).and_then(photocraft_doc::Layer::surface).is_some());
+    let face_box = has_roi.then(|| roi(p, st.doc.size)).flatten();
     let doc = Arc::clone(&st.doc);
     let (width, height) = (doc.size.width, doc.size.height);
     let t0 = crate::photo_cmds::Stopwatch::start();
@@ -1152,11 +1228,14 @@ fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
         s,
         "Analyze Portrait",
         false,
-        move |ctx| analyze_anchors(&doc, target, sample_all, kind, ctx),
-        move |_, (anchors, contour)| {
-            let mut r = json!({"kind": kind.as_str(), "width": width, "height": height, "layer": target.map(|l| l.0), "anchors": anchors, "ms": t0.ms()});
-            if let Some(contour) = contour {
+        move |ctx| analyze_anchors(&doc, target, sample_all, kind, face_box, ctx),
+        move |_, found| {
+            let mut r = json!({"kind": kind.as_str(), "width": width, "height": height, "layer": target.map(|l| l.0), "anchors": found.anchors, "ms": t0.ms()});
+            if let Some(contour) = found.contour {
                 r["contour"] = json!(contour);
+            }
+            if let Some(quality) = found.quality {
+                r["quality"] = quality;
             }
             Ok(r)
         },
@@ -1190,7 +1269,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Analyze Portrait",
             menu: &[],
             shortcut: None,
-            params: r##"{"kind":"body"|"face"="body","layer":id?,"sampleAllLayers":bool=false} → {kind,width,height,layer,anchors,contour?,ms} (the anchors the sculpt panels hand `filter.bodySculpt`/`filter.faceSculpt`: Body = person mask + pose + the silhouette contour, Face = the face mesh — a detected face box needs no person stage; without one the subject line only gates presence. One lightweight run — no parsing/body/fashion stages, no history step, nothing cached — and Apply with these anchors never analyses again)"##,
+            params: r##"{"kind":"body"|"face"="body","layer":id?,"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none (face only)} → {kind,width,height,layer,anchors,contour?,quality?,ms} (the anchors the sculpt panels hand `filter.bodySculpt`/`filter.faceSculpt`: Body = person mask + pose + the silhouette contour, Face = the face mesh — a detected face box needs no person stage; without one the subject line only gates presence. `roi` is Face Sculpt's drawn face box in document pixels: the mesh runs inside it and a box with no face errors instead of falling back; without it SCRFD's detected box is used, and without that the whole-document mesh. Face `quality` names the box source (`drawn`/`detected`/`wholeDocument`) and the mesh's face width, height, eye-line roll and nose-offset turn, so the panel can warn on the fallback and on a turned head. One lightweight run — no parsing/body/fashion stages, no history step, nothing cached — and Apply with these anchors never analyses again)"##,
             enabled,
             run: analyze,
             journal: false,
@@ -2047,6 +2126,40 @@ mod tests {
         s.execute("file.new", json!({"width": 64, "height": 64})).unwrap();
         let err = s.execute("portrait.analyze", json!({"kind": "bodyy"})).unwrap_err().to_string();
         assert!(err.contains("kind"), "{err}");
+    }
+
+    /// The face box is Face Sculpt's crop: Body's pose table needs no box, and silently
+    /// ignoring a caller's box would hide a mistake.
+    #[test]
+    fn portrait_analyze_refuses_a_face_box_for_body() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 96, "height": 128})).unwrap();
+        let err = s.execute("portrait.analyze", json!({"kind": "body", "roi": [10, 10, 40, 40]})).unwrap_err().to_string();
+        assert!(err.contains("roi"), "{err}");
+    }
+
+    /// Face's quality reply names a drawn box and measures the mesh: the panel warns from it.
+    /// A box with no face in it is the loud refusal, not a silent whole-document fallback.
+    #[test]
+    fn portrait_analyze_face_reports_a_drawn_box_and_refuses_an_empty_one() {
+        let (mut s, _) = disc();
+        let r = s.execute("portrait.analyze", json!({"kind": "face", "roi": [50, 40, 100, 80]})).unwrap();
+        assert_eq!(r["quality"]["source"], "drawn");
+        assert_eq!(r["anchors"]["pts"].as_array().map(Vec::len), Some(478));
+        assert!(r["quality"]["faceWidth"].as_f64().is_some_and(|w| w > 0.0), "the face's width is measured: {}", r["quality"]);
+
+        let err = s.execute("portrait.analyze", json!({"kind": "face", "roi": [96, 76, 8, 8]})).unwrap_err().to_string();
+        assert!(err.contains("no face found in the box"), "{err}");
+    }
+
+    /// Without a drawn or detected box, the mesh reads the whole document — the fallback the
+    /// panel's warning names, because a small face then gets few pixels.
+    #[test]
+    fn portrait_analyze_face_reports_the_whole_document_fallback() {
+        let (mut s, _) = disc();
+        let r = s.execute("portrait.analyze", json!({"kind": "face"})).unwrap();
+        assert_eq!(r["quality"]["source"], "wholeDocument");
+        assert!(r.get("quality").is_some(), "Face always carries its quality reading");
     }
 
     /// The sculpt panels consume only landmarks; the analysis that produced them lacks the

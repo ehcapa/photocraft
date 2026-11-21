@@ -468,11 +468,11 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
     let ramp_scale = if ramp_sum > budget && ramp_sum > 0.0 { budget / ramp_sum } else { 1.0 };
     for (part, k, shape) in asked {
         let Shape::Ramp { .. } = shape else {
-            write_shape(&mut field, &shape, k);
+            write_shape(&mut field, &shape, k, None);
             report.applied.push(part.name);
             continue;
         };
-        write_shape(&mut field, &shape, k * ramp_scale);
+        write_shape(&mut field, &shape, k * ramp_scale, None);
         report.applied.push(part.name);
     }
     (field, report)
@@ -486,15 +486,35 @@ fn ramp_magnitude(s: &Shape, k: f64) -> f64 {
     }
 }
 
+/// A per-node weight a part's displacement is multiplied by, as `(i, j) -> 0..=1`: the face
+/// table's clip to the face oval and its protection of the eyes and lips. The body passes
+/// `None` — its parts are bounded by their own falloff.
+pub(crate) type NodeWeight<'a> = &'a dyn Fn(usize, usize) -> f32;
+
+/// The field one part writes into and the weight it writes through — the pair every
+/// primitive needs, bundled so the writers stay under the argument-count lint.
+struct Write<'f, 'w> {
+    field: &'f mut LiquifyField,
+    weight: Option<NodeWeight<'w>>,
+}
+
 /// Writes one resolved shape at slider fraction `k` — the whole primitive surface, shared
 /// by both parts tables.
-pub(crate) fn write_shape(field: &mut LiquifyField, shape: &Shape, k: f64) {
+pub(crate) fn write_shape(field: &mut LiquifyField, shape: &Shape, k: f64, weight: Option<NodeWeight<'_>>) {
+    let mut write = Write { field, weight };
     match *shape {
-        Shape::Contract { a, b, band, width, gain } => write_contract(field, a, b, band, width, gain, k),
-        Shape::Radial { c, radius, gain } => write_radial(field, c, radius, gain, k),
-        Shape::Ramp { a, b, band, width, gain } => write_ramp(field, a, b, band, width, gain, k),
-        Shape::Shift { a, b, dir, band, width, gain } => write_shift(field, a, b, dir, band, width, gain * k),
+        Shape::Contract { a, b, band, width, gain } => write_contract(&mut write, a, b, band, width, gain, k),
+        Shape::Radial { c, radius, gain } => write_radial(&mut write, c, radius, gain, k),
+        Shape::Ramp { a, b, band, width, gain } => write_ramp(&mut write, a, b, band, width, gain, k),
+        Shape::Shift { a, b, dir, band, width, gain } => write_shift(&mut write, a, b, dir, band, width, gain * k),
     }
+}
+
+/// The weight at `(i, j)`, 1 without one. A zero weight skips the node before its shape
+/// maths runs, so a clipped-away face part costs only the lookup.
+#[inline]
+fn weight_at(weight: Option<NodeWeight<'_>>, i: usize, j: usize) -> f64 {
+    weight.map_or(1.0, |w| f64::from(w(i, j).clamp(0.0, 1.0)))
 }
 
 /// The inclusive node range covering the document rectangle, `None` when it misses the grid
@@ -515,7 +535,9 @@ fn span(field: &LiquifyField, x0: f64, y0: f64, x1: f64, y1: f64) -> Option<(usi
 /// to the rim pull (`gain · k · width`) at the falloff's shoulder — the bones barely move,
 /// the contour does — and points outward, so the inverse map samples farther out and the
 /// result reads as pulled in.
-fn write_contract(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64, k: f64) {
+fn write_contract(write: &mut Write<'_, '_>, a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64, k: f64) {
+    let weight = write.weight;
+    let field = &mut *write.field;
     let ab = sub(b, a);
     let len = norm(ab);
     let u = scale(ab, 1.0 / len);
@@ -527,6 +549,10 @@ fn write_contract(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64
     let scale_mag = gain * k * width;
     for j in j0..=j1 {
         for i in i0..=i1 {
+            let w = weight_at(weight, i, j);
+            if w <= 0.0 {
+                continue;
+            }
             let p = field.node_pos(i, j);
             let t = dot(sub(p, a), u) / len;
             let q = add(a, scale(u, t.clamp(0.0, 1.0) * len));
@@ -540,7 +566,7 @@ fn write_contract(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64
             if long <= 0.0 {
                 continue;
             }
-            let mag = scale_mag * lat * long * (rho / width);
+            let mag = scale_mag * lat * long * (rho / width) * w;
             let idx = j * field.w + i;
             field.d[idx][0] += (d[0] / rho * mag) as f32;
             field.d[idx][1] += (d[1] / rho * mag) as f32;
@@ -550,18 +576,24 @@ fn write_contract(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64
 
 /// The contraction about one centre (the head, the bust, the hips): the same profile with
 /// the lateral distance measured from `c`.
-fn write_radial(field: &mut LiquifyField, c: [f64; 2], radius: f64, gain: f64, k: f64) {
+fn write_radial(write: &mut Write<'_, '_>, c: [f64; 2], radius: f64, gain: f64, k: f64) {
+    let weight = write.weight;
+    let field = &mut *write.field;
     let Some((i0, j0, i1, j1)) = span(field, c[0] - radius, c[1] - radius, c[0] + radius, c[1] + radius) else { return };
     let scale_mag = gain * k * radius;
     for j in j0..=j1 {
         for i in i0..=i1 {
+            let w = weight_at(weight, i, j);
+            if w <= 0.0 {
+                continue;
+            }
             let d = sub(field.node_pos(i, j), c);
             let rho = norm(d);
             if rho >= radius || rho < 1e-9 {
                 continue;
             }
             let lat = falloff((rho / radius) * (rho / radius), DENSITY);
-            let mag = scale_mag * lat * (rho / radius);
+            let mag = scale_mag * lat * (rho / radius) * w;
             let idx = j * field.w + i;
             field.d[idx][0] += (d[0] / rho * mag) as f32;
             field.d[idx][1] += (d[1] / rho * mag) as f32;
@@ -580,7 +612,9 @@ fn write_radial(field: &mut LiquifyField, c: [f64; 2], radius: f64, gain: f64, k
 /// put its steepest slope at the silhouette's edge, and the five length ramps stacked that
 /// slope (measured: 6.4 px per 4 px cell); the plateau moves it out and the family's shared
 /// budget ([`RAMP_BUDGET`]) caps how much there is to shear.
-fn write_ramp(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64, k: f64) {
+fn write_ramp(write: &mut Write<'_, '_>, a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64, k: f64) {
+    let weight = write.weight;
+    let field = &mut *write.field;
     let ab = sub(b, a);
     let len = norm(ab);
     let u = scale(ab, 1.0 / len);
@@ -595,6 +629,10 @@ fn write_ramp(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64, f6
     let Some((i0, j0, i1, j1)) = span(field, min_x, min_y, max_x, max_y) else { return };
     for j in j0..=j1 {
         for i in i0..=i1 {
+            let w = weight_at(weight, i, j);
+            if w <= 0.0 {
+                continue;
+            }
             let p = field.node_pos(i, j);
             let t = dot(sub(p, a), u) / len;
             let s = smoothstep(lo, hi, t) * (1.0 - smoothstep(1.5, 2.5, t));
@@ -607,7 +645,7 @@ fn write_ramp(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64, f6
                 continue;
             }
             let lat = 1.0 - smoothstep(0.6, 1.0, rho / width);
-            let mag = delta * s * lat;
+            let mag = delta * s * lat * w;
             let idx = j * field.w + i;
             field.d[idx][0] -= (u[0] * mag) as f32;
             field.d[idx][1] -= (u[1] * mag) as f32;
@@ -620,7 +658,9 @@ fn write_ramp(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], band: (f64, f6
 /// plateau-plus-feather laterally and the contract family's smoothstep window
 /// longitudinally. The inverse map points against `dir`, so the content reads as moved
 /// along it; the ride is `gain` of the segment's own length.
-fn write_shift(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], dir: [f64; 2], band: (f64, f64), width: f64, gain: f64) {
+fn write_shift(write: &mut Write<'_, '_>, a: [f64; 2], b: [f64; 2], dir: [f64; 2], band: (f64, f64), width: f64, gain: f64) {
+    let weight = write.weight;
+    let field = &mut *write.field;
     let ab = sub(b, a);
     let len = norm(ab);
     let u = scale(ab, 1.0 / len);
@@ -633,6 +673,10 @@ fn write_shift(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], dir: [f64; 2]
     let Some((i0, j0, i1, j1)) = span(field, min_x, min_y, max_x, max_y) else { return };
     for j in j0..=j1 {
         for i in i0..=i1 {
+            let w = weight_at(weight, i, j);
+            if w <= 0.0 {
+                continue;
+            }
             let p = field.node_pos(i, j);
             let t = dot(sub(p, a), u) / len;
             let q = add(a, scale(u, t.clamp(0.0, 1.0) * len));
@@ -645,7 +689,7 @@ fn write_shift(field: &mut LiquifyField, a: [f64; 2], b: [f64; 2], dir: [f64; 2]
                 continue;
             }
             let lat = 1.0 - smoothstep(0.6, 1.0, rho / width);
-            let mag = delta * long * lat;
+            let mag = delta * long * lat * w;
             let idx = j * field.w + i;
             field.d[idx][0] -= (dir[0] * mag) as f32;
             field.d[idx][1] -= (dir[1] * mag) as f32;
@@ -681,7 +725,7 @@ fn lerp(a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
 
 /// Hermite smoothstep, flat at both ends (C1): the part windows' ramp, so no window edge is
 /// a seam.
-fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+pub(crate) fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }

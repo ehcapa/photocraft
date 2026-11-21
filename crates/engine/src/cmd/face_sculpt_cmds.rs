@@ -283,7 +283,7 @@ fn lightweight(s: &Session, all_layers: bool) -> Result<std::sync::Arc<photocraf
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let target = d.active_layer.filter(|l| !all_layers && d.doc.layer(*l).and_then(photocraft_doc::Layer::surface).is_some());
     let ctx = crate::jobs::JobCtx::new();
-    crate::portrait_cmds::analyze_sculpt(&d.doc, target, all_layers, crate::portrait_cmds::SculptKind::Face, &ctx)
+    crate::portrait_cmds::analyze_sculpt(&d.doc, target, all_layers, crate::portrait_cmds::SculptKind::Face, None, &ctx).map(|found| found.analysis)
 }
 
 fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {

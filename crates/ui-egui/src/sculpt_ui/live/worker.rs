@@ -36,10 +36,12 @@ pub(crate) struct Frame {
     pub image: ColorImage,
 }
 
-/// The panel's opening analysis: the anchors Apply will carry.
+/// The panel's opening analysis: the anchors Apply will carry, plus Face Sculpt's quality
+/// reading (where the face box came from and the mesh's geometry).
 pub(crate) struct Analysis {
     pub anchors: Value,
     pub contour: Option<Value>,
+    pub quality: Option<Value>,
     /// The layer whose own pixels were sampled, or `None` when the analysis read the flattened
     /// document — Apply cannot warp the latter.
     pub layer: Option<u64>,
@@ -88,18 +90,20 @@ pub(crate) fn render(job: &Job, ctx: &JobCtx) -> Result<Output, String> {
     Ok(Output::Frame(Frame { image: ColorImage::new([w, h], pixels) }))
 }
 
-/// One opening analysis: the document to read, the layer Apply will warp and which landmarks.
+/// One opening analysis: the document to read, the layer Apply will warp, which landmarks and
+/// the user's drawn face box, if any.
 pub(crate) struct AnalysisJob {
     pub doc: Arc<photocraft_doc::Document>,
     pub layer: photocraft_doc::LayerId,
     pub kind: photocraft_engine::portrait_cmds::SculptKind,
+    pub roi: Option<Rect>,
 }
 
 /// `job`'s anchors, through the engine's own `analyze_anchors` and this job's cancellation.
 pub(crate) fn analyze(job: &AnalysisJob, ctx: &JobCtx) -> Result<Output, String> {
-    let (anchors, contour) = photocraft_engine::portrait_cmds::analyze_anchors(&job.doc, Some(job.layer), false, job.kind, ctx).map_err(|e| e.to_string())?;
-    let contour = contour.map(serde_json::to_value).transpose().map_err(|e| format!("the contour would not serialise: {e}"))?;
-    Ok(Output::Analysis(Analysis { anchors, contour, layer: Some(job.layer.0) }))
+    let found = photocraft_engine::portrait_cmds::analyze_anchors(&job.doc, Some(job.layer), false, job.kind, job.roi, ctx).map_err(|e| e.to_string())?;
+    let contour = found.contour.map(serde_json::to_value).transpose().map_err(|e| format!("the contour would not serialise: {e}"))?;
+    Ok(Output::Analysis(Analysis { anchors: found.anchors, contour, quality: found.quality, layer: Some(job.layer.0) }))
 }
 
 /// `new` over `old` (premultiplied) by coverage `c`, as the engine mixes the committed warp

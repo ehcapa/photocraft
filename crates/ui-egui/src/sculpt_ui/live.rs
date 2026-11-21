@@ -55,6 +55,11 @@ pub struct Live {
     /// `portrait.analyze`'s anchors, `Null` when the analysis failed.
     anchors: Value,
     contour: Option<Value>,
+    /// Face Sculpt's quality reading: the face box's source and the mesh's geometry. `None`
+    /// for Body, or when the analysis failed.
+    quality: Option<Value>,
+    /// The user's drawn face box, if any: the next analysis meshes inside it.
+    roi: Option<Rect>,
     /// Whether the analysis sampled the bound layer's own pixels: the layer Apply can warp.
     sampled: bool,
     /// The bound layer is a raster surface or a smart object — the kinds Apply can warp.
@@ -124,6 +129,8 @@ impl Live {
             revision: 0,
             anchors: Value::Null,
             contour: None,
+            quality: None,
+            roi: None,
             sampled: false,
             warpable: false,
             busy: false,
@@ -186,7 +193,7 @@ impl Live {
         if st.doc.id != doc_id {
             return;
         }
-        let job = worker::AnalysisJob { doc: Arc::clone(&st.doc), layer, kind: self.kind() };
+        let job = worker::AnalysisJob { doc: Arc::clone(&st.doc), layer, kind: self.kind(), roi: self.roi };
         self.busy = true;
         self.analysis_pending = Some((doc_id, layer, self.revision));
         match self.worker.start(self.serial, app.ctx().clone(), move |ctx| worker::analyze(&job, ctx)) {
@@ -200,25 +207,30 @@ impl Live {
     /// The browser's path: no threads, so the analysis runs inline like it used to everywhere.
     #[cfg(target_arch = "wasm32")]
     fn analyze_sync(&mut self, app: &mut PhotocraftApp) {
-        let params = match self.layer {
+        let mut params = match self.layer {
             Some(layer) => json!({"kind": self.kind().as_str(), "layer": layer.0}),
             None => json!({"kind": self.kind().as_str()}),
         };
+        if let Some(r) = self.roi {
+            params["roi"] = json!([r.x0, r.y0, r.width(), r.height()]);
+        }
         self.busy = true;
         match app.session.execute("portrait.analyze", params) {
             Ok(reply) => {
                 let anchors = reply.get("anchors").cloned().unwrap_or(Value::Null);
                 let contour = reply.get("contour").cloned();
+                let quality = reply.get("quality").cloned();
                 let layer = reply.get("layer").and_then(Value::as_u64);
-                self.finish(app, anchors, contour, layer);
+                self.finish(app, anchors, contour, quality, layer);
             }
             Err(e) => self.fail(e.to_string()),
         }
     }
 
-    /// The analysis's answer into the panel's state: the anchors Apply will carry, and the
-    /// inline notice when it found nothing or sampled a layer Apply cannot warp.
-    fn finish(&mut self, app: &PhotocraftApp, anchors: Value, contour: Option<Value>, layer: Option<u64>) {
+    /// The analysis's answer into the panel's state: the anchors Apply will carry, the quality
+    /// the panel warns from, and the inline notice when it found nothing or sampled a layer
+    /// Apply cannot warp.
+    fn finish(&mut self, app: &PhotocraftApp, anchors: Value, contour: Option<Value>, quality: Option<Value>, layer: Option<u64>) {
         self.busy = false;
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -226,6 +238,7 @@ impl Live {
         }
         self.anchors = anchors;
         self.contour = contour;
+        self.quality = quality;
         // `layer` is null when the analysis read the flattened document: the bound layer then
         // has no pixels of its own to warp.
         self.sampled = self.warpable && layer == self.layer.map(|l| l.0);
@@ -273,6 +286,54 @@ impl Live {
             return Some(error.clone());
         }
         self.suppress.map(|why| crate::i18n::t(why).to_owned())
+    }
+
+    /// The question Face Sculpt should warn about before its warp is trusted: the
+    /// whole-document fallback (no face box) or a turned head. `None` when the analysis is
+    /// fine, for Body, or before one has landed.
+    pub fn warning_text(&self) -> Option<String> {
+        let q = self.quality.as_ref()?;
+        if q.get("source").and_then(Value::as_str) == Some("wholeDocument") {
+            return Some(tl!("No face box was found, so the landmarks came from the whole photo; select the face and re-analyse for a closer fit").into());
+        }
+        let turn = q.get("turnDeg").and_then(Value::as_f64).unwrap_or(0.0);
+        (turn.abs() > 20.0).then(|| tl!("The face is turned; Face Sculpt is least accurate on a profile").to_string())
+    }
+
+    /// The face box the current anchors were meshed inside, if the user drew one.
+    pub(crate) fn roi(&self) -> Option<Rect> {
+        self.roi
+    }
+
+    /// Runs the analysis again, inside `roi` when one is given: the panel's response to a
+    /// warning, or to a new selection. The old anchors and frame go at once; Apply waits for
+    /// the new answer.
+    pub(crate) fn reanalyze(&mut self, app: &mut PhotocraftApp, roi: Option<Rect>) {
+        self.suspend();
+        self.roi = roi;
+        self.anchors = Value::Null;
+        self.contour = None;
+        self.quality = None;
+        self.sampled = false;
+        self.notice = None;
+        self.preview_error = None;
+        self.last_requested = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.want = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.worker.busy() {
+                // Let the cancelled job drain first: tick starts the analysis as soon as the
+                // worker is free, so a cancelled preview cannot be mistaken for a cancelled
+                // analysis.
+                self.busy = true;
+                self.analysis_pending = None;
+            } else {
+                self.start_analysis(app);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.analyze_sync(app);
     }
 
     /// The document this panel belongs to, once one was found.
@@ -408,7 +469,7 @@ impl Live {
         match result {
             Ok(worker::Output::Analysis(reply)) => {
                 if self.analysis_pending.take().is_some() {
-                    self.finish(app, reply.anchors, reply.contour, reply.layer);
+                    self.finish(app, reply.anchors, reply.contour, reply.quality, reply.layer);
                     ctx.request_repaint();
                 }
             }
@@ -685,6 +746,8 @@ impl Live {
             revision: st.revision,
             anchors,
             contour: None,
+            quality: None,
+            roi: None,
             sampled: true,
             warpable: true,
             busy: false,
@@ -716,9 +779,9 @@ impl Live {
         if Some(st.doc.id) != self.doc {
             return;
         }
-        let job = worker::AnalysisJob { doc: Arc::clone(&st.doc), layer, kind: self.kind() };
+        let job = worker::AnalysisJob { doc: Arc::clone(&st.doc), layer, kind: self.kind(), roi: self.roi };
         match worker::analyze(&job, &photocraft_engine::jobs::JobCtx::new()) {
-            Ok(worker::Output::Analysis(reply)) => self.finish(app, reply.anchors, reply.contour, reply.layer),
+            Ok(worker::Output::Analysis(reply)) => self.finish(app, reply.anchors, reply.contour, reply.quality, reply.layer),
             Ok(worker::Output::Frame(_)) => {}
             Err(e) => self.fail(e),
         }

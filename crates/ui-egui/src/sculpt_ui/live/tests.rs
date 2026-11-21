@@ -272,7 +272,7 @@ fn a_slider_change_after_the_analysis_lands_previews() {
     let anchors = body_anchors(256.0, 384.0);
     live.worker
         .start(live.serial, app.ctx().clone(), move |_| {
-            Ok(super::worker::Output::Analysis(super::worker::Analysis { anchors, contour: None, layer: Some(layer.0) }))
+            Ok(super::worker::Output::Analysis(super::worker::Analysis { anchors, contour: None, quality: None, layer: Some(layer.0) }))
         })
         .unwrap();
     let ctx = app.ctx().clone();
@@ -290,6 +290,47 @@ fn a_slider_change_after_the_analysis_lands_previews() {
         assert!(std::time::Instant::now() < deadline, "the first slider change never previewed");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+/// A whole-document face reading is the fallback the sliders are least honest on. The panel
+/// names it, and its selection box becomes the next analysis's crop: a face that filled the
+/// photo is the case the whole-document mesh's small-face failure makes worth fixing.
+#[test]
+fn a_whole_document_face_reading_warns_and_reanalyse_uses_the_selection_box() {
+    let mut h = harness(blank(64, 64), egui::vec2(700.0, 800.0));
+    h.state_mut().sculpt = Some(panel(FACE));
+    let mut live = Live::test(h.state_mut(), FACE, face_anchors());
+    live.quality = Some(json!({"source": "wholeDocument", "turnDeg": 0.0}));
+    h.state_mut().sculpt_live = Some(live);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("No face box").is_some(), "the untrusted fallback is named");
+    assert!(h.query_by_label("Use selection as face box").is_some_and(|b| b.accesskit_node().is_disabled()), "no selection, no box to use");
+
+    h.state_mut().session.execute("select.rect", json!({"x": 10, "y": 12, "width": 40, "height": 48})).unwrap();
+    h.run_steps(2);
+    h.get_by_label("Use selection as face box").click();
+    h.run_steps(1);
+    assert_eq!(h.state().sculpt_live.as_ref().and_then(Live::roi), Some(Rect::new(10, 12, 50, 60)), "the selection bounds become the face box");
+    assert!(!h.state().sculpt_live.as_ref().expect("runtime").ready(), "the old anchors do not apply to the new box");
+}
+
+/// The eye line and the nose are the mesh's own pose reading: a turned head is where the
+/// front-view sliders stop being honest, so the panel warns on it and not on a small roll.
+#[test]
+fn a_turned_face_reading_warns_and_a_level_one_does_not() {
+    let mut h = harness(blank(64, 64), egui::vec2(700.0, 800.0));
+    h.state_mut().sculpt = Some(panel(FACE));
+    let mut live = Live::test(h.state_mut(), FACE, face_anchors());
+    live.quality = Some(json!({"source": "detected", "turnDeg": 32.0, "rollDeg": 2.0}));
+    h.state_mut().sculpt_live = Some(live);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("face is turned").is_some(), "a profile is named");
+
+    let mut live = h.state_mut().sculpt_live.take().expect("runtime");
+    live.quality = Some(json!({"source": "detected", "turnDeg": 4.0, "rollDeg": 2.0}));
+    h.state_mut().sculpt_live = Some(live);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("face is turned").is_none(), "a slightly turned face is not a warning");
 }
 
 /// Another active layer has its own pose or face: the runtime rebinds to it, drops the old

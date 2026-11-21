@@ -282,9 +282,15 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let ready = app.sculpt_live.as_ref().is_some_and(Live::ready);
     let busy = app.sculpt_live.as_ref().is_some_and(Live::busy);
     let notice = app.sculpt_live.as_ref().and_then(Live::notice_text);
+    let warning = app.sculpt_live.as_ref().and_then(Live::warning_text);
+    let roi = app.sculpt_live.as_ref().and_then(Live::roi);
+    // The user's drawn face box: a selection's bounds, the same source Smart Portrait uses.
+    let selection = app.session.active().and_then(|st| st.doc.selection.as_ref()).map(|m| m.content_bounds()).filter(|r| !r.is_empty());
     let title = if panel.command == FACE { tl!("Face Sculpt") } else { tl!("Body Sculpt") };
     let mut close = false;
     let mut confirm = false;
+    // `Some(None)` re-analyses without a box; `Some(Some(r))` inside the drawn box.
+    let mut reanalyze: Option<Option<photocraft_geom::Rect>> = None;
     // The tallest sections (the face's sixteen rows, or the ten eye pairs at three sliders
     // each once unlinked) outgrow a laptop's usable height. Cap the window to the screen and
     // let the rows scroll, so Apply and Close can never be pushed below its bottom edge.
@@ -330,6 +336,21 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 } else if let Some(notice) = &notice {
                     let warning = crate::theme::Tokens::get(ui.ctx()).warning;
                     status_line(ui, notice, Some(warning));
+                } else if let Some(warning) = &warning {
+                    // The analysis landed but its face box or turn makes the sliders less
+                    // trustworthy: name it, and offer the box that fixes it.
+                    let color = crate::theme::Tokens::get(ui.ctx()).warning;
+                    status_line(ui, warning, Some(color));
+                }
+                if panel.command == FACE {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(!busy && selection.is_some(), egui::Button::new(tl!("Use selection as face box"))).clicked() {
+                            reanalyze = Some(selection);
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new(tl!("Re-analyse"))).clicked() {
+                            reanalyze = Some(roi);
+                        }
+                    });
                 }
                 // The preset row (face only): seven one-clicks, the chosen one held. Wrapped, so
                 // a narrow window takes two lines rather than widening past the screen.
@@ -434,6 +455,12 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
         app.sculpt = None;
         app.sculpt_live = None;
         return;
+    }
+    if let Some(roi) = reanalyze
+        && let Some(mut live) = app.sculpt_live.take()
+    {
+        live.reanalyze(app, roi);
+        app.sculpt_live = Some(live);
     }
     app.sculpt = Some(panel.clone());
     if confirm {

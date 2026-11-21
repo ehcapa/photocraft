@@ -240,6 +240,49 @@ pub struct FaceSpec {
     pub anchors: FaceAnchors,
 }
 
+/// The face's geometric quality, as the panel reports it: the face's extent in the photo
+/// and how far the mesh is turned or rolled. It is not a confidence — FaceMesh has none —
+/// but a turned face is where the front-view sliders stop being honest, so naming it is
+/// better than letting the user read a wrong warp as a model failure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceQuality {
+    pub face_width: f32,
+    pub face_height: f32,
+    /// The eye line's angle in degrees. A small value is an upright head.
+    pub roll_deg: f32,
+    /// The nose's offset from the face's mid-axis, as the angle that offset would project
+    /// under a turn. A proxy for yaw, not a measured one: the mesh's own depth is too weak
+    /// to trust as a pose angle, and the slider range is a few degrees anyway.
+    pub turn_deg: f32,
+}
+
+impl FaceAnchors {
+    /// The quality of a usable 478-point mesh, `None` when the anchors are not one.
+    pub fn quality(&self) -> Option<FaceQuality> {
+        if self.pts.len() != MESH_COUNT || self.pts.iter().flatten().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let p = |i: usize| [self.pts[i][0] as f64, self.pts[i][1] as f64];
+        let face_width = (p(mesh::FACE_SIDE_L)[0] - p(mesh::FACE_SIDE_R)[0]).abs();
+        let face_height = (p(mesh::FOREHEAD_TOP)[1] - p(mesh::CHIN)[1]).abs();
+        if face_width < 8.0 || face_height < 8.0 {
+            return None;
+        }
+        // The eye line: the outer corners are the most stable pair the mesh names.
+        let (left, right) = (p(mesh::EYE_OUTER_L), p(mesh::EYE_OUTER_R));
+        let roll = (left[1] - right[1]).atan2(left[0] - right[0]).to_degrees();
+        // The nose's offset from the mid-point of the face's sides, along the side axis.
+        let (side_l, side_r) = (p(mesh::FACE_SIDE_L), p(mesh::FACE_SIDE_R));
+        let axis = [side_l[0] - side_r[0], side_l[1] - side_r[1]];
+        let axis_len = axis[0].hypot(axis[1]);
+        let mid = [(side_l[0] + side_r[0]) * 0.5, (side_l[1] + side_r[1]) * 0.5];
+        let nose = p(mesh::NOSE_TIP);
+        let offset = if axis_len < 1e-9 { 0.0 } else { ((nose[0] - mid[0]) * axis[0] + (nose[1] - mid[1]) * axis[1]) / axis_len };
+        let turn = ((2.0 * offset / face_width).clamp(-1.0, 1.0)).asin().to_degrees();
+        Some(FaceQuality { face_width: face_width as f32, face_height: face_height as f32, roll_deg: roll as f32, turn_deg: turn as f32 })
+    }
+}
+
 /// What a face build did — the body table's semantics: the rows that asked and ran, and
 /// the rows that asked but could not (a mesh that never answered), with the reason.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -264,6 +307,13 @@ mod mesh {
     /// The eye rings (the portrait crate's own canonical lists, restated).
     pub const EYE_RING_L: &[usize] = &[263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466];
     pub const EYE_RING_R: &[usize] = &[33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
+    /// MediaPipe's FACE_OVAL ring: the face's own outline, the field's clip.
+    pub const FACE_OVAL: &[usize] = &[
+        10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162,
+        21, 54, 103, 67, 109,
+    ];
+    /// The outer lip ring: the mouth's opening, protected from the face-outline parts.
+    pub const LIPS_RING: &[usize] = &[61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
     pub const EYE_OUTER_L: usize = 263;
     pub const EYE_OUTER_R: usize = 33;
     pub const EYE_INNER_L: usize = 362;
@@ -359,6 +409,11 @@ impl FaceFrame {
         self.p[i]
     }
 
+    /// A landmark ring as points, for the field's mask polygons.
+    fn ring(&self, ids: &[usize]) -> Vec<[f64; 2]> {
+        ids.iter().map(|&i| self.pt(i)).collect()
+    }
+
     fn mid(&self, a: usize, b: usize) -> [f64; 2] {
         [(self.pt(a)[0] + self.pt(b)[0]) * 0.5, (self.pt(a)[1] + self.pt(b)[1]) * 0.5]
     }
@@ -419,6 +474,162 @@ impl FaceFrame {
     fn mouth_w(&self) -> f64 {
         (self.pt(mesh::MOUTH_CORNER_L)[0] - self.pt(mesh::MOUTH_CORNER_R)[0]).abs().max(6.0)
     }
+}
+
+/// A convex hull (monotone chain, counter-clockwise) of a landmark ring. The rings are
+/// near-convex and their index order is not always the boundary order, so the hull is the
+/// safe polygon for a membership test. `None` for fewer than three distinct points.
+fn hull(mut pts: Vec<[f64; 2]>) -> Option<Vec<[f64; 2]>> {
+    pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])));
+    pts.dedup_by(|a, b| a[0] == b[0] && a[1] == b[1]);
+    if pts.len() < 3 {
+        return None;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let build = |src: &[[f64; 2]]| {
+        let mut out: Vec<[f64; 2]> = Vec::with_capacity(src.len());
+        for &p in src {
+            while out.len() >= 2 && cross(out[out.len() - 2], out[out.len() - 1], p) <= 0.0 {
+                out.pop();
+            }
+            out.push(p);
+        }
+        out
+    };
+    let lower = build(&pts);
+    pts.reverse();
+    let upper = build(&pts);
+    let mut ring = lower;
+    ring.pop();
+    let mut tail = upper;
+    tail.pop();
+    ring.extend(tail);
+    (ring.len() >= 3).then_some(ring)
+}
+
+/// Squared distance from `p` to the segment `a..b`.
+fn seg_dist2(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let ab = down(a, b);
+    let d2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if d2 <= 1e-18 {
+        let d = down(a, p);
+        return d[0] * d[0] + d[1] * d[1];
+    }
+    let t = ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / d2;
+    let t = t.clamp(0.0, 1.0);
+    let q = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+    let d = down(q, p);
+    d[0] * d[0] + d[1] * d[1]
+}
+
+/// The signed distance from `p` to a counter-clockwise convex polygon: negative inside,
+/// positive outside, absolute value the distance to the nearest edge.
+fn signed_distance(p: [f64; 2], poly: &[[f64; 2]]) -> f64 {
+    let mut d2 = f64::MAX;
+    let mut inside = true;
+    let n = poly.len();
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        let side = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        if side < 0.0 {
+            inside = false;
+        }
+        d2 = d2.min(seg_dist2(p, a, b));
+    }
+    let d = d2.sqrt();
+    if inside { -d } else { d }
+}
+
+/// The face field's soft bounds, computed over the face's own node window so a large
+/// document does not pay a canvas-sized mask: `clip` is the FACE_OVAL hull (1 inside, 0
+/// outside, a feather across the outline), `eye` and `lip` are 0 inside the eye rings and
+/// the lip ring and 1 outside. The outline parts must not move the eyes or the mouth; an
+/// eye or mouth part is exempt from its own feature's protection.
+struct FaceMask {
+    i0: usize,
+    j0: usize,
+    w: usize,
+    h: usize,
+    clip: Vec<f32>,
+    eye: Vec<f32>,
+    lip: Vec<f32>,
+}
+
+impl FaceMask {
+    fn new(frame: &FaceFrame, field: &LiquifyField) -> Option<FaceMask> {
+        let oval = hull(frame.ring(mesh::FACE_OVAL))?;
+        let eye_l = hull(frame.ring(mesh::EYE_RING_L));
+        let eye_r = hull(frame.ring(mesh::EYE_RING_R));
+        let lip = hull(frame.ring(mesh::LIPS_RING));
+        let (min_x, max_x) = oval.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+        let (min_y, max_y) = oval.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
+        // The clip's outward feather is the furthest the mask is nonzero outside the ring.
+        let inward = (frame.face_w * 0.02).max(2.0);
+        let outward = (frame.face_w * 0.05).clamp(4.0, 40.0);
+        let (bx, by) = (f64::from(field.bounds.x0) + 0.5, f64::from(field.bounds.y0) + 0.5);
+        let node_x = |x: f64| ((x - bx) / field.cell).floor();
+        let node_y = |y: f64| ((y - by) / field.cell).floor();
+        let i0 = node_x(min_x - outward).max(0.0) as usize;
+        let j0 = node_y(min_y - outward).max(0.0) as usize;
+        let i1 = node_x(max_x + outward).min(field.w as f64 - 1.0).max(i0 as f64) as usize;
+        let j1 = node_y(max_y + outward).min(field.h as f64 - 1.0).max(j0 as f64) as usize;
+        let (w, h) = (i1 - i0 + 1, j1 - j0 + 1);
+        let mut mask = FaceMask { i0, j0, w, h, clip: vec![0.0; w * h], eye: vec![1.0; w * h], lip: vec![1.0; w * h] };
+        // The rings' whole interiors stay still and the weight ramps to 1 outside them: an
+        // eye ring is only a few pixels tall, so a ramp centred on its outline (as the face
+        // clip's is) would leave the pupil partly free to ride the outline sliders. The
+        // ramp is long enough that its steepest slope keeps the around-the-face parts
+        // within the fold guard when every slider is at full.
+        let feather = (frame.face_w * 0.07).clamp(6.0, 32.0);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let p = field.node_pos(i, j);
+                let idx = (j - j0) * w + (i - i0);
+                mask.clip[idx] = (1.0 - crate::sculpt::smoothstep(-inward, outward, signed_distance(p, &oval))).clamp(0.0, 1.0) as f32;
+                let mut eye = 1.0f64;
+                for ring in [&eye_l, &eye_r].into_iter().flatten() {
+                    eye = eye.min(crate::sculpt::smoothstep(0.0, feather, signed_distance(p, ring)));
+                }
+                mask.eye[idx] = eye as f32;
+                if let Some(ring) = &lip {
+                    mask.lip[idx] = crate::sculpt::smoothstep(0.0, feather, signed_distance(p, ring)) as f32;
+                }
+            }
+        }
+        Some(mask)
+    }
+
+    /// The weight closure one part writes through. Outside the window the face clip is 0,
+    /// which is also every face part's answer there.
+    fn weights(&self, protect_eyes: bool, protect_lips: bool) -> impl Fn(usize, usize) -> f32 + '_ {
+        move |i, j| {
+            if i < self.i0 || j < self.j0 {
+                return 0.0;
+            }
+            let (x, y) = (i - self.i0, j - self.j0);
+            if x >= self.w || y >= self.h {
+                return 0.0;
+            }
+            let idx = y * self.w + x;
+            let mut weight = self.clip[idx];
+            if protect_eyes {
+                weight *= self.eye[idx];
+            }
+            if protect_lips {
+                weight *= self.lip[idx];
+            }
+            weight
+        }
+    }
+}
+
+/// Whether a part must leave the eye or lip interior alone. Eye parts own the eyes, mouth
+/// parts own the lips; everything else — the outline, the nose, the brows — protects both.
+fn protects(name: &str) -> (bool, bool) {
+    let eye = name.contains("eye") || name.contains("pupil") || name.contains("lid");
+    let mouth = name.contains("mouth") || name.contains("lip") || name.contains("gum") || name.contains("philtrum");
+    (!eye, !mouth)
 }
 
 /// One row of the face table — the body table's Part, over the face frame.
@@ -762,6 +973,10 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
     let mut field = LiquifyField::new(bounds, cell);
     let mut report = FaceReport::default();
     let Some(frame) = FaceFrame::new(&spec.anchors) else { return (field, report) };
+    // The face's own bounds: every part is clipped to the FACE_OVAL hull, and the outline,
+    // nose and brow parts cannot move the eyes or the mouth — the field used to run to the
+    // canvas edge, dragging hair and background with the cheek.
+    let mask = FaceMask::new(&frame, &field);
     let mut asked: Vec<(&'static FacePart, f64, Shape)> = Vec::new();
     let sliders = spec.sliders.composed();
     for part in FACE_PARTS {
@@ -806,7 +1021,14 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
             Shape::Contract { .. } | Shape::Radial { .. } => k * c_scale,
             Shape::Ramp { .. } | Shape::Shift { .. } => k * r_scale,
         };
-        write_shape(&mut field, &shape, k);
+        match &mask {
+            Some(mask) => {
+                let (protect_eyes, protect_lips) = protects(part.name);
+                let weight = mask.weights(protect_eyes, protect_lips);
+                write_shape(&mut field, &shape, k, Some(&weight));
+            }
+            None => write_shape(&mut field, &shape, k, None),
+        }
         report.applied.push(part.name);
     }
     (field, report)
@@ -827,6 +1049,17 @@ mod tests {
     /// centre, as FaceMesh's own no-face fallback does — the frame only reads named ones.
     fn face() -> FaceAnchors {
         let mut pts = vec![[256.0f32, 240.0f32, 0.0f32]; MESH_COUNT];
+        // The mask rings first: the face's own outline (an ellipse through forehead and
+        // chin) and the lip ring, so the clip and the protection have their polygons. The
+        // named anchors below keep their exact layout over the rings'.
+        let ring = |ids: &[usize], cx: f64, cy: f64, rx: f64, ry: f64, pts: &mut Vec<[f32; 3]>| {
+            for (k, &i) in ids.iter().enumerate() {
+                let t = -std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * k as f64 / ids.len() as f64;
+                pts[i] = [(cx + rx * t.cos()) as f32, (cy + ry * t.sin()) as f32, 0.0];
+            }
+        };
+        ring(mesh::FACE_OVAL, 256.0, 244.0, 120.0, 148.0, &mut pts);
+        ring(mesh::LIPS_RING, 256.0, 343.0, 40.0, 13.0, &mut pts);
         let mut set = |i: usize, x: f64, y: f64| pts[i] = [x as f32, y as f32, 0.0];
         set(mesh::FOREHEAD_TOP, 256.0, 96.0);
         set(mesh::CHIN, 256.0, 392.0);
@@ -1028,10 +1261,42 @@ mod tests {
     #[test]
     fn the_face_slims_toward_its_axis_and_the_corners_stay() {
         let (field, _) = build(FaceSliders { face_slim: 100.0, ..Default::default() });
-        let right_rim = field.sample(372.0, 350.0); // inside the slim band, to the axis's right
+        let right_rim = field.sample(330.0, 340.0); // inside the slim band and the face, to the axis's right
         assert!(right_rim[0] > 0.2, "the rim field must point outward (reads pulled in): {right_rim:?}");
         let corner = field.sample(10.0, 10.0);
         assert!(corner[0].abs() < 1e-6 && corner[1].abs() < 1e-6, "the corner stays: {corner:?}");
+    }
+
+    /// The field belongs to the face: a whole-face part must not reach the hair or the
+    /// background outside the FACE_OVAL ring, and it must leave the eyes and the mouth
+    /// still for the parts that own them. Before the clip, `face_size` pulled on the whole
+    /// canvas and on the eyes and lips as if they were cheek.
+    #[test]
+    fn the_outline_parts_stop_at_the_face_and_leave_the_features_still() {
+        let (field, _) = build(FaceSliders { face_size: 100.0, ..Default::default() });
+        let at = |x: f64, y: f64| {
+            let d = field.sample(x, y);
+            d[0].hypot(d[1])
+        };
+        for (x, y) in [(40.0, 40.0), (480.0, 480.0), (256.0, 470.0), (40.0, 244.0), (470.0, 244.0)] {
+            assert!(at(x, y) < 0.5, "outside the face stays still at ({x}, {y}): {}", at(x, y));
+        }
+        // The centres and points just inside each ring's outline: the eye ring is only
+        // sixteen pixels tall on this face, and a protection ramp centred on the outline
+        // left its inner edge free to ride the outline sliders.
+        for (x, y) in [(306.0, 232.0), (206.0, 232.0), (256.0, 343.0), (306.0, 238.0), (206.0, 226.0), (256.0, 333.0)] {
+            assert!(at(x, y) < 0.5, "the protected feature at ({x}, {y}) must not ride the outline: {}", at(x, y));
+        }
+        assert!(at(330.0, 340.0) > 1.0, "the cheek inside the face still shapes: {}", at(330.0, 340.0));
+    }
+
+    /// The protection is per feature, not a blanket freeze: the mouth rows still move the
+    /// lips they name.
+    #[test]
+    fn the_mouth_parts_still_move_the_lips_they_own() {
+        let (field, _) = build(FaceSliders { mouth_size: 100.0, ..Default::default() });
+        let corner = field.sample(296.0, 342.0);
+        assert!(corner[0].hypot(corner[1]) > 0.5, "the mouth corner moves: {corner:?}");
     }
 
     #[test]
@@ -1109,20 +1374,57 @@ mod tests {
         };
         let (field, report) = build(sliders);
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
-        let mut worst = 0.0f32;
+        let mut worst = (0.0f32, 0, 0);
         for j in 0..field.h {
             for i in 0..field.w {
                 let d = field.d[j * field.w + i];
                 if i + 1 < field.w {
                     let r = field.d[j * field.w + i + 1];
-                    worst = worst.max((d[0] - r[0]).abs().max((d[1] - r[1]).abs()));
+                    let step = (d[0] - r[0]).abs().max((d[1] - r[1]).abs());
+                    if step > worst.0 {
+                        worst = (step, i, j);
+                    }
                 }
                 if j + 1 < field.h {
                     let dn = field.d[(j + 1) * field.w + i];
-                    worst = worst.max((d[0] - dn[0]).abs().max((d[1] - dn[1]).abs()));
+                    let step = (d[0] - dn[0]).abs().max((d[1] - dn[1]).abs());
+                    if step > worst.0 {
+                        worst = (step, i, j);
+                    }
                 }
             }
         }
-        assert!((worst as f64) < CELL, "adjacent nodes step {worst:.2}px past the {CELL}px cell — the field folds");
+        let (worst, i, j) = worst;
+        let p = field.node_pos(i, j);
+        assert!((worst as f64) < CELL, "adjacent nodes step {worst:.2}px past the {CELL}px cell at ({}, {}) — the field folds", p[0], p[1]);
+    }
+
+    #[test]
+    fn the_quality_reads_an_upright_face_as_straight_on() {
+        let q = face().quality().expect("a full mesh has a quality");
+        assert!((q.face_width - 240.0).abs() < 0.5, "the face's width: {}", q.face_width);
+        assert!((q.face_height - 296.0).abs() < 0.5, "the face's height: {}", q.face_height);
+        assert!(q.roll_deg.abs() < 0.01, "the eye line is level: {}", q.roll_deg);
+        assert!(q.turn_deg.abs() < 0.01, "the nose is on the axis: {}", q.turn_deg);
+    }
+
+    /// A turned head moves the nose off the face's mid-axis; a tilted one lowers an eye. The
+    /// panel warns on both, so the reading must follow the landmarks rather than sit at zero.
+    #[test]
+    fn the_quality_follows_a_turned_and_a_tilted_head() {
+        let mut anchors = face();
+        anchors.pts[mesh::NOSE_TIP][0] += 24.0;
+        let q = anchors.quality().expect("a full mesh has a quality");
+        assert!((q.turn_deg - 11.5).abs() < 1.0, "a 24 px nose offset is the turn the panel reads: {}", q.turn_deg);
+
+        let mut anchors = face();
+        anchors.pts[mesh::EYE_OUTER_L][1] += 10.0;
+        anchors.pts[mesh::EYE_OUTER_R][1] -= 10.0;
+        let q = anchors.quality().expect("a full mesh has a quality");
+        assert!((q.roll_deg - 8.75).abs() < 0.5, "a 20 px eye-line rise over 130 px is the roll: {}", q.roll_deg);
+
+        let mut short = face();
+        short.pts.truncate(MESH_COUNT - 1);
+        assert!(short.quality().is_none(), "a truncated mesh is not a face");
     }
 }
