@@ -48,6 +48,25 @@ const COVERED_REASON: &str = "a landmark lies outside the person silhouette; the
 /// body parts want a broad plateau with the feather at the rim only.
 const DENSITY: f64 = 0.6;
 
+/// How far a [`Shape::Profile`]'s envelope reaches beyond the measured half-width at its
+/// level. The lateral falloff peaks near half its width, so twice the measured contour puts
+/// the peak on the visible rim (the fitted rows' own 2.05).
+const PROFILE_REACH: f64 = 2.05;
+
+/// The fraction of a limb's bone each of its two ends reaches past the joint, so the thigh's
+/// cap and the calf's overlap at the knee instead of both dying there.
+const LIMB_JOINT_OVERLAP: f64 = 0.18;
+
+/// The coupling length per pixel of local displacement: the slimming family's weight decays
+/// to nothing over twice the displacement it carries. The smoothstep's steepest slope is
+/// 1.5/L, so the weight contributes at most 0.75 to the map's slope — under the fold limit
+/// of 1 — at every node, however many rows stack there.
+const COUPLING_LENGTH: f64 = 2.0;
+
+/// The shortest coupling length (document px): tiny displacements still get a smooth handoff
+/// instead of a hard clip.
+const COUPLING_MIN: f64 = 8.0;
+
 /// The twenty-one shaping sliders, each −100..100. A slider's positive direction is its
 /// label's action: `waist` narrows, `hips` rounds, `leg_length` lengthens; zero leaves the
 /// part out.
@@ -331,11 +350,23 @@ impl<'a> Frame<'a> {
         (f64::from(level.left).max(4.0), f64::from(level.right).max(4.0))
     }
 
-    /// The fitted band around a torso level: a narrow window on the torso axis, clamped to
-    /// the segment so a level at either end still names a valid window.
-    fn level_band(level: &LevelFit) -> (f64, f64) {
-        let t = f64::from(level.t).clamp(0.03, 0.97);
-        (t - 0.085, (t + 0.085).min(1.05))
+    /// The torso's width profile as `(t, half-width)` knots sorted by `t`: the fit's four
+    /// measured levels (bust, waist, belly, hip), or the joint-spacing estimate when there is
+    /// no fit. Sorted here, not trusted: `t` comes from params, and the profile writer blends
+    /// between neighbours.
+    fn torso_levels(&self) -> [(f64, f64); 4] {
+        let mut levels = match self.fit {
+            Some(fit) => [&fit.bust, &fit.waist, &fit.belly, &fit.hip].map(|l| {
+                let half = f64::from(l.left.max(l.right)).max(4.0);
+                (f64::from(l.t), half)
+            }),
+            None => {
+                let half = self.shoulder_w() * 0.425;
+                [(0.0, half), (0.30, half), (0.70, half), (1.0, half)]
+            }
+        };
+        levels.sort_by(|a, b| a.0.total_cmp(&b.0));
+        levels
     }
 
     fn mid(&self, i: usize, j: usize) -> [f64; 2] {
@@ -414,6 +445,10 @@ impl<'a> Frame<'a> {
         (radius >= 4.0).then_some(Shape::Radial { c, radius, gain })
     }
 
+    fn profile(&self, a: [f64; 2], b: [f64; 2], levels: [(f64, f64); 4], kernel: Kernel, gain: f64) -> Option<Shape> {
+        (norm(sub(b, a)) >= 4.0).then_some(Shape::Profile { a, b, levels, kernel, gain })
+    }
+
     fn ramp(&self, a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64) -> Option<Shape> {
         (norm(sub(b, a)) >= 4.0 && width >= 4.0 && band.1 > band.0).then_some(Shape::Ramp { a, b, band, width, gain })
     }
@@ -423,8 +458,41 @@ impl<'a> Frame<'a> {
     }
 }
 
+/// The longitudinal profile of a [`Shape::Profile`]: how much of the row's pull a level of
+/// the torso receives, as a function of `t` along the shoulder→hip segment. Both kernels are
+/// C1 with zero slope at their ends, so a row's effect blends into its neighbours' instead of
+/// stopping at a window edge — the isolated-band dent a hard window produced.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Kernel {
+    /// A raised cosine: 1 at `centre`, 0 with zero slope at `centre ± half`. The waist and
+    /// belly are bumps: strongest on their measured row, tapering continuously toward the
+    /// ribs and the hips.
+    Bump { centre: f64, half: f64 },
+    /// Smoothstep up over `ease`, full between `lo + ease` and `hi - ease`, smoothstep down.
+    /// The whole-torso rows (slim body) use it: a broad plateau, not a band.
+    Plateau { lo: f64, hi: f64, ease: f64 },
+}
+
+impl Kernel {
+    fn at(&self, t: f64) -> f64 {
+        match *self {
+            Kernel::Bump { centre, half } => {
+                if half <= 1e-9 {
+                    return 1.0;
+                }
+                let u = ((t - centre) / half).clamp(-1.0, 1.0);
+                0.5 * (1.0 + (std::f64::consts::PI * u).cos())
+            }
+            Kernel::Plateau { lo, hi, ease } => {
+                let ease = ease.max(0.0);
+                smoothstep(lo, lo + ease, t) * (1.0 - smoothstep(hi - ease, hi, t))
+            }
+        }
+    }
+}
+
 /// One part's resolved geometry — shared with the face table ([`crate::face_sculpt`]):
-/// the panel's parts are rows over these four primitives, nothing more.
+/// the panel's parts are rows over these primitives, nothing more.
 pub(crate) enum Shape {
     /// Scale the lateral distance to a segment: the displacement grows from nothing on the
     /// axis to the rim pull at the falloff's shoulder, inside a longitudinal window over
@@ -432,6 +500,13 @@ pub(crate) enum Shape {
     /// pull at slider 100 as a fraction of `width`; the field points outward (the inverse
     /// map samples farther out, which reads as contraction), so a negative gain expands.
     Contract { a: [f64; 2], b: [f64; 2], band: (f64, f64), width: f64, gain: f64 },
+    /// A contraction whose lateral width and longitudinal strength follow the torso's own
+    /// measured width profile: `levels` are `(t, half-width)` knots sorted by `t` (the fit's
+    /// bust, waist, belly and hip), and the envelope at any `t` reaches [`PROFILE_REACH`]
+    /// times the interpolated half-width, so the pull lands on the visible contour at every
+    /// level. `kernel` sets how strongly the row acts at each level; one continuous shape
+    /// replaces the per-level bands, so waist, belly and slim compose without dents.
+    Profile { a: [f64; 2], b: [f64; 2], levels: [(f64, f64); 4], kernel: Kernel, gain: f64 },
     /// The same scaling about one centre: the head, the bust, the hips.
     Radial { c: [f64; 2], radius: f64, gain: f64 },
     /// Stretch along a→b by `gain` of the segment's length: the smoothstep ramp is zero
@@ -479,36 +554,37 @@ const PARTS: &[Part] = &[
         // would pull both legs toward the centre instead of slimming each. The old row also
         // needed the ankles, so a cropped or skirt-hidden pair killed the whole slider.
         needs: &[11, 12, 23, 24],
-        shape: |f| match f.fit {
-            Some(fit) => {
-                let half = fit.max_half().max(24.0);
-                f.contract(f.shoulder_mid(), f.hip_mid(), (0.0, 1.05), 2.10 * half, 0.14)
-            }
-            None => f.contract(f.shoulder_mid(), f.hip_mid(), (0.0, 1.05), f.shoulder_w() * 0.85, 0.10),
+        shape: |f| {
+            // One continuous envelope down the whole torso, its width following the measured
+            // contour at every level and its strength a broad plateau: the slim slider reads
+            // as the silhouette narrowing, not as bands that end in seams.
+            let levels = f.torso_levels();
+            let gain = if f.fit.is_some() { 0.14 } else { 0.10 };
+            f.profile(f.shoulder_mid(), f.hip_mid(), levels, Kernel::Plateau { lo: 0.0, hi: 1.05, ease: 0.25 }, gain)
         },
     },
     Part {
         name: "waist",
         slider: |s| s.waist,
         needs: &[11, 12, 23, 24],
-        shape: |f| match f.fit {
-            Some(fit) => {
-                let (l, r) = f.level_half(&fit.waist);
-                f.contract(f.shoulder_mid(), f.hip_mid(), Frame::level_band(&fit.waist), 2.05 * l.max(r), 0.18)
-            }
-            None => f.contract(f.shoulder_mid(), f.hip_mid(), (0.30, 0.78), f.shoulder_w() * 0.60, 0.10),
+        shape: |f| {
+            // A bump centred on the measured waist, wide enough to blend into the ribs above
+            // and the hips below: the old ±8.5% window acted on a narrow band and left the
+            // torso dented above and below it. The level's `t` still places the peak; the
+            // tail is what makes the slider read as a continuous narrowing.
+            let centre = f.fit.map_or(0.54, |fit| f64::from(fit.waist.t));
+            let gain = if f.fit.is_some() { 0.18 } else { 0.10 };
+            f.profile(f.shoulder_mid(), f.hip_mid(), f.torso_levels(), Kernel::Bump { centre, half: 0.26 }, gain)
         },
     },
     Part {
         name: "belly",
         slider: |s| s.belly,
         needs: &[11, 12, 23, 24],
-        shape: |f| match f.fit {
-            Some(fit) => {
-                let (l, r) = f.level_half(&fit.belly);
-                f.contract(f.shoulder_mid(), f.hip_mid(), Frame::level_band(&fit.belly), 2.05 * l.max(r), 0.17)
-            }
-            None => f.contract(f.shoulder_mid(), f.hip_mid(), (0.55, 0.95), f.shoulder_w() * 0.62, 0.08),
+        shape: |f| {
+            let centre = f.fit.map_or(0.75, |fit| f64::from(fit.belly.t));
+            let gain = if f.fit.is_some() { 0.17 } else { 0.08 };
+            f.profile(f.shoulder_mid(), f.hip_mid(), f.torso_levels(), Kernel::Bump { centre, half: 0.22 }, gain)
         },
     },
     Part {
@@ -604,6 +680,9 @@ const PARTS: &[Part] = &[
 /// skirt-hidden end shortens the row rather than skipping it. Without a fit the old
 /// bone-length fraction stands.
 fn limb(f: &Frame, i: usize, j: usize, width_frac: f64, gain: f64) -> Option<Shape> {
+    // Every limb row must reach past its joints: a band that ramps to zero exactly at the
+    // joint left the knee and elbow still while the bones either side moved, reading as a
+    // pinch; overlapping the neighbouring bone's cap keeps the chain continuous.
     if let Some(fit) = f.fit
         && let Some(idx) = LIMB_SEGMENTS.iter().position(|&(a, b)| a == i && b == j)
     {
@@ -611,11 +690,13 @@ fn limb(f: &Frame, i: usize, j: usize, width_frac: f64, gain: f64) -> Option<Sha
         let radius = f64::from(l.radius);
         let (t0, t1) = (f64::from(l.t0).clamp(0.0, 0.98), f64::from(l.t1).clamp(0.02, 1.0));
         if radius > 1.0 && t1 - t0 >= 0.10 {
-            return f.contract(f.pt(i), f.pt(j), (t0, t1), (2.0 * radius).max(16.0), gain);
+            let band = (t0 - LIMB_JOINT_OVERLAP, t1 + LIMB_JOINT_OVERLAP);
+            return f.contract(f.pt(i), f.pt(j), band, (2.0 * radius).max(16.0), gain);
         }
     }
     let len = norm(sub(f.pt(j), f.pt(i)));
-    f.contract(f.pt(i), f.pt(j), (0.05, 0.95), (len * width_frac).max(12.0), gain)
+    let band = (0.05 - LIMB_JOINT_OVERLAP, 0.95 + LIMB_JOINT_OVERLAP);
+    f.contract(f.pt(i), f.pt(j), band, (len * width_frac).max(12.0), gain)
 }
 
 /// An arm segment, a limb with a slimmer fraction.
@@ -718,17 +799,15 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
     let shape_budget = SHAPE_BUDGET * frame.fit.map_or(frame.person_w(), |fit| fit.max_half().max(24.0));
     let shape_sum: f64 = asked.iter().map(|&(_, k, ref s, _)| shape_magnitude(s, k)).sum();
     let shape_scale = if shape_sum > shape_budget && shape_sum > 0.0 { shape_budget / shape_sum } else { 1.0 };
-    // The person clip: a slimming row's envelope is deliberately twice the distance to the
-    // silhouette, so its peak lands on the outline — without a clip the same envelope would
-    // move the background beside the body. The fit's rows are a feathered weight, 1 inside
-    // the person and 0 beyond a short feather; length ramps keep their own lateral plateau
-    // (they must move the silhouette and the background together to avoid a seam).
-    let field_w = field.w;
-    let weights = spec.fit.as_ref().filter(|fit| fit.is_valid()).map(|fit| person_weight(fit, &field));
-    let weight_at = |i: usize, j: usize| weights.as_ref().map_or(1.0, |w| w[j * field_w + i]);
+    // The shaping family is built into its own field first: its participation weight has to
+    // scale the family's *total* displacement at each node, not each row's separately, so a
+    // stack of rows contributes one bounded slope. Length ramps and shifts keep their own
+    // lateral plateau (they move the silhouette and the background together to avoid a seam)
+    // and are written straight into the field.
+    let mut shaping = LiquifyField::new(bounds, cell);
     for (part, k, shape, approximate) in asked {
         let k = match &shape {
-            Shape::Contract { .. } | Shape::Radial { .. } => k * shape_scale,
+            Shape::Contract { .. } | Shape::Radial { .. } | Shape::Profile { .. } => k * shape_scale,
             Shape::Ramp { .. } => k * ramp_scale,
             Shape::Shift { .. } => k,
         };
@@ -737,11 +816,55 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
         }
         match shape {
             Shape::Ramp { .. } | Shape::Shift { .. } => write_shape(&mut field, &shape, k, None),
-            Shape::Contract { .. } | Shape::Radial { .. } => write_shape(&mut field, &shape, k, Some(&weight_at)),
+            _ => write_shape(&mut shaping, &shape, k, None),
         }
         report.applied.push(part.name);
     }
+    couple_to_person(&mut field, &shaping, spec.fit.as_ref().filter(|fit| fit.is_valid()));
     (field, report)
+}
+
+/// Adds the shaping family to the field, coupled to the person silhouette: inside the person
+/// the whole displacement stands; outside, it decays to nothing over twice its own local
+/// magnitude ([`COUPLING_LENGTH`]). The silhouette and the background beside it therefore
+/// move together — a slim drags the near background in, a fuller hip pushes it out — while
+/// the far background stays, and no slider stack can fold the map on the weight alone. This
+/// replaces the old near-binary person clip, whose short fixed feather left the field frozen
+/// just outside the outline (visible as a ridge along it) and could not move the background
+/// out at all.
+fn couple_to_person(field: &mut LiquifyField, shaping: &LiquifyField, fit: Option<&BodyFit>) {
+    let n = field.w * field.h;
+    let Some(fit) = fit else {
+        for idx in 0..n.min(shaping.d.len()).min(field.d.len()) {
+            field.d[idx][0] += shaping.d[idx][0];
+            field.d[idx][1] += shaping.d[idx][1];
+        }
+        return;
+    };
+    if shaping.w != field.w || shaping.h != field.h || shaping.d.len() != n {
+        // The two fields are built from the same bounds and cell; anything else is a bug,
+        // and dropping the shapes would be worse than running them uncoupled.
+        for idx in 0..n.min(shaping.d.len()) {
+            field.d[idx][0] += shaping.d[idx][0];
+            field.d[idx][1] += shaping.d[idx][1];
+        }
+        return;
+    }
+    let dist = silhouette_distance(fit, field);
+    for idx in 0..n {
+        let d = shaping.d[idx];
+        let m = f64::from(d[0]).hypot(f64::from(d[1]));
+        if !m.is_finite() || m <= 0.0 {
+            continue; // zero, or a NaN the frame's checks should have stopped
+        }
+        let l = (COUPLING_LENGTH * m).max(COUPLING_MIN);
+        let w = 1.0 - smoothstep(0.0, l, f64::from(dist[idx]));
+        if !w.is_finite() || w <= 0.0 {
+            continue;
+        }
+        field.d[idx][0] += (f64::from(d[0]) * w) as f32;
+        field.d[idx][1] += (f64::from(d[1]) * w) as f32;
+    }
 }
 
 /// A ramp's |Δ| in pixels — the fold budget's currency.
@@ -752,62 +875,98 @@ fn ramp_magnitude(s: &Shape, k: f64) -> f64 {
     }
 }
 
-/// A contract/radial's peak |Δ| in pixels, the same currency for the slimming family.
+/// A contract/profile/radial's peak |Δ| in pixels, the same currency for the shaping family
+/// (the lateral falloff's shoulder is where the profile's peak sits, at ~0.35 of its width).
 fn shape_magnitude(s: &Shape, k: f64) -> f64 {
     match *s {
         Shape::Contract { width, gain, .. } => gain.abs() * k.abs() * width * 0.35,
+        Shape::Profile { levels, gain, .. } => {
+            let half = levels.iter().map(|&(_, h)| h).fold(0.0, f64::max).max(4.0);
+            gain.abs() * k.abs() * PROFILE_REACH * half * 0.35
+        }
         Shape::Radial { radius, gain, .. } => gain.abs() * k.abs() * radius * 0.35,
         _ => 0.0,
     }
 }
 
-/// The per-node person weight from the fit's silhouette rows: 1 well inside, 0 beyond a
-/// feather outside the nearest run, with a smoothstep in between. Vertical distance counts
-/// beyond the silhouette's top and bottom; between rows the nearest row's runs stand in, and
-/// the feather hides the step.
-fn person_weight(fit: &BodyFit, field: &LiquifyField) -> Vec<f32> {
-    let mut out = vec![1.0f32; field.w * field.h];
+/// The per-node distance from the node to the fitted person silhouette (0 inside it), in
+/// document pixels. Between two sampled rows the two rows' horizontal distances are blended
+/// with a smoothstep, so the distance is smooth along y instead of jumping at the row spacing
+/// (the old nearest-row clip turned that jump into a visible ridge); the smoothstep's zero
+/// slope at each row also keeps its own y-slope bounded. Beyond the first and last rows the
+/// vertical distance counts. One 1-2-1 pass along y softens the remaining kink where a run
+/// starts or ends (the top of a hand beside the hip), which is the one place the two rows'
+/// distances can disagree sharply.
+fn silhouette_distance(fit: &BodyFit, field: &LiquifyField) -> Vec<f32> {
+    let n = field.w * field.h;
+    let mut out = vec![0.0f32; n];
     let (Some(first), Some(last)) = (fit.rows.first(), fit.rows.last()) else { return out };
-    let height = (last.y - first.y) as f64;
-    let feather = (0.02 * height).clamp(4.0, 24.0);
-    // Rows and field node rows are both ordered by y, so the nearest row is found by one
+    let (top, bottom) = (f64::from(first.y), f64::from(last.y));
+    // Rows and field node rows are both ordered by y, so the bracketing rows are found by one
     // forward cursor instead of a scan per node — a 24 MP field is a million nodes.
     let mut near = 0usize;
     for j in 0..field.h {
         let y = field.node_pos(0, j)[1];
-        while near + 1 < fit.rows.len() {
-            let here = (f64::from(fit.rows[near].y) - y).abs();
-            let next = (f64::from(fit.rows[near + 1].y) - y).abs();
-            if next < here {
-                near += 1;
-            } else {
-                break;
-            }
+        if !y.is_finite() {
+            continue;
         }
-        let row = &fit.rows[near];
-        let dy = if y < f64::from(first.y) {
-            f64::from(first.y) - y
-        } else if y > f64::from(last.y) {
-            y - f64::from(last.y)
+        while near + 1 < fit.rows.len() && f64::from(fit.rows[near + 1].y) <= y {
+            near += 1;
+        }
+        let (r0, r1, t) = if y < top {
+            (&fit.rows[0], &fit.rows[0], 0.0)
+        } else if y >= bottom {
+            let last = &fit.rows[fit.rows.len() - 1];
+            (last, last, 0.0)
+        } else {
+            let y0 = f64::from(fit.rows[near].y);
+            let y1 = f64::from(fit.rows[near + 1].y);
+            let t = if y1 > y0 { ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) } else { 0.0 };
+            (&fit.rows[near], &fit.rows[near + 1], t)
+        };
+        let dy = if y < top {
+            top - y
+        } else if y > bottom {
+            y - bottom
         } else {
             0.0
         };
+        let blend = smoothstep(0.0, 1.0, t);
         for i in 0..field.w {
             let x = field.node_pos(i, j)[0];
-            let mut dx = f64::INFINITY;
-            for run in &row.runs {
-                let (x0, x1) = (f64::from(run[0]), f64::from(run[1]));
-                if x >= x0 && x <= x1 {
-                    dx = 0.0;
-                    break;
-                }
-                dx = dx.min((x - x0).abs().min((x - x1).abs()));
+            if !x.is_finite() {
+                out[j * field.w + i] = f32::INFINITY;
+                continue;
             }
-            let dist = dx.hypot(dy);
-            out[j * field.w + i] = (1.0 - smoothstep(0.0, feather, dist)) as f32;
+            let dx0 = runs_distance(r0, x);
+            let dx1 = runs_distance(r1, x);
+            let dx = dx0 + (dx1 - dx0) * blend;
+            out[j * field.w + i] = dx.hypot(dy) as f32;
         }
     }
-    out
+    let mut softened = out.clone();
+    for j in 0..field.h {
+        let up = j.saturating_sub(1) * field.w;
+        let down = (j + 1).min(field.h - 1) * field.w;
+        let here = j * field.w;
+        for i in 0..field.w {
+            softened[here + i] = (out[up + i] + 2.0 * out[here + i] + out[down + i]) * 0.25;
+        }
+    }
+    softened
+}
+
+/// The horizontal distance from `x` to the nearest of a row's runs, 0 inside one.
+fn runs_distance(row: &BodyRow, x: f64) -> f64 {
+    let mut best = f64::INFINITY;
+    for run in &row.runs {
+        let (x0, x1) = (f64::from(run[0]), f64::from(run[1]));
+        if x >= x0 && x <= x1 {
+            return 0.0;
+        }
+        best = best.min((x - x0).abs().min((x - x1).abs()));
+    }
+    best
 }
 
 /// A per-node weight a part's displacement is multiplied by, as `(i, j) -> 0..=1`: the face
@@ -829,6 +988,7 @@ pub(crate) fn write_shape(field: &mut LiquifyField, shape: &Shape, k: f64, weigh
     let mut write = Write { field, weight };
     match *shape {
         Shape::Contract { a, b, band, width, gain } => write_contract(&mut write, a, b, band, width, gain, k),
+        Shape::Profile { a, b, levels, kernel, gain } => write_profile(&mut write, a, b, levels, &kernel, gain, k),
         Shape::Radial { c, radius, gain } => write_radial(&mut write, c, radius, gain, k),
         Shape::Ramp { a, b, band, width, gain } => write_ramp(&mut write, a, b, band, width, gain, k),
         Shape::Shift { a, b, dir, band, width, gain } => write_shift(&mut write, a, b, dir, band, width, gain * k),
@@ -897,6 +1057,70 @@ fn write_contract(write: &mut Write<'_, '_>, a: [f64; 2], b: [f64; 2], band: (f6
             field.d[idx][1] += (d[1] / rho * mag) as f32;
         }
     }
+}
+
+/// A contraction whose envelope and longitudinal strength follow the torso's own measured
+/// width profile ([`Shape::Profile`]): at every `t` the lateral width is [`PROFILE_REACH`]
+/// times the interpolated measured half-width — so the pull lands on the visible contour at
+/// that level — while `kernel` sets how much of the row's pull reaches there. The width is
+/// blended between level knots with a smoothstep, so the envelope has no kink at a level and
+/// the rows compose without the seam an isolated band left.
+fn write_profile(write: &mut Write<'_, '_>, a: [f64; 2], b: [f64; 2], levels: [(f64, f64); 4], kernel: &Kernel, gain: f64, k: f64) {
+    let weight = write.weight;
+    let field = &mut *write.field;
+    let ab = sub(b, a);
+    let len = norm(ab);
+    let u = scale(ab, 1.0 / len);
+    let max_half = levels.iter().map(|&(_, h)| h).fold(0.0, f64::max).max(4.0);
+    let reach = PROFILE_REACH * max_half;
+    let (min_x, max_x) = (a[0].min(b[0]) - reach, a[0].max(b[0]) + reach);
+    let (min_y, max_y) = (a[1].min(b[1]) - reach, a[1].max(b[1]) + reach);
+    let Some((i0, j0, i1, j1)) = span(field, min_x, min_y, max_x, max_y) else { return };
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let w = weight_at(weight, i, j);
+            if w <= 0.0 {
+                continue;
+            }
+            let p = field.node_pos(i, j);
+            let t = dot(sub(p, a), u) / len;
+            let long = kernel.at(t);
+            if long <= 0.0 {
+                continue;
+            }
+            let width = PROFILE_REACH * profile_half(&levels, t).max(4.0);
+            let q = add(a, scale(u, t.clamp(0.0, 1.0) * len));
+            let d = sub(p, q);
+            let rho = norm(d);
+            if rho >= width || rho < 1e-9 {
+                continue;
+            }
+            let lat = falloff((rho / width) * (rho / width), DENSITY);
+            let mag = gain * k * width * lat * (rho / width) * long * w;
+            let idx = j * field.w + i;
+            field.d[idx][0] += (d[0] / rho * mag) as f32;
+            field.d[idx][1] += (d[1] / rho * mag) as f32;
+        }
+    }
+}
+
+/// The measured half-width at `t`, blended between the neighbouring knots with a smoothstep
+/// (zero slope at each knot) and clamped to the end knots outside them. `levels` is sorted
+/// by `t`.
+fn profile_half(levels: &[(f64, f64); 4], t: f64) -> f64 {
+    let (t0, h0) = levels[0];
+    if !t.is_finite() || t <= t0 {
+        return h0;
+    }
+    for pair in levels.windows(2) {
+        let (a, ha) = pair[0];
+        let (b, hb) = pair[1];
+        if t <= b {
+            let s = if b > a { smoothstep(0.0, 1.0, (t - a) / (b - a)) } else { 1.0 };
+            return ha + (hb - ha) * s;
+        }
+    }
+    levels[3].1
 }
 
 /// The contraction about one centre (the head, the bust, the hips): the same profile with
@@ -1244,17 +1468,41 @@ mod tests {
     }
 
     #[test]
-    fn the_fitted_waist_pulls_the_measured_contour_in_and_the_background_stays() {
+    fn the_fitted_waist_pulls_in_with_the_near_background_and_the_far_background_stays() {
         let (field, report) = sculpt_field(&fitted_spec(SculptSliders { waist: 100.0, ..SculptSliders::default() }), bounds(), CELL);
         assert!(report.applied.contains(&"waist"), "{report:?}");
-        // The measured waist contour at 76 px from the axis: the fitted envelope reaches
-        // past it, so the rim moves (the old joint-spacing width stopped short of it).
+        // The measured waist contour: the fitted envelope reaches past it, so the rim moves
+        // (the old joint-spacing width stopped short of it).
         let rim = field.sample(326.0, 295.0);
         assert!(rim[0] > 1.0, "the fitted waist must pull its own contour in: {rim:?}");
-        // Outside the silhouette but inside the envelope, the feathered person clip keeps
-        // the background still; without it this point moves with the contract.
-        let background = field.sample(150.0, 295.0);
-        assert!(background[0].abs() < 0.05 && background[1].abs() < 0.05, "the background stays: {background:?}");
+        // The background beside the contour is coupled to the person: it rides the pull at
+        // nearly the rim's strength. The old fixed feather moved it at a fraction of the
+        // rim's strength and froze everything past the feather, which read as a ridge along
+        // the silhouette.
+        let near = field.sample(180.0, 295.0);
+        assert!(near[0].abs() > 0.7 * rim[0].abs(), "the near background must move with the contour (near {near:?}, rim {rim:?})");
+        assert!(near[0] < 0.0, "the near background outside the left rim moves outward (with the pull): {near:?}");
+        // The far background does not move: the coupling decays over the local displacement.
+        let far = field.sample(150.0, 295.0);
+        assert!(far[0].abs() < 0.5 && far[1].abs() < 0.5, "the far background stays: {far:?}");
+    }
+
+    /// Fattening moves the silhouette *out*: a pixel just outside the measured hip contour
+    /// samples inward far enough to show the body, and the background beside it is pushed
+    /// along. The old near-binary clip froze everything past its short feather, so a fuller
+    /// hip could only widen the body inside its own outline.
+    #[test]
+    fn the_fitted_hip_expansion_pushes_the_near_background_out() {
+        let (field, _) = sculpt_field(&fitted_spec(SculptSliders { hips: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        // The measured hip row's right run ends at x≈334; 4 px outside, the inverse map must
+        // sample at least that far inward (toward the joint at x=292), which reads as the
+        // contour expanding out to this pixel.
+        let just_outside = field.sample(338.0, 400.0);
+        assert!(just_outside[0] < -4.2, "the hip must expand past its measured contour: {just_outside:?}");
+        let beside = field.sample(344.0, 400.0);
+        assert!(beside[0] < 0.0, "the near background is pushed outward with the hip: {beside:?}");
+        let far = field.sample(380.0, 400.0);
+        assert!(far[0].abs() < 0.5 && far[1].abs() < 0.5, "the far background stays: {far:?}");
     }
 
     #[test]
@@ -1263,7 +1511,12 @@ mod tests {
         let waist = sculpt_field(&fitted_spec(SculptSliders { waist: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
         let at_belly = belly.sample(300.0, 334.0);
         assert!(at_belly[0] > 1.0, "the belly must pull its measured row in: {at_belly:?}");
-        assert!(waist.sample(300.0, 334.0)[0].abs() < 0.5, "the waist band must not reach the belly row");
+        // Each row's own measured row is its strongest; the other row's pull there is the
+        // continuous taper, not full strength.
+        assert!(at_belly[0] > 2.0 * waist.sample(300.0, 334.0)[0].abs(), "the belly row belongs to the belly");
+        let at_waist = waist.sample(300.0, 296.0);
+        assert!(at_waist[0] > 1.0, "the waist must pull its measured row in: {at_waist:?}");
+        assert!(at_waist[0] > 2.0 * belly.sample(300.0, 296.0)[0].abs(), "the waist row belongs to the waist");
         // The hips expand on the joint line, not on a skirt's widest hem row.
         let hips = sculpt_field(&fitted_spec(SculptSliders { hips: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
         let hip = hips.sample(330.0, 400.0);
@@ -1271,6 +1524,36 @@ mod tests {
         let bust = sculpt_field(&fitted_spec(SculptSliders { bust: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
         let chest = bust.sample(320.0, 246.0);
         assert!(chest[0] < -1.0, "the bust must push the chest out: {chest:?}");
+    }
+
+    /// The waist and belly rows taper across the whole torso: a tenth of the torso above and
+    /// below the waist row the slider still pulls at a good fraction of its peak. The old
+    /// ±8.5% band stopped at zero just outside the level, which read as a dent that the ribs
+    /// and hips did not follow.
+    #[test]
+    fn the_waist_taper_reaches_above_and_below_its_row() {
+        let (field, _) = sculpt_field(&fitted_spec(SculptSliders { waist: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        let at = |y: f64| field.sample(300.0, y)[0];
+        let peak = at(296.0);
+        assert!(peak > 1.0, "the waist row pulls: {peak:.2}");
+        let above = at(270.0); // t ≈ 0.41, toward the ribs
+        let below = at(320.0); // t ≈ 0.64, toward the belly
+        assert!(above > 0.4 * peak, "the pull must carry up toward the ribs (above {above:.2}, peak {peak:.2})");
+        assert!(below > 0.4 * peak, "the pull must carry down toward the hips (below {below:.2}, peak {peak:.2})");
+    }
+
+    /// The knee is one continuous surface: a point on the outer knee must move under the
+    /// thigh slider and under the calf slider. Each limb band used to ramp to zero exactly at
+    /// its joint, leaving a dead ring at the knee and elbow that read as a pinch.
+    #[test]
+    fn the_knee_moves_under_the_thigh_and_the_calf() {
+        let thigh = sculpt_field(&fitted_spec(SculptSliders { thighs: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let calf = sculpt_field(&fitted_spec(SculptSliders { calves: 100.0, ..SculptSliders::default() }), bounds(), CELL).0;
+        let knee = 200.0; // the outer knee contour: 26 px out from the joint at x=226
+        let by_thigh = thigh.sample(knee, 540.0)[0].abs();
+        let by_calf = calf.sample(knee, 540.0)[0].abs();
+        assert!(by_thigh > 0.5, "the knee must move under the thigh: {by_thigh:.2}px");
+        assert!(by_calf > 0.5, "the knee must move under the calf: {by_calf:.2}px");
     }
 
     #[test]
