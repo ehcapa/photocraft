@@ -735,7 +735,10 @@ fn parts_notice(reply: &Value) -> Option<String> {
     if any("skipped") {
         Some(tl!("Some regions were left out: the pose did not find their landmarks in the person silhouette").into())
     } else if any("approximate") {
-        Some(tl!("Some regions used inferred landmark positions").into())
+        // Inferred landmarks, a pose too asymmetric to align, a contour the mask fuses with
+        // the background: the reasons differ, and the panel names the common truth rather
+        // than claiming one of them for all.
+        Some(tl!("Some regions were handled approximately: the photo does not show them clearly enough to follow exactly").into())
     } else {
         None
     }

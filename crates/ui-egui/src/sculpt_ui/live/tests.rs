@@ -161,14 +161,14 @@ fn the_length_sliders_warn_when_the_pose_did_not_see_the_feet() {
     assert!(guessed.warning_text().is_some_and(|t| t.contains("feet")), "a guessed foot is said before Apply");
 }
 
-/// An Apply whose reply leaves a region out, or places one by inference, says so inline. A
+/// An Apply whose reply leaves a region out, or handles one approximately, says so inline. A
 /// clean reply leaves the status line alone.
 #[test]
-fn an_apply_reports_regions_it_left_out_or_inferred() {
+fn an_apply_reports_regions_it_left_out_or_approximated() {
     let skipped = json!({"parts": {"applied": ["waist"], "approximate": [], "skipped": [{"part": "right upper arm", "why": "outside"}]}});
     assert!(super::parts_notice(&skipped).is_some_and(|n| n.contains("left out")), "a skipped part is said");
     let approximate = json!({"parts": {"applied": ["thigh"], "approximate": [{"part": "left thigh", "why": "inferred"}], "skipped": []}});
-    assert!(super::parts_notice(&approximate).is_some_and(|n| n.contains("inferred")), "an inferred part is said");
+    assert!(super::parts_notice(&approximate).is_some_and(|n| n.contains("approximately")), "an approximate part is said");
     let clean = json!({"parts": {"applied": ["waist"], "approximate": [], "skipped": []}});
     assert!(super::parts_notice(&clean).is_none(), "a clean Apply adds no notice");
     assert!(super::parts_notice(&json!({"changed": true})).is_none(), "a reply without parts adds none");
