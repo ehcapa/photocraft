@@ -8,7 +8,7 @@
 //! body table defined.
 
 use photocraft_algo::contour;
-use photocraft_algo::face_sculpt::{FaceAnchors, FacePreset, FaceReport, FaceSides, FaceSliders, FaceSpec, SYMMETRY_PAIRS, face_field};
+use photocraft_algo::face_sculpt::{FaceAnchors, FacePreset, FaceReport, FaceSides, FaceSliders, FaceSpec, SYMMETRY_LIMIT, SYMMETRY_PAIRS, face_field};
 use photocraft_algo::liquify::{LiquifyField, apply_liquify, auto_cell};
 use photocraft_doc::LayerContent;
 use photocraft_geom::Rect;
@@ -212,10 +212,13 @@ fn oval_ring(anchors: &FaceAnchors) -> Vec<[f64; 2]> {
     photocraft_portrait::face::FACE_OVAL.iter().map(|&i| [anchors.pts[i][0] as f64, anchors.pts[i][1] as f64]).collect()
 }
 
-fn stamp_ring(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64; 2]], smooth: f32) {
+/// The face oval's own relaxation, stamped as relief: the low-pass's whole-ring shrink is
+/// removed first, so the slider relaxes the outline's bumps instead of deflating the face.
+/// Returns how many corrections were left out as cuts rather than bumps.
+fn stamp_ring(field: &mut photocraft_algo::liquify::LiquifyField, pts: &[[f64; 2]], smooth: f32) -> usize {
     let len: f64 = pts.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum::<f64>()
         + (pts[0][0] - pts[pts.len() - 1][0]).hypot(pts[0][1] - pts[pts.len() - 1][1]);
-    contour::stamp(field, pts, len / pts.len() as f64, f64::from(smooth));
+    contour::stamp_relief(field, pts, len / pts.len() as f64, f64::from(smooth))
 }
 
 /// 3D塑颜's three angles in degrees: the slider's ±100 maps to ±8° (yaw, pitch) or ±6°
@@ -246,21 +249,36 @@ fn field_with(
         report.applied.push("pose");
     }
     // 对称液化: the paired features align toward each other's mirror about the face's
-    // axis — pure geometry of the stored mesh, so the re-render replays it for free.
+    // axis — pure geometry of the stored mesh, so the re-render replays it for free. Only a
+    // local touch of asymmetry is aligned: a pair whose reflected position is far from its
+    // counterpart is a turned or tilted head, not an asymmetry, and dragging a disc of the
+    // photo there was what turned this slider into circular smears.
     if symmetry > 0.0 {
         let pts: Vec<[f64; 2]> = spec.anchors.pts.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
         let axis = [(pts[454][0] + pts[234][0]) * 0.5, (pts[10][1] + pts[152][1]) * 0.5];
         let up = [pts[10][0] - pts[152][0], pts[10][1] - pts[152][1]];
         let eye_w = (pts[263][0] - pts[362][0]).abs().max(8.0);
-        contour::align_pairs(&mut field, &pts, SYMMETRY_PAIRS, axis, up, f64::from(symmetry), eye_w * 2.0);
-        report.applied.push("symmetry");
+        let face_w = (pts[454][0] - pts[234][0]).abs().max(8.0);
+        let pairs = contour::symmetric_pairs(&pts, SYMMETRY_PAIRS, axis, up, face_w * SYMMETRY_LIMIT);
+        if pairs.is_empty() {
+            report.skipped.push(("symmetry", "the face's paired features differ too much to mirror — a turned or tilted head"));
+        } else {
+            contour::align_pairs(&mut field, &pts, &pairs, axis, up, f64::from(symmetry), eye_w * 2.0);
+            if pairs.len() < SYMMETRY_PAIRS.len() {
+                report.approximate.push(("symmetry", "pairs the mesh places far from their mirror are left alone"));
+            }
+            report.applied.push("symmetry");
+        }
     }
     // AI 面部流畅: the face oval's own contour, low-passed and stamped over the parts. The
     // ring comes from the anchors, so the re-render replays it with no analysis.
     if smooth > 0.0 {
         let ring = oval_ring(&spec.anchors);
         let pts = contour.unwrap_or(&ring);
-        stamp_ring(&mut field, pts, smooth);
+        let dropped = stamp_ring(&mut field, pts, smooth);
+        if dropped > 0 {
+            report.approximate.push(("smooth", "parts of the face outline meet the hair or the neck in a cut; only its own bumps are relaxed there"));
+        }
         report.applied.push("smooth");
     }
     (field, report)
@@ -350,6 +368,7 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
 fn parts(report: &photocraft_algo::face_sculpt::FaceReport) -> Value {
     json!({
         "applied": report.applied,
+        "approximate": report.approximate.iter().map(|(name, why)| json!({"part": name, "why": why})).collect::<Vec<_>>(),
         "skipped": report.skipped.iter().map(|(name, why)| json!({"part": name, "why": why})).collect::<Vec<_>>(),
     })
 }

@@ -288,6 +288,7 @@ impl FaceAnchors {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FaceReport {
     pub applied: Vec<&'static str>,
+    pub approximate: Vec<(&'static str, &'static str)>,
     pub skipped: Vec<(&'static str, &'static str)>,
 }
 
@@ -350,6 +351,14 @@ mod mesh {
 /// the fold limit of 1. The old fixed 40 px clip had half the support the rows' displacement
 /// needed and rippled the hair at the jaw.
 const FACE_COUPLING: f64 = 2.0;
+
+/// The largest mirror correction a face symmetry pass may act on, as a fraction of the face's
+/// width. A pair further from its mirror than this is not an asymmetry to smooth but a
+/// different geometry — on a turned or tilted head the reflected feature is nowhere near its
+/// counterpart (the real portrait that prompted this measured corrections up to 44% of the
+/// face's width) — and aligning it drags a disc of the photo across the face. A genuine
+/// asymmetry is a few per cent of the face.
+pub const SYMMETRY_LIMIT: f64 = 0.05;
 
 /// The symmetry pairs (left index, right index) 对称液化 aligns: the eye corners and
 /// rims, the brows, the mouth corners, the nose wings, the cheekbones, the temples, the
@@ -442,6 +451,13 @@ impl FaceFrame {
     fn along_down(&self, from: usize, t: f64) -> [f64; 2] {
         let d = down(self.pt(from), self.pt(mesh::CHIN));
         [self.pt(from)[0] + d[0] * t, self.pt(from)[1] + d[1] * t]
+    }
+
+    /// `t` of the way from `a` to `b`; past `b` when `t` > 1. Bands that must hold a
+    /// landmark in their plateau extend their axis beyond it.
+    fn toward(&self, a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
+        let d = down(a, b);
+        [a[0] + d[0] * t, a[1] + d[1] * t]
     }
 
     /// The unit vector pointing to the person's left (image right).
@@ -687,6 +703,16 @@ fn whole_face(name: &str) -> bool {
     name.starts_with("face slim") || matches!(name, "face size" | "v face" | "face width")
 }
 
+/// Whether a row carries the head beside the face instead of being clipped to the FACE_OVAL
+/// hull: the whole-face family above, and the two hairline rows. Their subject is the
+/// boundary between forehead skin and hair, and a local clip would hold the hair still while
+/// the skin moved under it — pinning the line in place. The hairline rows are shaped in the
+/// same whole field and merged through the head-level weight, whose decay over the family's
+/// displacement stretches the hair beside the line rather than rippling it.
+fn head_coupled(name: &str) -> bool {
+    whole_face(name) || matches!(name, "hairline" | "forehead height")
+}
+
 /// Whether a part must leave the eye or lip interior alone, as `(eyes, lips)`.
 ///
 /// The whole-face rows — the uniform scale, the width and the full-face slims — carry the
@@ -734,6 +760,10 @@ const FACE_PARTS: &[FacePart] = &[
         slider: |s| s.face_slim,
         shape: |f| f.contract_v(f.along_up(mesh::CHIN, 0.55), f.pt(mesh::CHIN), (0.10, 0.95), f.face_w * 0.72, 0.20),
     },
+    // A slim pulls the sides in; if the chin stayed at its old height the lower face would
+    // read as stretched around a pinned point. A small lift of the chin's own band keeps
+    // the jaw closing on a chin that rises with it.
+    FacePart { name: "face slim chin", slider: |s| s.face_slim, shape: |f| f.chin_band(0.025) },
     FacePart {
         name: "left temple",
         slider: |s| s.sides.temples[SIDE_L].unwrap_or(s.temples),
@@ -755,12 +785,20 @@ const FACE_PARTS: &[FacePart] = &[
         shape: |f| f.radial(f.pt(mesh::CHEEKBONE_R), f.face_w * 0.13, 0.08),
     },
     FacePart { name: "jaw", slider: |s| s.jaw, shape: |f| f.contract_v(f.along_up(mesh::CHIN, 0.55), f.pt(mesh::CHIN), (0.0, 1.0), f.face_w * 0.50, 0.34) },
-    FacePart { name: "face size", slider: |s| s.face_size, shape: |f| f.radial(f.face_c, f.face_h * 0.62, 0.26) },
+    // Face size is a scale, so the displacement must grow with the distance from the centre:
+    // the chin, furthest out, has to move most. The radial's own falloff peaks well inside
+    // a face-sized radius and had the chin travelling half as far as the eyes — a scale
+    // pinned at the chin, which reads as a stretched lower face. A radius well past the face
+    // keeps the profile near-linear across it.
+    FacePart { name: "face size", slider: |s| s.face_size, shape: |f| f.radial(f.face_c, f.face_h * 1.5, 0.13) },
     FacePart {
         name: "v face",
         slider: |s| s.v_face,
         shape: |f| f.contract_v(f.along_up(mesh::CHIN, 0.40), f.pt(mesh::CHIN), (0.0, 1.0), f.face_w * 0.55, 0.27),
     },
+    // The V's point needs the same lift as the slim's: a jaw tapering to a pinned chin is a
+    // spike, not a V.
+    FacePart { name: "v face chin", slider: |s| s.v_face, shape: |f| f.chin_band(0.040) },
     // Width-family convention (PixCake's own right side): positive widens, so the gain
     // expands.
     FacePart {
@@ -768,20 +806,37 @@ const FACE_PARTS: &[FacePart] = &[
         slider: |s| s.face_width,
         shape: |f| f.contract_v(f.pt(mesh::FOREHEAD_TOP), f.pt(mesh::CHIN), (0.05, 0.95), f.face_w * 0.70, -0.24),
     },
+    // The band is centred on the hairline itself: its axis starts above the line, in the
+    // hair, and ends short of the brows, so the landmark sits in the plateau. The old band
+    // started at the landmark and ran down past the brows, which by the time it reached the
+    // middle of its window was moving the eyebrows and leaving the hairline where it was.
     FacePart {
         name: "hairline",
         slider: |s| s.hairline,
-        shape: |f| f.shift_band(f.pt(mesh::FOREHEAD_TOP), f.along_down(mesh::FOREHEAD_TOP, 0.45), v(f.up(), 1.0), (0.1, 0.9), f.face_w * 0.55, 0.075),
+        shape: |f| {
+            f.shift_band(f.along_down(mesh::FOREHEAD_TOP, -0.25), f.along_down(mesh::FOREHEAD_TOP, 0.16), v(f.up(), 1.0), (0.0, 1.0), f.face_w * 0.55, 0.09)
+        },
     },
     FacePart {
         name: "forehead width",
         slider: |s| s.forehead_width,
         shape: |f| Some(Shape::Contract { a: f.pt(mesh::TEMPLE_L), b: f.pt(mesh::TEMPLE_R), band: (0.0, 1.0), width: f.face_h * 0.25, gain: -0.38 }),
     },
+    // A stretch from the brow line up: the hairline (and the crown above it) rides up by the
+    // slider's own length while the brows stay, so the forehead itself gets taller — the old
+    // band's plateau sat between the brows and the hairline and moved the brows instead.
     FacePart {
         name: "forehead height",
         slider: |s| s.forehead_height,
-        shape: |f| f.shift_band(f.pt(mesh::BROW_INNER_L), f.along_up(mesh::FOREHEAD_TOP, 0.5), v(f.up(), -1.0), (0.1, 0.9), f.face_w * 0.55, 0.08),
+        shape: |f| {
+            Some(Shape::Ramp {
+                a: f.mid(mesh::BROW_MID_L, mesh::BROW_MID_R),
+                b: f.pt(mesh::FOREHEAD_TOP),
+                band: (0.0, 1.0),
+                width: f.face_w * 0.80,
+                gain: 0.17,
+            })
+        },
     },
     FacePart {
         name: "philtrum",
@@ -808,11 +863,11 @@ const FACE_PARTS: &[FacePart] = &[
         slider: |s| s.chin_point,
         shape: |f| f.contract_v(f.pt(mesh::LOWER_LIP_LOW), f.pt(mesh::CHIN), (0.0, 1.0), f.face_w * 0.28, 0.50),
     },
-    FacePart {
-        name: "chin retract",
-        slider: |s| s.chin_retract,
-        shape: |f| f.shift_band(f.pt(mesh::MOUTH_CORNER_L), f.pt(mesh::CHIN), v(f.up(), 1.0), (0.3, 1.0), f.face_w * 0.45, 0.10),
-    },
+    // The band runs from the mouth's centre down past the chin, along the face's midline, so
+    // both sides of the chin move together and the chin point sits in the plateau. The old
+    // band started at the left mouth corner and ended on the chin, where its taper is zero:
+    // it pulled one side of the jaw and left the chin, and the mirror side, untouched.
+    FacePart { name: "chin retract", slider: |s| s.chin_retract, shape: |f| f.chin_band(0.10) },
     // ---------- the eyes (per-side rows share their slider) ----------
     FacePart {
         name: "left eye size",
@@ -1052,6 +1107,16 @@ impl FaceFrame {
     fn shift_band(&self, a: [f64; 2], b: [f64; 2], dir: [f64; 2], band: (f64, f64), width: f64, gain: f64) -> Option<Shape> {
         (len_of(down(b, a)) >= 2.0 && len_of(dir) > 1e-9 && width >= 4.0 && band.1 > band.0).then_some(Shape::Shift { a, b, dir, band, width, gain })
     }
+
+    /// The chin's own band, shared by the retract slider and the slimming lifts: the axis
+    /// runs from the mouth's centre down past the chin along the face's midline, so both
+    /// sides of the chin move together and the chin point sits in the plateau. `gain` of the
+    /// axis length is the lift at the slider's full value.
+    fn chin_band(&self, gain: f64) -> Option<Shape> {
+        let m = self.mid(mesh::MOUTH_CORNER_L, mesh::MOUTH_CORNER_R);
+        let b = self.toward(m, self.pt(mesh::CHIN), 1.35);
+        self.shift_band(m, b, v(self.up(), 1.0), (0.15, 0.95), self.face_w * 0.45, gain)
+    }
 }
 
 /// The face field of `spec` over `bounds`. Pure and deterministic like the body's; the
@@ -1103,25 +1168,25 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
         Shape::Contract { .. } | Shape::Profile { .. } | Shape::Radial { .. } => k * c_scale,
         Shape::Ramp { .. } | Shape::Shift { .. } => k * r_scale,
     };
-    // The whole-face rows are shaped as one family in their own field: their participation
+    // The head-coupled rows are shaped as one family in their own field: their participation
     // weight decays over a length set by the family's largest displacement, and the mask's
     // window must reach as far as that weight does. The mask is built after them, then every
-    // local row is written through its tight clip as before, and the whole family is merged
-    // last with the head-level weight.
+    // local row is written through its tight clip as before, and the family is merged last
+    // with the head-level weight.
     let mut whole = LiquifyField::new(bounds, cell);
     for (part, k, shape) in &asked {
-        if whole_face(part.name) {
+        if head_coupled(part.name) {
             write_shape(&mut whole, shape, scale_of(shape, *k), None);
         }
     }
     let whole_max = whole.d.iter().fold(0.0f64, |acc, d| acc.max(f64::from(d[0].hypot(d[1]))));
     // The face's own bounds: the local rows are clipped to the FACE_OVAL hull and cannot
     // move the eyes or the mouth (the field used to run to the canvas edge, dragging hair
-    // and background with the cheek); the whole-face rows carry the near head instead.
+    // and background with the cheek); the head-coupled rows carry the near head instead.
     let mask = FaceMask::new(&frame, &field, FACE_COUPLING * whole_max);
     for (part, k, shape) in asked {
         report.applied.push(part.name);
-        if whole_face(part.name) {
+        if head_coupled(part.name) {
             continue; // merged below as one family
         }
         let k = scale_of(&shape, k);
@@ -1494,6 +1559,80 @@ mod tests {
             assert!(mag > 0.5, "{name}: the eye rides the whole-face row: {eye:?}");
             assert!(eye[0] * rim[0] + eye[1] * rim[1] > 0.0, "{name}: the eye moves with the face's edge (eye {eye:?}, rim {rim:?})");
         }
+    }
+
+    /// Face size is a scale: the chin stands furthest from the centre, so it must travel
+    /// furthest. The old radius put the radial's falloff peak inside the face and the chin
+    /// moved half as far as the eyes — a scale that read as pinned at the chin.
+    #[test]
+    fn face_size_moves_the_chin_more_than_the_eyes() {
+        let (field, _) = build(FaceSliders { face_size: 100.0, ..Default::default() });
+        let mag = |x: f64, y: f64| {
+            let d = field.sample(x, y);
+            d[0].hypot(d[1])
+        };
+        let chin = mag(256.0, 392.0);
+        let eye = mag(306.0, 232.0);
+        assert!(chin > 2.0, "the chin moves: {chin}");
+        assert!(chin > eye * 1.4, "the chin travels with the scale, further than the eyes (chin {chin:.2}, eye {eye:.2})");
+    }
+
+    /// A slim or a V pulls the sides in; the chin rides a little with them so the lower
+    /// face closes on a moving point instead of stretching around a pinned one.
+    #[test]
+    fn a_slim_and_a_v_face_lift_the_chin() {
+        let at = |sliders: FaceSliders| {
+            let (field, _) = build(sliders);
+            let d = field.sample(256.0, 392.0);
+            d[0].hypot(d[1])
+        };
+        let slim = at(FaceSliders { face_slim: 100.0, ..Default::default() });
+        let v = at(FaceSliders { v_face: 100.0, ..Default::default() });
+        assert!(slim > 1.0, "the slim lifts the chin: {slim}");
+        assert!(v > slim, "the V lifts it further than the slim: {v} vs {slim}");
+    }
+
+    /// Retract Chin is symmetric: both sides of the jaw and the chin point move together.
+    /// The old band started at the left mouth corner and ended on the chin, where its taper
+    /// is zero — one side pulled, the chin and its mirror side stayed.
+    #[test]
+    fn chin_retract_moves_both_sides_and_the_chin_point() {
+        let (field, _) = build(FaceSliders { chin_retract: 100.0, ..Default::default() });
+        let chin = field.sample(256.0, 392.0);
+        assert!(chin[1] > 1.0, "the chin point lifts: {chin:?}");
+        let left = field.sample(236.0, 380.0);
+        let right = field.sample(276.0, 380.0);
+        assert!(left[1] > 1.0 && right[1] > 1.0, "both sides of the jaw lift (left {left:?}, right {right:?})");
+        assert!((left[1] - right[1]).abs() < 0.2, "the two sides lift equally (left {left:?}, right {right:?})");
+    }
+
+    /// The hairline slider raises the hairline itself and leaves the brows where they are;
+    /// the old band's plateau sat on the brows and moved them while the hairline stayed.
+    #[test]
+    fn the_hairline_moves_the_hairline_not_the_brows() {
+        let (field, _) = build(FaceSliders { hairline: 100.0, ..Default::default() });
+        let hairline = field.sample(256.0, 96.0);
+        let brow = field.sample(256.0, 186.0);
+        let brow_mag = brow[0].hypot(brow[1]);
+        assert!(hairline[1] > 2.0, "the hairline rises (the inverse map points down): {hairline:?}");
+        assert!(brow_mag < 0.5, "the brows stay: {brow:?}");
+    }
+
+    /// Forehead Height is a stretch from the brow line up: the hairline and the crown above
+    /// it rise, the forehead skin between them stretches, and the brows stay.
+    #[test]
+    fn forehead_height_raises_the_hairline_not_the_brows() {
+        let (field, _) = build(FaceSliders { forehead_height: 100.0, ..Default::default() });
+        let hairline = field.sample(256.0, 96.0);
+        let brow = field.sample(256.0, 196.0);
+        let brow_mag = brow[0].hypot(brow[1]);
+        assert!(hairline[1] > 2.0, "the hairline rises: {hairline:?}");
+        assert!(brow_mag < 0.5, "the brows stay: {brow:?}");
+        // The ramp carries the hair just above the hairline, so the line itself is what
+        // moves rather than the skin sliding under a pinned boundary. The carry decays
+        // past twice the family's displacement; the sample sits inside that.
+        let hair = field.sample(256.0, 76.0);
+        assert!(hair[1] > 1.0, "the hair beside the line rides the stretch: {hair:?}");
     }
 
     /// The protection is per feature, not a blanket freeze: the mouth rows still move the

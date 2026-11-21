@@ -733,7 +733,10 @@ pub(crate) fn apply(app: &mut PhotocraftApp, panel: &Panel) {
 fn parts_notice(reply: &Value) -> Option<String> {
     let any = |key: &str| reply.get("parts").and_then(|p| p.get(key)).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
     if any("skipped") {
-        Some(tl!("Some regions were left out: the pose did not find their landmarks in the person silhouette").into())
+        // The reasons differ by row (a pose that did not see a joint, a face too turned to
+        // mirror): the panel names the common truth, and the reply's `parts` carries each
+        // reason for the CLI and automation.
+        Some(tl!("Some regions were left out: this photo does not show them clearly enough to follow exactly").into())
     } else if any("approximate") {
         // Inferred landmarks, a pose too asymmetric to align, a contour the mask fuses with
         // the background: the reasons differ, and the panel names the common truth rather

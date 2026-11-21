@@ -89,6 +89,22 @@ pub fn low_pass(pts: &mut [[f64; 2]], closed: bool, strength: f64) {
 /// caller reports the pass approximate when any were, instead of showing a large warp as a
 /// faithful smoother.
 pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength: f64) -> usize {
+    stamp_contour(field, pts, spacing, strength, false)
+}
+
+/// [`stamp`], with the whole contour's own shift and uniform shrink removed first — the
+/// face outline's case. A closed convex ring low-passed toward its neighbours' chords
+/// shrinks every point toward the interior: twenty passes on a face oval moved its rim
+/// inward by sixty pixels on a real portrait, and stamped as-is the smooth slider read as
+/// a smaller face, dragging the eyes and brows along with the rim. Removing the similarity
+/// the low-pass applied to the ring (its mean shift and its scale about the centroid) leaves
+/// its local relief — the bumps the slider exists to relax — and nothing else. A contour
+/// that already is smooth therefore relaxes to nothing, as it should.
+pub fn stamp_relief(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength: f64) -> usize {
+    stamp_contour(field, pts, spacing, strength, true)
+}
+
+fn stamp_contour(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength: f64, relief: bool) -> usize {
     if pts.len() < 3 || !spacing.is_finite() || spacing <= 1e-9 {
         return 0;
     }
@@ -106,6 +122,9 @@ pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength:
             // No cut anywhere: the contour closes on itself and is smoothed as one ring.
             let mut smoothed = pts.to_vec();
             low_pass(&mut smoothed, true, strength);
+            if relief {
+                steady(pts, &mut smoothed);
+            }
             dropped = push_corrections(&mut items, pts, &smoothed, limit);
         }
         Some(start) => {
@@ -113,21 +132,52 @@ pub fn stamp(field: &mut LiquifyField, pts: &[[f64; 2]], spacing: f64, strength:
             for k in 0..n {
                 let i = (start + k) % n;
                 if on_border(field, pts[i]) {
-                    dropped += smooth_run(&mut items, &run, strength, limit);
+                    dropped += smooth_run(&mut items, &run, strength, limit, relief);
                     run.clear();
                     continue;
                 }
                 run.push(pts[i]);
                 if gap(i) {
-                    dropped += smooth_run(&mut items, &run, strength, limit);
+                    dropped += smooth_run(&mut items, &run, strength, limit, relief);
                     run.clear();
                 }
             }
-            dropped += smooth_run(&mut items, &run, strength, limit);
+            dropped += smooth_run(&mut items, &run, strength, limit, relief);
         }
     }
     stamp_corrections(field, &items, reach, 2);
     dropped
+}
+
+/// Removes from `smoothed` the translation and uniform scale that best map `origin` onto
+/// it, so a relaxation's whole-shape drift is not stamped as a correction. Points missing
+/// from either list, or a degenerate origin, leave `smoothed` as it is.
+fn steady(origin: &[[f64; 2]], smoothed: &mut [[f64; 2]]) {
+    let n = origin.len();
+    if n < 3 || smoothed.len() != n {
+        return;
+    }
+    let inv = 1.0 / n as f64;
+    let c = origin.iter().fold([0.0f64; 2], |a, p| [a[0] + p[0] * inv, a[1] + p[1] * inv]);
+    let (mut sxx, mut sxy, mut t) = (0.0f64, 0.0f64, [0.0f64; 2]);
+    for (p, q) in origin.iter().zip(smoothed.iter()) {
+        let x = [p[0] - c[0], p[1] - c[1]];
+        let y = [q[0] - c[0], q[1] - c[1]];
+        sxx += x[0] * x[0] + x[1] * x[1];
+        sxy += x[0] * y[0] + x[1] * y[1];
+        t[0] += y[0] * inv;
+        t[1] += y[1] * inv;
+    }
+    if sxx <= 1e-12 {
+        return;
+    }
+    let s = sxy / sxx;
+    let s = if s.is_finite() && s > 0.0 && s < 2.0 { s } else { 1.0 };
+    for (p, q) in origin.iter().zip(smoothed.iter_mut()) {
+        let x = [p[0] - c[0], p[1] - c[1]];
+        q[0] -= (s - 1.0) * x[0] + t[0];
+        q[1] -= (s - 1.0) * x[1] + t[1];
+    }
 }
 
 /// A point cut by the frame, held out of the contour smoothing.
@@ -138,12 +188,15 @@ fn on_border(field: &LiquifyField, p: [f64; 2]) -> bool {
 
 /// The corrections of one open contour run, low-passed with its ends held. Returns how many
 /// exceeded the limit and were left out.
-fn smooth_run(items: &mut Vec<([f64; 2], [f64; 2])>, run: &[[f64; 2]], strength: f64, limit: f64) -> usize {
+fn smooth_run(items: &mut Vec<([f64; 2], [f64; 2])>, run: &[[f64; 2]], strength: f64, limit: f64, relief: bool) -> usize {
     if run.len() < 3 {
         return 0;
     }
     let mut smoothed = run.to_vec();
     low_pass(&mut smoothed, false, strength);
+    if relief {
+        steady(run, &mut smoothed);
+    }
     push_corrections(items, run, &smoothed, limit)
 }
 
@@ -269,15 +322,40 @@ pub fn alignable_pairs(pts: &[[f64; 2]], visibility: &[f32], pairs: &[(usize, us
             let (Some(&pi), Some(&pj)) = (pts.get(i), pts.get(j)) else {
                 return false;
             };
-            if !seen(i) || !seen(j) {
-                return false;
-            }
-            let (mi, mj) = (reflect(pi, axis, u), reflect(pj, axis, u));
-            let a = (mj[0] - pi[0]).hypot(mj[1] - pi[1]);
-            let b = (mi[0] - pj[0]).hypot(mi[1] - pj[1]);
-            a.max(b) <= limit
+            seen(i) && seen(j) && mirror_error(pi, pj, axis, u) <= limit
         })
         .collect()
+}
+
+/// The pairs a symmetry pass may align when every point is trusted — the face mesh always
+/// names its own features. `limit` is in document pixels: a pair whose mirror correction at
+/// full strength is larger is not an asymmetry to smooth but a different geometry — on a
+/// turned or tilted head the reflected feature is nowhere near its counterpart — and aligning
+/// it would drag a disc of the photo across the face. The face caller scales the limit to its
+/// own width; a pair that fails is left where it is.
+pub fn symmetric_pairs(pts: &[[f64; 2]], pairs: &[(usize, usize)], axis: [f64; 2], dir: [f64; 2], limit: f64) -> Vec<(usize, usize)> {
+    let n = len_unit(dir);
+    if n < 1e-9 || limit.is_nan() || limit <= 0.0 {
+        return Vec::new();
+    }
+    let u = [dir[0] / n, dir[1] / n];
+    pairs
+        .iter()
+        .copied()
+        .filter(|&(i, j)| {
+            let (Some(&pi), Some(&pj)) = (pts.get(i), pts.get(j)) else {
+                return false;
+            };
+            mirror_error(pi, pj, axis, u) <= limit
+        })
+        .collect()
+}
+
+/// The larger of a pair's two mirror corrections: how far each point would move to land on
+/// the other's reflection.
+fn mirror_error(pi: [f64; 2], pj: [f64; 2], axis: [f64; 2], u: [f64; 2]) -> f64 {
+    let (mi, mj) = (reflect(pi, axis, u), reflect(pj, axis, u));
+    (mj[0] - pi[0]).hypot(mj[1] - pi[1]).max((mi[0] - pj[0]).hypot(mi[1] - pj[1]))
 }
 
 /// 对称液化: aligns landmark `pairs` toward symmetry about the line (`axis` point, `dir`
@@ -429,6 +507,59 @@ mod tests {
         let mut field = LiquifyField::new(bounds(), 2.0);
         stamp(&mut field, &pts, spacing, 0.0);
         assert!(field.is_identity());
+    }
+
+    /// A ring with no relief — a plain circle sampled as sparsely as a face oval — must not
+    /// move at all under the relief stamp. The plain stamp shrinks it, because the low-pass
+    /// pulls every point toward its neighbours' chords; on a face that read as a smaller
+    /// face. This is the behaviour the face's smooth slider depends on.
+    #[test]
+    fn the_relief_stamp_leaves_a_smooth_ring_alone() {
+        let n = 36;
+        let pts: Vec<[f64; 2]> = (0..n)
+            .map(|k| {
+                let t = k as f64 / n as f64 * std::f64::consts::TAU;
+                [128.0 + 80.0 * t.cos(), 128.0 + 80.0 * t.sin()]
+            })
+            .collect();
+        let spacing = std::f64::consts::TAU * 80.0 / n as f64;
+        let mut plain = LiquifyField::new(bounds(), 2.0);
+        stamp(&mut plain, &pts, spacing, 100.0);
+        let mut relief = LiquifyField::new(bounds(), 2.0);
+        stamp_relief(&mut relief, &pts, spacing, 100.0);
+        assert!(plain.max_displacement() > 4.0, "the plain low-pass shrinks the ring: {}", plain.max_displacement());
+        assert!(relief.max_displacement() < 0.5, "a smooth ring relaxes to nothing: {}", relief.max_displacement());
+    }
+
+    /// The relief stamp is not a no-op: a local bump on an otherwise smooth ring still
+    /// pulls in.
+    #[test]
+    fn the_relief_stamp_still_relaxes_a_bump() {
+        let n = 96;
+        let pts: Vec<[f64; 2]> = (0..n)
+            .map(|k| {
+                let t = k as f64 / n as f64 * std::f64::consts::TAU;
+                let r = 80.0 + if (k as isize - 24).abs() <= 1 { 6.0 } else { 0.0 };
+                [128.0 + r * t.cos(), 128.0 + r * t.sin()]
+            })
+            .collect();
+        let spacing = std::f64::consts::TAU * 80.0 / n as f64;
+        let mut field = LiquifyField::new(bounds(), 2.0);
+        stamp_relief(&mut field, &pts, spacing, 100.0);
+        let bulge = pts[24];
+        let d = field.sample(bulge[0], bulge[1]);
+        let r = (bulge[0] - 128.0).hypot(bulge[1] - 128.0);
+        let outward = [(bulge[0] - 128.0) / r, (bulge[1] - 128.0) / r];
+        assert!(d[0] * outward[0] + d[1] * outward[1] > 0.5, "the bump's correction must read inward: {d:?}");
+    }
+
+    #[test]
+    fn only_pairs_within_the_limit_are_symmetric() {
+        let (pts, _) = raised_arm();
+        let close = symmetric_pairs(&pts, &[(11, 12), (15, 16)], [130.0, 100.0], [0.0, 1.0], 40.0);
+        assert_eq!(close, vec![(11, 12)], "the raised wrist pair is a different geometry, not an asymmetry");
+        let all = symmetric_pairs(&pts, &[(11, 12), (15, 16)], [130.0, 100.0], [0.0, 1.0], 1000.0);
+        assert_eq!(all.len(), 2, "a generous limit keeps both pairs");
     }
 
     #[test]
