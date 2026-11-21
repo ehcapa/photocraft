@@ -626,16 +626,17 @@ impl FaceMask {
 
 /// Whether a part must leave the eye or lip interior alone, as `(eyes, lips)`.
 ///
-/// The whole-face rows — the uniform scale, the width and the two full-face slims — carry
-/// the features with them. Holding the eyes and mouth still while the face around them
-/// shrinks or narrows is what reads as a warped photograph: the features keep their old
-/// size and spacing inside a face that no longer has room for them. The face-length rows
-/// are the same case for the mouth, which sits inside their ramp; the eyes are above it.
+/// The whole-face rows — the uniform scale, the width and the full-face slims — carry the
+/// features with them. Holding the eyes and mouth still while the face around them shrinks
+/// or narrows is what reads as a warped photograph: the features keep their old size and
+/// spacing inside a face that no longer has room for them. The face-length rows are the
+/// same case for the mouth, which sits inside their ramp; the eyes are above it.
 ///
 /// Every other row reshapes one region around the features — the jaw, the temples, the
 /// brows, the nose — and must leave them still. Eye and mouth parts own their feature.
 fn protects(name: &str) -> (bool, bool) {
-    if matches!(name, "face slim" | "face size" | "v face" | "face width") {
+    // The slim rows are two components of one whole-face slider, so the prefix covers both.
+    if name.starts_with("face slim") || matches!(name, "face size" | "v face" | "face width") {
         return (false, false);
     }
     if matches!(name, "mid face" | "lower face") {
@@ -656,10 +657,20 @@ struct FacePart {
 /// The parts. Table order = build order (determinism, as the body table's).
 const FACE_PARTS: &[FacePart] = &[
     // ---------- the outline ----------
+    // Two contractions share the slim slider: a light one over the whole face, from the
+    // forehead to the chin, and a stronger one from the cheekbones down. Narrowing only the
+    // chin reads as a pointed jaw pasted on, and narrowing only the sides leaves the lower
+    // contour behind; the pair keeps the whole face coordinated while the jaw and cheeks,
+    // where slimming is read, move about twice as far as the temples.
     FacePart {
         name: "face slim",
         slider: |s| s.face_slim,
-        shape: |f| f.contract_v(f.along_up(mesh::CHIN, 0.30), f.pt(mesh::CHIN), (0.0, 1.0), f.face_w * 0.62, 0.27),
+        shape: |f| Some(Shape::Contract { a: f.pt(mesh::FOREHEAD_TOP), b: f.pt(mesh::CHIN), band: (0.05, 0.95), width: f.face_w * 0.70, gain: 0.12 }),
+    },
+    FacePart {
+        name: "face slim lower",
+        slider: |s| s.face_slim,
+        shape: |f| f.contract_v(f.along_up(mesh::CHIN, 0.55), f.pt(mesh::CHIN), (0.10, 0.95), f.face_w * 0.72, 0.20),
     },
     FacePart {
         name: "left temple",
@@ -1272,11 +1283,22 @@ mod tests {
         }
     }
 
+    /// Slim narrows the whole face, not only the chin, and the jaw and cheek contour move
+    /// about twice as far as the temples. The old single band started 30% of the face height
+    /// above the chin, below the cheekbones, so the upper face stayed put; the test samples
+    /// the same height at the temple and at the cheek to guard both halves.
     #[test]
-    fn the_face_slims_toward_its_axis_and_the_corners_stay() {
+    fn the_face_slims_throughout_and_the_lower_contour_most() {
         let (field, _) = build(FaceSliders { face_slim: 100.0, ..Default::default() });
-        let right_rim = field.sample(330.0, 340.0); // inside the slim band and the face, to the axis's right
-        assert!(right_rim[0] > 0.2, "the rim field must point outward (reads pulled in): {right_rim:?}");
+        let mag = |x: f64, y: f64| {
+            let d = field.sample(x, y);
+            assert!(d[0] > 0.0, "the right-side field must point outward (reads pulled in) at ({x}, {y}): {d:?}");
+            d[0].hypot(d[1])
+        };
+        // Inside the face on the axis's right: the temple, the cheekbone and the jaw.
+        let (temple, cheek, jaw) = (mag(350.0, 180.0), mag(350.0, 268.0), mag(330.0, 340.0));
+        assert!(cheek > temple * 1.5, "the cheek contour must slim more than the temple (cheek {cheek:.2}, temple {temple:.2})");
+        assert!(jaw > temple * 1.5, "the jaw must slim more than the temple (jaw {jaw:.2}, temple {temple:.2})");
         let corner = field.sample(10.0, 10.0);
         assert!(corner[0].abs() < 1e-6 && corner[1].abs() < 1e-6, "the corner stays: {corner:?}");
     }
@@ -1351,14 +1373,16 @@ mod tests {
         }
     }
 
-    /// The scale and width rows reach the eyes too, so the eyes ride them with the face; the
-    /// slims start at the mouth's height and end above the eyes, so their band leaves the
-    /// eyes alone — a slim face does not change where the eyes sit.
+    /// The scale, the width and the slim reach the eyes, so the eyes ride them with the
+    /// face; the V row starts at the mouth's height and ends above the eyes, so its band
+    /// leaves them alone — a V jaw does not change where the eyes sit.
     #[test]
-    fn the_face_size_and_width_carry_the_eyes_with_them() {
-        for (name, sliders) in
-            [("face size", FaceSliders { face_size: 100.0, ..Default::default() }), ("face width", FaceSliders { face_width: 100.0, ..Default::default() })]
-        {
+    fn the_face_size_width_and_slim_carry_the_eyes_with_them() {
+        for (name, sliders) in [
+            ("face size", FaceSliders { face_size: 100.0, ..Default::default() }),
+            ("face width", FaceSliders { face_width: 100.0, ..Default::default() }),
+            ("face slim", FaceSliders { face_slim: 100.0, ..Default::default() }),
+        ] {
             let (field, _) = build(sliders);
             let eye = field.sample(306.0, 232.0);
             let rim = field.sample(330.0, 340.0);
