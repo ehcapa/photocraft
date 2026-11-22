@@ -799,9 +799,9 @@ impl Live {
         let Some(l) = st.doc.layer(layer) else { return };
         let opacity = (l.opacity * l.fill_opacity).clamp(0.0, 1.0);
         let without = crate::distort_ui::without_layer(&st.doc, layer);
-        let textures = PreviewTextures::new(format!("sculpt-{}", self.serial), PreviewPixels::new(frame.image, [1.0, 1.0]));
+        let textures = PreviewTextures::new(&mut app.texture_serials, format!("sculpt-{}", self.serial), PreviewPixels::new(frame.image, [1.0, 1.0]));
         let crop = frame.crop.map(|c| CropPreview {
-            textures: PreviewTextures::new(format!("sculpt-crop-{}", self.serial), PreviewPixels::new(c.image, [1.0, 1.0])),
+            textures: PreviewTextures::new(&mut app.texture_serials, format!("sculpt-crop-{}", self.serial), PreviewPixels::new(c.image, [1.0, 1.0])),
             bounds: c.bounds,
         });
         self.preview = Some(Preview { textures, crop, without, opacity, size: self.size });
