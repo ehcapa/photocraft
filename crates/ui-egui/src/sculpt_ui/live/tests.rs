@@ -171,8 +171,8 @@ fn apply_is_disabled_until_anchors_exist() {
     h.run_steps(3);
     assert!(h.get_by_label("Apply").accesskit_node().is_disabled(), "Apply is greyed out without anchors");
     let steps = h.state().session.active().unwrap().history.past_len();
-    let panel = h.state().sculpt.clone().expect("panel open");
-    super::apply(h.state_mut(), &panel);
+    let mut panel = h.state().sculpt.clone().expect("panel open");
+    super::apply(h.state_mut(), &mut panel);
     assert_eq!(h.state().session.active().unwrap().history.past_len(), steps, "a refused Apply edits nothing");
     assert!(h.state().sculpt.is_some(), "the panel stays open");
 }
@@ -193,6 +193,26 @@ fn apply_with_anchors_is_one_step_and_keeps_the_panel_open() {
     assert_eq!(h.state().session.active().unwrap().history.past_len(), steps + 1, "one history step");
     assert!(h.state().sculpt.is_some(), "Apply keeps the panel open");
     assert!(h.state().sculpt_live.as_ref().is_some_and(|live| !live.has_preview()), "the preview gives way to the commit");
+}
+
+/// Applying again without touching a slider is no second warp: the committed values are the
+/// baseline, so the request is empty and the engine reports `changed: false`. Before the
+/// baseline, the same press re-applied every slider over the committed pixels and dragged the
+/// face out of shape.
+#[test]
+fn a_second_apply_without_a_change_edits_nothing() {
+    let mut h = harness(patterned(256, 384), egui::vec2(700.0, 900.0));
+    h.state_mut().sculpt = Some(panel(BODY));
+    let live = Live::test(h.state_mut(), BODY, body_anchors(256.0, 384.0));
+    h.state_mut().sculpt_live = Some(live);
+    h.state_mut().sculpt.as_mut().expect("panel open").values.insert("waist".into(), -60.0);
+    h.run_steps(2);
+    h.get_by_label("Apply").click();
+    h.run_steps(3);
+    let steps = h.state().session.active().unwrap().history.past_len();
+    h.get_by_label("Apply").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.active().unwrap().history.past_len(), steps, "an unchanged second Apply is no edit");
 }
 
 /// Height and Leg Length stretch from the ankles; a pose that only guessed the feet moves the
@@ -263,7 +283,7 @@ fn an_applied_panel_does_not_preview_the_same_values_again() {
     assert!(live.render_now(&mut app, &p).is_some(), "a frame is drawn");
     app.sculpt_live = Some(live);
     let steps = app.session.active().unwrap().history.past_len();
-    super::apply(&mut app, &p);
+    super::apply(&mut app, &mut p);
     assert_eq!(app.session.active().unwrap().history.past_len(), steps + 1, "Apply added the document's one step");
     let mut live = app.sculpt_live.take().expect("Apply keeps the runtime");
     assert!(!live.has_preview(), "Apply drops the shown frame");
@@ -286,7 +306,7 @@ fn apply_adopts_the_warped_anchors_for_the_next_preview() {
     p.values.insert("faceSize".into(), 100.0);
     let live = Live::test(&mut app, FACE, before.clone());
     app.sculpt_live = Some(live);
-    super::apply(&mut app, &p);
+    super::apply(&mut app, &mut p);
     let live = app.sculpt_live.as_ref().expect("Apply keeps the runtime");
     assert!(live.ready(), "the adopted anchors still enable the next Apply");
     assert_ne!(live.anchors, before, "the reply's anchors replace the analysed ones");
@@ -302,6 +322,90 @@ fn apply_adopts_the_warped_anchors_for_the_next_preview() {
     assert!(travel > 1.0, "the adopted mesh must follow a visible move: {travel}");
     let merged = live.merged_params(&p.params());
     assert_eq!(merged.get("anchors"), Some(&live.anchors), "the next preview and Apply carry the adopted anchors");
+}
+
+/// Apply bakes the panel's values into the pixels: the next request carries only the change,
+/// so a tweak after Apply moves that slider alone instead of stacking the whole set again —
+/// which turned a fully adjusted face into a deformity. The preset bundle was applied too,
+/// so its chip clears.
+#[test]
+fn after_an_apply_the_next_request_is_only_the_change() {
+    let mut app = app(patterned(512, 512));
+    let mut p = panel(FACE);
+    p.values.insert("jaw".into(), 40.0);
+    p.values.insert("eyeSize".into(), 20.0);
+    p.values.insert("presetStrength".into(), 60.0);
+    p.preset = "classic".into();
+    app.sculpt_live = Some(Live::test(&mut app, FACE, face_anchors()));
+    super::apply(&mut app, &mut p);
+    let live = app.sculpt_live.as_ref().expect("Apply keeps the runtime");
+    assert_eq!(p.preset, "none", "the applied preset bundle is baked, so its chip clears");
+    assert_eq!(live.request_params(&p.params()), json!({}), "untouched sliders request nothing");
+    p.values.insert("jaw".into(), 45.0);
+    let delta = live.request_params(&p.params());
+    assert_eq!(delta, json!({"jaw": 5.0}), "only the moved slider is requested: {}", p.params());
+}
+
+/// A paired row is compared per side, because the engine's side overrides are absolute: a
+/// pair that moved together is sent as one base difference, a side that moved alone as its
+/// two sides — the form that makes each side land where the panel shows it.
+#[test]
+fn a_paired_row_requests_the_change_per_side() {
+    let mut app = app(patterned(512, 512));
+    let mut live = Live::test(&mut app, FACE, face_anchors());
+    // The last Apply baked eyeSize 40 on both sides.
+    live.applied = Some((json!({"eyeSize": 40.0}), 1));
+    let mut p = panel(FACE);
+    p.values.insert("eyeSize".into(), 40.0);
+    assert_eq!(live.request_params(&p.params()), json!({}), "an unchanged pair requests nothing");
+    // Unlinked, the panel shows both sides at 0: both must come back down by 40.
+    p.locks.insert("eyeSize".into(), false);
+    assert_eq!(live.request_params(&p.params()), json!({"eyeSize": -40.0}), "a pair that moved together stays one base value");
+    // A side moved alone goes as the two sides; a base difference would have moved both.
+    let mut one_side = panel(FACE);
+    one_side.locks.insert("eyeSize".into(), false);
+    one_side.values.insert("eyeSizeLeft".into(), 30.0);
+    one_side.values.insert("eyeSizeRight".into(), 50.0);
+    assert_eq!(live.request_params(&one_side.params()), json!({"eyeSizeLeft": -10.0, "eyeSizeRight": 10.0}));
+}
+
+/// Undoing the committed warp puts the pixels back: the sliders must describe the whole
+/// request again, not a difference from a warp that is gone.
+#[test]
+fn an_undo_of_the_apply_makes_the_sliders_the_whole_request_again() {
+    let mut app = app(patterned(512, 512));
+    let mut p = panel(FACE);
+    p.values.insert("jaw".into(), 40.0);
+    app.sculpt_live = Some(Live::test(&mut app, FACE, face_anchors()));
+    super::apply(&mut app, &mut p);
+    let mut live = app.sculpt_live.take().expect("Apply keeps the runtime");
+    assert_eq!(live.request_params(&p.params()), json!({}), "the commit is the baseline");
+    assert!(app.session.undo(), "the committed warp is undone");
+    let ctx = app.ctx().clone();
+    live.tick(&mut app, &p, &ctx);
+    let whole = live.request_params(&p.params());
+    assert_eq!(whole.get("jaw").and_then(Value::as_f64), Some(40.0), "the slider is the whole request again: {whole}");
+    app.sculpt_live = Some(live);
+}
+
+/// Clear History forgets the rows but not the image: the warp the last Apply baked is still
+/// in the pixels, so the baseline must survive it. (Matching history by position would read
+/// the emptied list as an undo and stack the whole slider set on the next pass.)
+#[test]
+fn a_clear_history_keeps_the_committed_baseline() {
+    let mut app = app(patterned(512, 512));
+    let mut p = panel(FACE);
+    p.values.insert("jaw".into(), 40.0);
+    app.sculpt_live = Some(Live::test(&mut app, FACE, face_anchors()));
+    super::apply(&mut app, &mut p);
+    let mut live = app.sculpt_live.take().expect("Apply keeps the runtime");
+    let before = app.session.active().unwrap().history.past_len();
+    app.session.execute("history.clear", json!({})).expect("the history can be cleared");
+    assert!(app.session.active().unwrap().history.past_len() < before, "the rows are gone");
+    let ctx = app.ctx().clone();
+    live.tick(&mut app, &p, &ctx);
+    assert_eq!(live.request_params(&p.params()), json!({}), "the committed warp still stands, so nothing is re-requested");
+    app.sculpt_live = Some(live);
 }
 
 /// The canvas shows the document without the target layer while the proxy is drawn over it;

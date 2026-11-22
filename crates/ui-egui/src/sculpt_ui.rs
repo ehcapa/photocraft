@@ -472,12 +472,13 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
         live.reanalyze(app, roi);
         app.sculpt_live = Some(live);
     }
-    app.sculpt = Some(panel.clone());
     if confirm {
         // One history step through the engine command, carrying the panel's analysed anchors;
-        // the panel stays open for the next pass.
-        apply(app, &panel);
+        // the panel stays open, and the applied values are baked so the next pass sends only
+        // the change from them rather than the whole set again.
+        apply(app, &mut panel);
     }
+    app.sculpt = Some(panel);
 }
 
 #[cfg(test)]

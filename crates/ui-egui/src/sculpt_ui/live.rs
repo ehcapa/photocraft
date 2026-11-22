@@ -82,9 +82,16 @@ pub struct Live {
     preview_error: Option<String>,
     /// Why the live preview is off although the panel can apply, or `None`.
     suppress: Option<&'static str>,
-    /// The panel's params the newest preview request was made for (or the values last applied):
-    /// unchanged values never re-preview, so an Apply's warp is not drawn a second time.
+    /// The request the newest preview was made for: unchanged values never re-preview, so an
+    /// Apply's warp is not drawn a second time.
     last_requested: Option<Value>,
+    /// The panel's params the last Apply baked into the pixels, and the history state that
+    /// holds the warp. While that state is an ancestor of the current one (or the current
+    /// state), the next preview and Apply send only the change from these values: an
+    /// untouched slider sends nothing, so a second Apply continues from the committed result
+    /// instead of stacking the whole set again. An undo that leaves the state only in redo
+    /// clears it, and the sliders describe the whole request once more.
+    applied: Option<(Value, u64)>,
     /// The newest request's identity, advanced on every panel change; a running job for an older
     /// identity is superseded once the values settle.
     generation: u64,
@@ -176,6 +183,7 @@ impl Live {
             suppress: None,
             // A freshly opened panel's params are `{}`: an untouched panel previews nothing.
             last_requested: Some(json!({})),
+            applied: None,
             generation: 0,
             want: false,
             pending: None,
@@ -323,6 +331,72 @@ impl Live {
         self.anchors.is_object() && self.layer.is_some() && self.sampled
     }
 
+    /// The params a preview or Apply sends: the panel's values when no warp is committed,
+    /// else the difference from the values the pixels already carry. An untouched slider
+    /// sends nothing, so a pass after Apply moves only what the user changed instead of
+    /// stacking the whole set a second time — which dragged the face far past the sliders.
+    /// Paired rows are compared per side, because the engine's side overrides are absolute:
+    /// the difference goes as the base when both sides moved together and as the two sides
+    /// when they did not. The preset row is a one-shot bundle (its chip clears on Apply), so
+    /// a chosen preset passes through whole.
+    fn request_params(&self, current: &Value) -> Value {
+        let Some((applied, _)) = &self.applied else { return current.clone() };
+        let mut out = serde_json::Map::new();
+        // `presetStrength` also sits in the panel's values map; only a chosen preset makes it
+        // a request of its own.
+        if let Some(preset) = current.get("preset").and_then(Value::as_str).filter(|p| !p.is_empty() && *p != "none") {
+            out.insert("preset".to_owned(), json!(preset));
+            if let Some(v) = current.get("presetStrength") {
+                out.insert("presetStrength".to_owned(), v.clone());
+            }
+        }
+        let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        // Keys that name one side of a paired row: the prefix is the row's own slider.
+        let mut pairs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for v in [current, applied] {
+            if let Value::Object(m) = v {
+                for key in m.keys() {
+                    if let Some(base) = key.strip_suffix("Left").or_else(|| key.strip_suffix("Right")) {
+                        pairs.insert(base.to_owned());
+                    }
+                }
+            }
+        }
+        // A side the engine does not see follows its base slider, so resolve both values the
+        // way the command will before taking the difference.
+        let side = |v: &Value, base: &str, suffix: &str| -> f64 { v.get(format!("{base}{suffix}")).and_then(Value::as_f64).unwrap_or_else(|| num(v, base)) };
+        for base in &pairs {
+            let left = side(current, base, "Left") - side(applied, base, "Left");
+            let right = side(current, base, "Right") - side(applied, base, "Right");
+            if left == 0.0 && right == 0.0 {
+                continue;
+            }
+            if (left - right).abs() < 1e-6 {
+                out.insert(base.clone(), json!(left));
+            } else {
+                out.insert(format!("{base}Left"), json!(left));
+                out.insert(format!("{base}Right"), json!(right));
+            }
+        }
+        let mut scalars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for v in [current, applied] {
+            if let Value::Object(m) = v {
+                for key in m.keys() {
+                    if key != "preset" && key != "presetStrength" && !pairs.contains(key) && !key.ends_with("Left") && !key.ends_with("Right") {
+                        scalars.insert(key.clone());
+                    }
+                }
+            }
+        }
+        for key in &scalars {
+            let d = num(current, key) - num(applied, key);
+            if d != 0.0 {
+                out.insert(key.clone(), json!(d));
+            }
+        }
+        Value::Object(out)
+    }
+
     /// The line the panel shows under its tabs: the analysis's refusal, else why the live
     /// preview is off. `None` when both are fine.
     pub fn notice_text(&self) -> Option<String> {
@@ -429,6 +503,15 @@ impl Live {
             self.suspend();
             return;
         }
+        // An undo of the committed warp leaves its state only in the redo branch: the pixels no
+        // longer carry it, and the sliders describe the whole request again. A later edit, or
+        // Clear History, keeps that state an ancestor of the current one — the warp is still
+        // baked, so the difference stands.
+        if let Some((_, id)) = &self.applied
+            && !st.history.row_of(*id).is_some_and(|row| row <= st.history.past_len())
+        {
+            self.applied = None;
+        }
         let size = [st.doc.size.width, st.doc.size.height];
         let revision = st.revision;
         let active_layer = st.active_layer;
@@ -498,7 +581,7 @@ impl Live {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let params = panel.params();
+            let params = self.request_params(&panel.params());
             if self.last_requested.as_ref() != Some(&params) {
                 self.last_requested = Some(params);
                 self.generation = self.generation.wrapping_add(1);
@@ -791,14 +874,16 @@ fn reveals_all(mask: &LayerMask) -> bool {
 
 /// Applies with the panel's slider values and the analysed anchors: one history step through the
 /// engine command. The preview goes first so a frame cannot land on the already-warped pixels.
-pub(crate) fn apply(app: &mut PhotocraftApp, panel: &Panel) {
+/// After a pass the committed values are baked, so the next preview and Apply send only the
+/// change from them — and the preset chip clears, its bundle having been applied.
+pub(crate) fn apply(app: &mut PhotocraftApp, panel: &mut Panel) {
     let Some(mut live) = app.sculpt_live.take() else { return };
     if !live.ready() {
         app.sculpt_live = Some(live);
         return;
     }
-    let params = live.merged_params(&panel.params());
     let values = panel.params();
+    let params = live.merged_params(&live.request_params(&values));
     live.suspend();
     match app.run(live.command, params) {
         Ok(reply) => {
@@ -810,8 +895,17 @@ pub(crate) fn apply(app: &mut PhotocraftApp, panel: &Panel) {
             if let Some(moved) = reply.get("anchors").filter(|a| a.is_object()) {
                 live.anchors = moved.clone();
             }
+            // A run that changed nothing (an identity field) baked nothing: the previous
+            // baseline stands, and its values are requested again if they matter.
+            if reply.get("changed").and_then(Value::as_bool) != Some(false) {
+                // The state the run left current holds the warp: as long as it stays an
+                // ancestor of the current state, the pixels carry these values.
+                let state = app.session.active().and_then(|st| st.history.row_id(st.history.past_len())).unwrap_or_default();
+                live.applied = Some((values, state));
+                panel.preset = "none".into();
+            }
             // Unchanged values never re-preview: the canvas already shows the committed warp.
-            live.last_requested = Some(values);
+            live.last_requested = Some(live.request_params(&panel.params()));
             #[cfg(not(target_arch = "wasm32"))]
             {
                 live.proxy = None;
@@ -939,6 +1033,7 @@ impl Live {
             preview_error: None,
             suppress: None,
             last_requested: Some(json!({})),
+            applied: None,
             generation: 0,
             want: false,
             pending: None,
@@ -980,7 +1075,7 @@ impl Live {
     /// is returned to compare pixels.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn render_now(&mut self, app: &mut PhotocraftApp, panel: &Panel) -> Option<egui::ColorImage> {
-        let params = panel.params();
+        let params = self.request_params(&panel.params());
         self.last_requested = Some(params.clone());
         let job = self.job(app, &params)?;
         let frame = match worker::render(&job, &photocraft_engine::jobs::JobCtx::new()).ok()? {
