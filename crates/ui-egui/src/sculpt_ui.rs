@@ -55,6 +55,7 @@ const BODY_SECTIONS: &[Section] = &[
             r("waist", "Waist"),
             r("belly", "Belly"),
             r("arms", "Arms"),
+            r("forearms", "Forearms & Hands"),
             r("thighs", "Thighs"),
             r("calves", "Calves"),
             r("shoulders", "Shoulder Width"),

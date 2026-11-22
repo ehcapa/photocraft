@@ -1,5 +1,5 @@
-//! Filter › Body Sculpt: whole-body shaping from the body-pose foundation — sixteen
-//! bidirectional sliders (PixCake's 全身美型 panel in this fork's terms) whose warp
+//! Filter › Body Sculpt: whole-body shaping from the body-pose foundation — twenty-two
+//! bidirectional shaping sliders (PixCake's 全身美型 panel in this fork's terms) whose warp
 //! [`photocraft_algo::sculpt`] writes analytically over Liquify's own field, so the pixel
 //! work, the selection limit and the smart-filter replay are all the distortion family's.
 //!
@@ -40,7 +40,7 @@ fn bad(msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: SCULPT.into(), msg: msg.into() }
 }
 
-/// One slider out of params: absent is zero (the dialog sends all sixteen, a script the few
+/// One slider out of params: absent is zero (the dialog sends all twenty-two, a script the few
 /// it means), a non-number is refused, the range clamps like the dialog's own slider stops.
 fn slider(p: &Value, key: &str) -> Result<f32> {
     let raw = match p.get(key) {
@@ -56,6 +56,7 @@ fn sliders(p: &Value) -> Result<SculptSliders> {
         waist: slider(p, "waist")?,
         belly: slider(p, "belly")?,
         arms: slider(p, "arms")?,
+        forearms: slider(p, "forearms")?,
         thighs: slider(p, "thighs")?,
         calves: slider(p, "calves")?,
         shoulders: slider(p, "shoulders")?,
@@ -950,7 +951,7 @@ pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> 
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"waistLine":-300..300=0 (placement: moves the fitted waist row by 30% of the shoulder→hip-joint span per 100, up to 90% either way at ±300, positive downward; 0 leaves the measured or prior row. Set it on a visible waistband the outline's crease test missed; the row's own silhouette width follows),"bellyLine":-300..300=0 (placement: the same for the belly row, so a front-on belly the side outline cannot confirm still gets a line the user trusts),"symmetry":0..100=0 (对称液化·上半身: the paired joints align toward each other's mirror about the torso axis),"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action — Waist narrows, Hips rounds, Leg Length lengthens; with `anchors` the analysis never runs on Apply),"anchors":{…}? (`portrait.analyze`'s document-pixel anchors — the panel supplies them so Apply is a field build and a warp; without them one lightweight pose analysis runs. Stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"forearms":-100..100=0 (the lower arm from the elbow past the wrist through the palm and fingers; the pose has no hand landmarks, so the hand follows the forearm's direction and the report marks it approximate),"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"waistLine":-300..300=0 (placement: moves the fitted waist row by 30% of the shoulder→hip-joint span per 100, up to 90% either way at ±300, positive downward; 0 leaves the measured or prior row. Set it on a visible waistband the outline's crease test missed; the row's own silhouette width follows),"bellyLine":-300..300=0 (placement: the same for the belly row, so a front-on belly the side outline cannot confirm still gets a line the user trusts),"symmetry":0..100=0 (对称液化·上半身: the paired joints align toward each other's mirror about the torso axis),"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action — Waist narrows, Hips rounds, Leg Length lengthens; with `anchors` the analysis never runs on Apply),"anchors":{…}? (`portrait.analyze`'s document-pixel anchors — the panel supplies them so Apply is a field build and a warp; without them one lightweight pose analysis runs. Stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: SCULPT,
         label: "Body Sculpt…",
@@ -1610,6 +1611,7 @@ mod tests {
                 ("waist", |v| SculptSliders { waist: v, ..SculptSliders::default() }),
                 ("belly", |v| SculptSliders { belly: v, ..SculptSliders::default() }),
                 ("arms", |v| SculptSliders { arms: v, ..SculptSliders::default() }),
+                ("forearms", |v| SculptSliders { forearms: v, ..SculptSliders::default() }),
                 ("thighs", |v| SculptSliders { thighs: v, ..SculptSliders::default() }),
                 ("calves", |v| SculptSliders { calves: v, ..SculptSliders::default() }),
                 ("shoulders", |v| SculptSliders { shoulders: v, ..SculptSliders::default() }),

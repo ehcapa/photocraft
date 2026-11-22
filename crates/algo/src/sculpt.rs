@@ -43,6 +43,7 @@ const LIMB_COVERED: f64 = 0.45;
 /// Why a row that ran anyway is reported approximate.
 const INFERRED_REASON: &str = "the pose barely sees those landmarks; the position is inferred from the silhouette";
 const COVERED_REASON: &str = "a landmark lies outside the person silhouette; the covered part of the limb is used";
+const HAND_REASON: &str = "the pose has no hand landmarks; the palm and fingers follow the forearm's direction";
 const WAIST_PRIOR_REASON: &str = "the outline shows no waist crease, so the row follows the body's anatomical waist between the ribs and the hip joints; a garment's waistband may sit elsewhere — move the line to it";
 const BELLY_PRIOR_REASON: &str = "the outline shows no belly bump, so the row follows the widest lower-abdomen row between the waist and the hips; a front-on bump the side outline cannot show stays approximate";
 
@@ -59,6 +60,25 @@ const PROFILE_REACH: f64 = 2.05;
 /// cap and the calf's overlap at the knee instead of both dying there.
 const LIMB_JOINT_OVERLAP: f64 = 0.18;
 
+/// How far past the wrist the lower arm's row runs, as a fraction of the forearm's own bone:
+/// the pose names no hand joints, so the palm and fingers are taken to continue along the
+/// forearm's direction. An average hand (wrist to fingertip) is about three quarters of a
+/// forearm; the band's far fade starts inside the hand, so the fingertips pull less than the
+/// palm.
+const HAND_REACH: f64 = 0.75;
+
+/// The lower arm row's width floor, as a fraction of the bone. The person mask under-measures
+/// a thin forearm (7–9 px where the limb is visibly wider), and the hand is about as wide as
+/// the wrist: the floor keeps the rim pull visible and the envelope covering the hand instead
+/// of a line inside it.
+const FOREARM_WIDTH: f64 = 0.30;
+
+/// The lower arm is about three quarters as thick as the upper arm it hangs from. The mask
+/// reads a forearm badly when it is pressed against the torso or a hip (the run merges, or
+/// the edge is shaded), so the upper arm it is jointed to supplies the envelope's width
+/// floor: a forearm the mask called 7 px wide is visibly about the same as the upper arm.
+const FOREARM_OF_UPPER: f64 = 0.75;
+
 /// The coupling length per pixel of local displacement: the slimming family's weight decays
 /// to nothing over twice the displacement it carries. The smoothstep's steepest slope is
 /// 1.5/L, so the weight contributes at most 0.75 to the map's slope — under the fold limit
@@ -69,15 +89,17 @@ const COUPLING_LENGTH: f64 = 2.0;
 /// instead of a hard clip.
 const COUPLING_MIN: f64 = 8.0;
 
-/// The twenty-one shaping sliders, each −100..100. A slider's positive direction is its
+/// The twenty-two shaping sliders, each −100..100. A slider's positive direction is its
 /// label's action: `waist` narrows, `hips` rounds, `leg_length` lengthens; zero leaves the
-/// part out.
+/// part out. `arms` shapes the upper arm; `forearms` the lower arm from the elbow through
+/// the palm and fingers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SculptSliders {
     pub slim_body: f32,
     pub waist: f32,
     pub belly: f32,
     pub arms: f32,
+    pub forearms: f32,
     pub thighs: f32,
     pub calves: f32,
     pub shoulders: f32,
@@ -582,6 +604,13 @@ fn fit_placed(name: &str) -> bool {
     matches!(name, "slim body" | "waist" | "belly" | "left hip" | "right hip" | "left bust" | "right bust")
 }
 
+/// Whether a row shapes the hand: the pose has no hand landmarks, so the palm and fingers
+/// follow the forearm's direction — the row is reported approximate even when its forearm is
+/// measured.
+fn hand_shaped(name: &str) -> bool {
+    matches!(name, "left lower arm" | "right lower arm")
+}
+
 /// The parts, table order = build order (the superposition is order-stable, which is part of
 /// the determinism the smart filter relies on).
 const PARTS: &[Part] = &[
@@ -663,6 +692,10 @@ const PARTS: &[Part] = &[
     Part { name: "left forearm", slider: |s| s.arms, needs: &[13, 15], shape: |f| arm(f, 13, 15, 0.26) },
     Part { name: "right upper arm", slider: |s| s.arms, needs: &[12, 14], shape: |f| arm(f, 12, 14, 0.26) },
     Part { name: "right forearm", slider: |s| s.arms, needs: &[14, 16], shape: |f| arm(f, 14, 16, 0.26) },
+    // The lower arm's own row: the fitted forearm places the band and width, and the hand
+    // continues past the wrist because the pose names no hand joints.
+    Part { name: "left lower arm", slider: |s| s.forearms, needs: &[13, 15], shape: |f| forearm(f, 13, 15, 0.24) },
+    Part { name: "right lower arm", slider: |s| s.forearms, needs: &[14, 16], shape: |f| forearm(f, 14, 16, 0.24) },
     Part { name: "left thigh", slider: |s| s.thighs, needs: &[23, 25], shape: |f| limb(f, 23, 25, 0.42, 0.24) },
     Part { name: "right thigh", slider: |s| s.thighs, needs: &[24, 26], shape: |f| limb(f, 24, 26, 0.42, 0.24) },
     Part { name: "left calf", slider: |s| s.calves, needs: &[25, 27], shape: |f| limb(f, 25, 27, 0.32, 0.22) },
@@ -757,6 +790,43 @@ fn arm(f: &Frame, i: usize, j: usize, gain: f64) -> Option<Shape> {
     limb(f, i, j, 0.32, gain)
 }
 
+/// The lower arm from the elbow through the wrist, the palm and the fingers. The fitted
+/// forearm places the near end of the band; the far end runs on past the wrist along the
+/// bone's own direction, because the pose has no hand joints. The band's far fade starts
+/// inside the hand, so the fingertips pull less than the palm, and the ordinary lateral
+/// falloff bounds the row at the hand's sides.
+fn forearm(f: &Frame, i: usize, j: usize, gain: f64) -> Option<Shape> {
+    let a = f.pt(i);
+    let b = f.pt(j);
+    let len = norm(sub(b, a));
+    if len < 4.0 {
+        return None;
+    }
+    let u = scale(sub(b, a), 1.0 / len);
+    let tip = add(b, scale(u, len * HAND_REACH));
+    // Where the wrist sits on the extended elbow→fingertip segment.
+    let wrist = 1.0 / (1.0 + HAND_REACH);
+    let fit = f.fit.and_then(|fit| {
+        let idx = LIMB_SEGMENTS.iter().position(|&(x, y)| x == i && y == j)?;
+        let limb = fit.limbs.get(idx)?;
+        (limb.radius > 1.0 && limb.t1 - limb.t0 >= 0.10).then_some((fit, limb))
+    });
+    let t0 = fit.map_or(0.05, |(_, limb)| f64::from(limb.t0).clamp(0.0, 0.98));
+    let band = ((t0 - LIMB_JOINT_OVERLAP) * wrist, 1.0);
+    let measured = fit.map_or(0.0, |(_, limb)| 2.0 * f64::from(limb.radius));
+    // The forearm's own fit when the mask saw it, else the upper arm's thickness scaled down:
+    // a forearm held against the body reads thin, and an envelope that thin would leave the
+    // visible rim — and the hand — outside its reach.
+    let upper = fit.and_then(|(fit, _)| {
+        let above = i.checked_sub(2)?;
+        let idx = LIMB_SEGMENTS.iter().position(|&(x, y)| x == above && y == i)?;
+        let limb = fit.limbs.get(idx)?;
+        (limb.radius > 1.0).then(|| 2.0 * FOREARM_OF_UPPER * f64::from(limb.radius))
+    });
+    let width = measured.max(upper.unwrap_or(0.0)).max(len * FOREARM_WIDTH).max(16.0);
+    f.contract(a, tip, band, width, gain)
+}
+
 /// One hip: a radial expansion placed halfway between the torso axis and the fitted hip
 /// contour, with the envelope reaching twice that distance so its peak lands on the visible
 /// curve. Without a fit it keeps the joint-spacing estimate.
@@ -848,6 +918,9 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
             report.skipped.push((part.name, "the anchors are too close to name an axis"));
             continue;
         };
+        // The hand has no pose landmarks: a row that runs through it is approximate even when
+        // its forearm is measured, and its own reason stands when nothing else is inferred.
+        let approximate = approximate.or_else(|| hand_shaped(part.name).then_some(HAND_REASON));
         asked.push((part, f64::from(slider / 100.0).clamp(-1.0, 1.0) * confidence, shape, approximate));
     }
     // Without a fitted silhouette every torso row places itself from the joints alone: the
@@ -1535,6 +1608,25 @@ mod tests {
         }
     }
 
+    /// [`fitted`] with a hand below each wrist: the pose names no hand joints, so the mask's
+    /// own hand runs are the only evidence that the lower arm's row must reach past the wrist.
+    fn fitted_with_hands() -> BodyFit {
+        let mut fit = fitted();
+        let a = standing();
+        let hand = |elbow: usize, wrist: usize, y: f32| {
+            let (e, w) = (a.pose[elbow], a.pose[wrist]);
+            let t = (y - w[1]) / (w[1] - e[1]);
+            let x = w[0] + (w[0] - e[0]) * t;
+            let half = if y < 440.0 { 16.0 } else { 12.0 };
+            [x - half, x + half]
+        };
+        for row in fit.rows.iter_mut().filter(|r| (380.0..=440.0).contains(&r.y)) {
+            row.runs.push(hand(13, 15, row.y));
+            row.runs.push(hand(14, 16, row.y));
+        }
+        fit
+    }
+
     fn fitted_spec(sliders: SculptSliders) -> SculptSpec {
         SculptSpec { sliders, anchors: standing(), fit: Some(fitted()) }
     }
@@ -1916,6 +2008,7 @@ mod tests {
             waist: 100.0,
             belly: 100.0,
             arms: 100.0,
+            forearms: 100.0,
             thighs: 100.0,
             calves: 100.0,
             shoulders: 100.0,
@@ -1938,6 +2031,37 @@ mod tests {
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         let step = max_adjacent_step(&field);
         assert!(step < CELL, "adjacent nodes step {step:.2}px past the {CELL}px cell — the fitted stack folds");
+    }
+
+    /// The lower arm's row is independent of Arms: it reaches the hand the pose names no
+    /// joints for, and leaves the upper arm to the arms slider.
+    #[test]
+    fn the_lower_arm_row_slims_the_hand_and_spares_the_upper_arm() {
+        let build_with = |sliders: SculptSliders| sculpt_field(&SculptSpec { sliders, anchors: standing(), fit: Some(fitted_with_hands()) }, bounds(), CELL).0;
+        // The left hand's outer rim below the wrist, and the left upper arm's outer rim.
+        let hand = build_with(SculptSliders { forearms: 100.0, ..SculptSliders::default() }).sample(172.0, 410.0);
+        assert!(hand[0] < -1.0, "the hand rim must pull toward the arm: {hand:?}");
+        let arms_on_the_hand = build_with(SculptSliders { arms: 100.0, ..SculptSliders::default() }).sample(172.0, 410.0);
+        assert!(arms_on_the_hand[0].abs() < 0.05 && arms_on_the_hand[1].abs() < 0.05, "the Arms row must not reach the hand: {arms_on_the_hand:?}");
+        let upper = build_with(SculptSliders { forearms: 100.0, ..SculptSliders::default() }).sample(176.0, 220.0);
+        assert!(upper[0].abs() < 0.05 && upper[1].abs() < 0.05, "the lower-arm row must leave the upper arm still: {upper:?}");
+    }
+
+    #[test]
+    fn the_hand_rows_say_the_hand_is_approximate() {
+        let (_, report) = sculpt_field(&fitted_spec(SculptSliders { forearms: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        for side in ["left lower arm", "right lower arm"] {
+            assert!(report.applied.contains(&side), "{report:?}");
+            assert!(report.approximate.iter().any(|(n, why)| *n == side && *why == HAND_REASON), "{side} must carry the hand reason: {report:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_fit_the_lower_arm_row_still_reaches_the_hand() {
+        let (field, report) = build(SculptSliders { forearms: 100.0, ..SculptSliders::default() });
+        assert!(report.applied.contains(&"left lower arm"), "{report:?}");
+        let d = field.sample(172.0, 410.0);
+        assert!(d[0].hypot(d[1]) > 0.5, "the hand must follow the forearm's direction when nothing measured it: {d:?}");
     }
 
     /// Height and Leg Length stretch everything above the ankles: a feet position the pose only
@@ -1999,6 +2123,7 @@ mod tests {
                 waist: 100.0 * sign,
                 belly: 100.0 * sign,
                 arms: 100.0 * sign,
+                forearms: 100.0 * sign,
                 thighs: 100.0 * sign,
                 calves: 100.0 * sign,
                 shoulders: 100.0 * sign,
