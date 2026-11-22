@@ -40,6 +40,13 @@ const fn r(key: &'static str, label: &'static str) -> Row {
     Row { key, label }
 }
 
+/// A row's slider span. The placement lines move a row up or down the body, and a waistband
+/// can sit far from the anatomical row: their ±300 is ±90% of the shoulder→hip-joint span,
+/// where the shaping sliders' ±100 is the shape's own strength.
+fn row_range(key: &str) -> std::ops::RangeInclusive<f32> {
+    if matches!(key, "waistLine" | "bellyLine") { -300.0..=300.0 } else { -100.0..=100.0 }
+}
+
 const BODY_SECTIONS: &[Section] = &[
     Section {
         name: "Shaping",
@@ -429,7 +436,7 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             } else {
                                 let mut v = panel.value(row.key);
                                 let label = ui.label(tl!(row.label));
-                                ui.add(egui::Slider::new(&mut v, -100.0..=100.0)).labelled_by(label.id);
+                                ui.add(egui::Slider::new(&mut v, row_range(row.key))).labelled_by(label.id);
                                 ui.end_row();
                                 edits.push(Edit { key: row.key, base: v, sides: None });
                             }
