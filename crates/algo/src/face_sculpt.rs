@@ -567,27 +567,56 @@ fn signed_distance(p: [f64; 2], poly: &[[f64; 2]]) -> f64 {
 
 /// The face field's soft bounds, computed over the face's own node window so a large
 /// document does not pay a canvas-sized mask: `sdf` is the signed distance to the FACE_OVAL
-/// hull, `clip` the local rows' tight clip (1 inside, 0 past a short feather outside),
-/// `eye` and `lip` are 0 inside the eye rings and the lip ring and 1 outside. The local
-/// outline parts must stop at the outline and leave the eyes and mouth still; an eye or
-/// mouth part is exempt from its own feature's protection. The window reaches as far as the
-/// whole-face rows' coupling needs, so `whole_weights` can follow the hair beside the face.
+/// hull (and `eye_sdf`/`lip_sdf` to the eye rings and the lip ring), from which `clip` — the
+/// local rows' tight clip, 1 inside and ramping to 0 outside — and `eye`/`lip`, 0 inside the
+/// feature and 1 outside, are built. The local outline parts must stop at the outline and
+/// leave the eyes and mouth still; an eye or mouth part is exempt from its own feature's
+/// protection. The window reaches as far as the whole-face rows' coupling needs and as far
+/// as the widest ramp, so `whole_weights` can follow the hair beside the face without the
+/// local clip being cut off at the window's edge.
 struct FaceMask {
     i0: usize,
     j0: usize,
     w: usize,
     h: usize,
     sdf: Vec<f32>,
+    eye_sdf: Vec<f32>,
+    lip_sdf: Vec<f32>,
     clip: Vec<f32>,
     eye: Vec<f32>,
     lip: Vec<f32>,
+    /// The face clip's inner ramp, in document pixels (inside is full weight).
+    inward: f64,
+    /// The face clip's outward ramp, in document pixels.
+    outward: f64,
+    /// The eye and lip protection ramps, in document pixels.
+    eye_feather: f64,
+    lip_feather: f64,
     /// The shortest whole-face coupling length, in document pixels.
     min_length: f64,
 }
 
+/// The feature a ramp absorbs displacement for.
+#[derive(Clone, Copy)]
+enum Absorb {
+    Eye,
+    Lip,
+    Oval,
+}
+
+/// How far each ramp is stretched past the displacement it must absorb. A smoothstep's
+/// steepest slope is 1.5/L, so the map's local slope from a part of displacement D fades at
+/// 1.5·D/L; keeping that under 0.5 (a local compression of at least half, the whole-face
+/// family's own floor) needs L ≥ 3·D. The old absolute pixel caps (40 px at the clip, 32 px
+/// at the eye and lip ramps) fell far below that on a several-thousand-pixel face, where a
+/// local row moves tens of pixels: the ramp then doubled as the source of the smear.
+const TAPER_ABSORB: f64 = 3.0;
+
 impl FaceMask {
-    /// `reach` is the furthest outside the ring the whole-face weight is nonzero (twice the
-    /// whole-face family's largest displacement); the window covers it.
+    /// `reach` is the furthest outside the ring any weight is nonzero — twice the whole-face
+    /// family's largest displacement, and the grown local ramps' own span; the window covers
+    /// it. The ramps start at the face-scaled rules; [`FaceMask::grown`] stretches them to
+    /// the displacement they absorb before any part is written through them.
     fn new(frame: &FaceFrame, field: &LiquifyField, reach: f64) -> Option<FaceMask> {
         let oval = hull(frame.ring(mesh::FACE_OVAL))?;
         let eye_l = hull(frame.ring(mesh::EYE_RING_L));
@@ -595,12 +624,14 @@ impl FaceMask {
         let lip = hull(frame.ring(mesh::LIPS_RING));
         let (min_x, max_x) = oval.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
         let (min_y, max_y) = oval.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
-        // The local clip's outward feather is the furthest a local part is nonzero outside
-        // the ring; the window must also hold the whole-face coupling's longer reach.
+        // The face-scaled rule lengths, with no absolute pixel cap: on a large face a local
+        // row's displacement grows with the face, and a ramp that stays at a fixed pixel
+        // length turns the row's edge into a fold. The floors keep a tiny face from aliasing.
         let inward = (frame.face_w * 0.02).max(2.0);
-        let clip_outward = (frame.face_w * 0.05).clamp(4.0, 40.0);
+        let outward = (frame.face_w * 0.05).max(2.0);
+        let feather = (frame.face_w * 0.07).max(3.0);
         let reach = if reach.is_finite() { reach.max(0.0) } else { 0.0 };
-        let window = clip_outward.max(reach);
+        let window = outward.max(feather).max(reach);
         let (bx, by) = (f64::from(field.bounds.x0) + 0.5, f64::from(field.bounds.y0) + 0.5);
         let node_x = |x: f64| ((x - bx) / field.cell).floor();
         let node_y = |y: f64| ((y - by) / field.cell).floor();
@@ -615,35 +646,88 @@ impl FaceMask {
             w,
             h,
             sdf: vec![0.0; w * h],
-            clip: vec![0.0; w * h],
+            // A missing ring means no eye (or lip) to protect: an infinite distance leaves
+            // its protection at 1 everywhere instead of freezing the outline rows.
+            eye_sdf: vec![f32::INFINITY; w * h],
+            lip_sdf: vec![f32::INFINITY; w * h],
+            clip: vec![1.0; w * h],
             eye: vec![1.0; w * h],
             lip: vec![1.0; w * h],
+            inward,
+            outward,
+            eye_feather: feather,
+            lip_feather: feather,
             min_length: (frame.face_w * 0.04).max(2.0),
         };
         // The rings' whole interiors stay still and the weight ramps to 1 outside them: an
         // eye ring is only a few pixels tall, so a ramp centred on its outline (as the face
-        // clip's is) would leave the pupil partly free to ride the outline sliders. The
-        // ramp is long enough that its steepest slope keeps the around-the-face parts
-        // within the fold guard when every slider is at full.
-        let feather = (frame.face_w * 0.07).clamp(6.0, 32.0);
+        // clip's is) would leave the pupil partly free to ride the outline sliders.
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let p = field.node_pos(i, j);
                 let idx = (j - j0) * w + (i - i0);
-                let sdf = signed_distance(p, &oval);
-                mask.sdf[idx] = sdf as f32;
-                mask.clip[idx] = (1.0 - crate::sculpt::smoothstep(-inward, clip_outward, sdf)).clamp(0.0, 1.0) as f32;
-                let mut eye = 1.0f64;
+                mask.sdf[idx] = signed_distance(p, &oval) as f32;
+                let mut eye = f64::MAX;
                 for ring in [&eye_l, &eye_r].into_iter().flatten() {
-                    eye = eye.min(crate::sculpt::smoothstep(0.0, feather, signed_distance(p, ring)));
+                    eye = eye.min(signed_distance(p, ring));
                 }
-                mask.eye[idx] = eye as f32;
+                if eye != f64::MAX {
+                    mask.eye_sdf[idx] = eye as f32;
+                }
                 if let Some(ring) = &lip {
-                    mask.lip[idx] = crate::sculpt::smoothstep(0.0, feather, signed_distance(p, ring)) as f32;
+                    mask.lip_sdf[idx] = signed_distance(p, ring) as f32;
                 }
             }
         }
+        mask.ramps();
         Some(mask)
+    }
+
+    /// Rebuilds the weight fields from the ramp lengths: the clip falls from 1 at
+    /// `-inward` to 0 at `outward`, and the protections rise from 0 on their ring to 1 at
+    /// their feather.
+    fn ramps(&mut self) {
+        for idx in 0..self.w * self.h {
+            let sdf = f64::from(self.sdf[idx]);
+            self.clip[idx] = (1.0 - crate::sculpt::smoothstep(-self.inward, self.outward, sdf)).clamp(0.0, 1.0) as f32;
+            self.eye[idx] = crate::sculpt::smoothstep(0.0, self.eye_feather, f64::from(self.eye_sdf[idx])) as f32;
+            self.lip[idx] = crate::sculpt::smoothstep(0.0, self.lip_feather, f64::from(self.lip_sdf[idx])) as f32;
+        }
+    }
+
+    /// The largest displacement in `scratch` within `band` of a feature, in document pixels:
+    /// the parts a ramp must absorb just where it fades them.
+    fn absorbed(&self, scratch: &LiquifyField, what: Absorb, len: f64) -> f64 {
+        let mut worst = 0.0f64;
+        for j in self.j0..self.j0 + self.h {
+            for i in self.i0..self.i0 + self.w {
+                let idx = (j - self.j0) * self.w + (i - self.i0);
+                let (s, lo) = match what {
+                    Absorb::Eye => (f64::from(self.eye_sdf[idx]), 0.0),
+                    Absorb::Lip => (f64::from(self.lip_sdf[idx]), 0.0),
+                    Absorb::Oval => (f64::from(self.sdf[idx]), -self.inward),
+                };
+                if s < lo || s > len {
+                    continue;
+                }
+                if let Some(d) = scratch.d.get(j.saturating_mul(scratch.w).saturating_add(i)) {
+                    worst = worst.max(f64::from(d[0].hypot(d[1])));
+                }
+            }
+        }
+        worst
+    }
+
+    /// The ramp for `what`, grown from `rule` until it absorbs the parts' own displacement
+    /// ([`TAPER_ABSORB`]). Two passes settle the band against the grown length; a length
+    /// that only shrinks is kept from pass to pass, so a band that reaches past a part's
+    /// support cannot collapse the ramp under the displacement it just measured.
+    fn grown(&self, scratch: &LiquifyField, what: Absorb, rule: f64) -> f64 {
+        let mut len = rule;
+        for _ in 0..2 {
+            len = len.max(rule.max(TAPER_ABSORB * self.absorbed(scratch, what, len)));
+        }
+        len
     }
 
     /// The weight closure a local part writes through. Outside the window the face clip is 0,
@@ -1199,10 +1283,38 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
         }
     }
     let whole_max = whole.d.iter().fold(0.0f64, |acc, d| acc.max(f64::from(d[0].hypot(d[1]))));
+    // The local rows' displacement, before any clip: the ramps are sized from it. Each
+    // scratch pass writes the parts a ramp must absorb — the parts a protection applies to,
+    // and for the face clip every local part — so the ramp grows past the pull it fades
+    // instead of folding the pixels it should soften.
+    let mut scratch = LiquifyField::new(bounds, cell);
+    let write_parts = |scratch: &mut LiquifyField, keep: &dyn Fn(&str) -> bool| {
+        scratch.d.fill([0.0; 2]);
+        for (part, k, shape) in &asked {
+            if !head_coupled(part.name) && keep(part.name) {
+                write_shape(scratch, shape, scale_of(shape, *k), None);
+            }
+        }
+    };
+    write_parts(&mut scratch, &|_| true);
+    let local_max = scratch.d.iter().fold(0.0f64, |acc, d| acc.max(f64::from(d[0].hypot(d[1]))));
     // The face's own bounds: the local rows are clipped to the FACE_OVAL hull and cannot
     // move the eyes or the mouth (the field used to run to the canvas edge, dragging hair
     // and background with the cheek); the head-coupled rows carry the near head instead.
-    let mask = FaceMask::new(&frame, &field, FACE_COUPLING * whole_max);
+    let mut mask = FaceMask::new(&frame, &field, (FACE_COUPLING * whole_max).max(TAPER_ABSORB * local_max));
+    if let Some(mask) = &mut mask {
+        let face_w = frame.face_w;
+        write_parts(&mut scratch, &|name| protects(name).0);
+        let eye = mask.grown(&scratch, Absorb::Eye, (face_w * 0.07).max(3.0));
+        write_parts(&mut scratch, &|name| protects(name).1);
+        let lip = mask.grown(&scratch, Absorb::Lip, (face_w * 0.07).max(3.0));
+        write_parts(&mut scratch, &|_| true);
+        let outward = mask.grown(&scratch, Absorb::Oval, (face_w * 0.05).max(2.0));
+        mask.outward = outward;
+        mask.eye_feather = eye;
+        mask.lip_feather = lip;
+        mask.ramps();
+    }
     for (part, k, shape) in asked {
         report.applied.push(part.name);
         if head_coupled(part.name) {
@@ -1492,9 +1604,11 @@ mod tests {
     /// whole canvas.
     #[test]
     fn the_face_parts_stop_at_the_face_outline() {
-        // A local row — the jaw here — reshapes the face's own skin through its tight
-        // clip; only the whole-face rows carry the head, so the hair just outside the rim
-        // keeps still while the cheek a few pixels inside shapes.
+        // A local row — the jaw here — reshapes the face's own skin through its clip; only
+        // the whole-face rows carry the head, so the hair outside the rim keeps still while
+        // the cheek a few pixels inside shapes. The ramp is scaled to the row's own pull
+        // (a fixed pixel length folds a larger face), so a sliver survives just past the
+        // rim and is gone within the ramp.
         let (field, _) = build(FaceSliders { jaw: 100.0, ..Default::default() });
         let at = |x: f64, y: f64| {
             let d = field.sample(x, y);
@@ -1503,8 +1617,12 @@ mod tests {
         for (x, y) in [(40.0, 40.0), (480.0, 480.0), (256.0, 470.0), (40.0, 244.0), (470.0, 244.0)] {
             assert!(at(x, y) < 0.5, "outside the face stays still at ({x}, {y}): {}", at(x, y));
         }
-        assert!(at(360.0, 340.0) < 0.5, "the jaw stops at the outline: {}", at(360.0, 340.0));
-        assert!(at(330.0, 340.0) > 1.0, "the cheek inside the face still shapes: {}", at(330.0, 340.0));
+        let cheek = at(330.0, 340.0);
+        assert!(cheek > 1.0, "the cheek inside the face still shapes: {cheek}");
+        let rim = at(360.0, 340.0);
+        assert!(rim < cheek * 0.3, "the jaw's clip fades most of the pull just past the rim (rim {rim:.2}, cheek {cheek:.2})");
+        let beyond = at(380.0, 340.0);
+        assert!(beyond < 0.5, "and it is gone within the ramp, 20 px further out: {beyond}");
     }
 
     /// A local reshape of the face's edge must leave the eyes and the mouth still. The
@@ -1810,6 +1928,90 @@ mod tests {
         let (worst, i, j) = worst;
         let p = field.node_pos(i, j);
         assert!((worst as f64) < CELL, "adjacent nodes step {worst:.2}px past the {CELL}px cell at ({}, {}) — the field folds", p[0], p[1]);
+    }
+
+    /// The canonical face at `s` times its size, on a document that holds it, and the field
+    /// cell that document would use.
+    fn scaled_face(s: f64) -> (FaceAnchors, Rect, f64) {
+        let mut a = face();
+        let c = [256.0, 240.0];
+        for p in &mut a.pts {
+            p[0] = (c[0] + (f64::from(p[0]) - c[0]) * s) as f32;
+            p[1] = (c[1] + (f64::from(p[1]) - c[1]) * s) as f32;
+        }
+        let doc = (512.0 * s) as i32;
+        a.doc = [doc as f32, doc as f32];
+        let cell = if s < 1.5 { CELL } else { 4.0 };
+        let bounds = Rect::new(0, 0, doc, doc);
+        (a, bounds, cell)
+    }
+
+    /// The smallest singular value of the inverse map's Jacobian `I + ∇d` at a point: 1 is
+    /// untouched scale, below 1 is local compression and 0 a fold.
+    fn stretch(field: &LiquifyField, x: f64, y: f64, h: f64) -> f64 {
+        let dx = [(field.sample(x + h, y)[0] - field.sample(x - h, y)[0]) / (2.0 * h), (field.sample(x + h, y)[1] - field.sample(x - h, y)[1]) / (2.0 * h)];
+        let dy = [(field.sample(x, y + h)[0] - field.sample(x, y - h)[0]) / (2.0 * h), (field.sample(x, y + h)[1] - field.sample(x, y - h)[1]) / (2.0 * h)];
+        let (a, b, c, d) = (1.0 + dx[0], dy[0], dx[1], 1.0 + dy[1]);
+        let (e, f, g) = (a * a + c * c, a * b + c * d, b * b + d * d);
+        let disc = (((e - g) * 0.5).powi(2) + f * f).max(0.0).sqrt();
+        (((e + g) * 0.5 - disc).max(0.0)).sqrt()
+    }
+
+    /// A local row's ramp is scaled to the pull it fades, not to a fixed pixel length: on a
+    /// four- and an eight-times larger face the same sliders must keep the map free of a
+    /// fold (a positive smallest stretch everywhere) instead of collapsing the taper into a
+    /// few pixels under a tens-of-pixels displacement. The whole-face rows sit at their own
+    /// deliberate 0.30 floor; a local row must not compress the map below 0.2 anywhere over
+    /// the face at any of these sizes.
+    #[test]
+    fn local_rows_do_not_fold_at_larger_face_sizes() {
+        let combos: &[(&str, FaceSliders)] = &[
+            ("jaw +", FaceSliders { jaw: 100.0, ..Default::default() }),
+            ("jaw -", FaceSliders { jaw: -100.0, ..Default::default() }),
+            ("cheekbones +", FaceSliders { cheekbones: 100.0, ..Default::default() }),
+            ("temples +", FaceSliders { temples: 100.0, ..Default::default() }),
+            ("nose shift +", FaceSliders { nose_shift: 100.0, ..Default::default() }),
+            ("mouth height +", FaceSliders { mouth_height: 100.0, ..Default::default() }),
+            ("eye size -", FaceSliders { eye_size: -100.0, ..Default::default() }),
+            ("face slim +", FaceSliders { face_slim: 100.0, ..Default::default() }),
+        ];
+        for s in [1.0, 4.0, 8.0] {
+            let (anchors, bounds, cell) = scaled_face(s);
+            // `scaled_face` grows the mesh about its centre (256, 240); every landmark's
+            // position is centre + offset × s, not coordinate × s.
+            let (cx, cy, rx, ry) = (256.0, 240.0 + 4.0 * s, 120.0 * s, 148.0 * s);
+            for (name, sliders) in combos {
+                let (field, _) = face_field(&FaceSpec { sliders: *sliders, anchors: anchors.clone() }, bounds, cell);
+                let mut worst = (f64::MAX, [0.0; 2]);
+                for j in 0..25 {
+                    for i in 0..25 {
+                        let p = [cx + rx * (f64::from(i) / 12.0 - 1.0), cy + ry * (f64::from(j) / 12.0 - 1.0)];
+                        let v = stretch(&field, p[0], p[1], cell.max(2.0));
+                        if v < worst.0 {
+                            worst = (v, p);
+                        }
+                    }
+                }
+                assert!(
+                    worst.0 >= 0.2,
+                    "{name} at {s}× compresses the map to {:.3} at ({:.0}, {:.0}): the taper cannot absorb the row's displacement",
+                    worst.0,
+                    worst.1[0],
+                    worst.1[1]
+                );
+            }
+            // The longer ramps must not leak the outline rows into the eyes: the jaw's pull
+            // at an eye centre stays a sliver of its pull on the cheek.
+            let (field, _) = face_field(&FaceSpec { sliders: FaceSliders { jaw: 100.0, ..Default::default() }, anchors: anchors.clone() }, bounds, cell);
+            let mag = |p: [f64; 2]| {
+                let d = field.sample(p[0], p[1]);
+                d[0].hypot(d[1])
+            };
+            let cheek = mag([cx + 74.0 * s, cy + 100.0 * s]);
+            for eye in [[cx + 50.0 * s, cy - 8.0 * s], [cx - 50.0 * s, cy - 8.0 * s]] {
+                assert!(mag(eye) < cheek * 0.05, "the jaw reaches the eye at {s}×: {} against the cheek's {}", mag(eye), cheek);
+            }
+        }
     }
 
     #[test]
