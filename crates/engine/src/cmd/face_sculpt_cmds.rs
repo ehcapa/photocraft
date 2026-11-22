@@ -173,17 +173,25 @@ fn anchors_from_params(p: &Value) -> Result<Option<FaceAnchors>> {
     if anchors.pts.len() != photocraft_algo::face_sculpt::MESH_COUNT || !finite {
         return Err(bad("`anchors` must carry the 478 finite face-mesh points [x, y, z] and the document size"));
     }
+    // The optional hairline curve is the panel's traced boundary: a stored or scripted one
+    // must be a real curve, or the field would sample garbage. Absent is valid (the row's
+    // landmark fallback); present but malformed is refused like the mesh itself.
+    if let Some(curve) = &anchors.hairline
+        && (!(2..=128).contains(&curve.len()) || curve.iter().flatten().any(|v| !v.is_finite()))
+    {
+        return Err(bad("`anchors.hairline`, when present, must be 2..128 finite [x, y] document points"));
+    }
     Ok(Some(anchors))
 }
 
-/// The mesh anchors of an analysis: the 478 points as `x, y` document pixels. `None` when
-/// the mesh stage never answered (no face found).
-pub(crate) fn anchors_from_analysis(a: &photocraft_portrait::Analysis) -> Option<FaceAnchors> {
+/// The mesh anchors of an analysis: the 478 points as `x, y` document pixels, plus the
+/// optional traced hairline. `None` when the mesh stage never answered (no face found).
+pub(crate) fn anchors_from_analysis(a: &photocraft_portrait::Analysis, hairline: Option<Vec<[f32; 2]>>) -> Option<FaceAnchors> {
     if a.landmarks.len() != photocraft_algo::face_sculpt::MESH_COUNT {
         return None;
     }
     let pts = a.landmarks.iter().map(|q| [q[0], q[1], q[2]]).collect();
-    Some(FaceAnchors { doc: [a.width as f32, a.height as f32], pts })
+    Some(FaceAnchors { doc: [a.width as f32, a.height as f32], pts, hairline })
 }
 
 /// One 3D塑颜 angle: the slider's ±100 maps to ±8° (yaw, pitch) or ±6° (roll) — the
@@ -313,6 +321,8 @@ fn warped_point(field: &LiquifyField, p: [f64; 2]) -> [f32; 2] {
 }
 
 /// `anchors` at `field`'s destination: what the panel should carry into the next preview.
+/// The traced hairline rides the same warp as the mesh, so the next preview's band follows
+/// where the pixels put the boundary rather than where it started.
 fn warped_anchors(field: &LiquifyField, anchors: &FaceAnchors) -> FaceAnchors {
     FaceAnchors {
         doc: anchors.doc,
@@ -324,17 +334,19 @@ fn warped_anchors(field: &LiquifyField, anchors: &FaceAnchors) -> FaceAnchors {
                 [w[0], w[1], p[2]]
             })
             .collect(),
+        hairline: anchors.hairline.as_ref().map(|curve| curve.iter().map(|p| warped_point(field, [f64::from(p[0]), f64::from(p[1])])).collect()),
     }
 }
 
 /// The one lightweight analysis a run without anchors needs: SCRFD's box when a detector
-/// model is placed, the FaceMesh landmarks either way, no parsing. A detected box needs no
-/// person stage; the no-detector fallback asks the subject line only for presence.
-fn lightweight(s: &Session, all_layers: bool) -> Result<std::sync::Arc<photocraft_portrait::Analysis>> {
+/// model is placed, the FaceMesh landmarks either way, and the face parser's hairline trace
+/// when its model is. A detected box needs no person stage; the no-detector fallback asks
+/// the subject line only for presence.
+fn lightweight(s: &Session, all_layers: bool) -> Result<crate::portrait_cmds::SculptAnalysis> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let target = d.active_layer.filter(|l| !all_layers && d.doc.layer(*l).and_then(photocraft_doc::Layer::surface).is_some());
     let ctx = crate::jobs::JobCtx::new();
-    crate::portrait_cmds::analyze_sculpt(&d.doc, target, all_layers, crate::portrait_cmds::SculptKind::Face, None, &ctx).map(|found| found.analysis)
+    crate::portrait_cmds::analyze_sculpt(&d.doc, target, all_layers, crate::portrait_cmds::SculptKind::Face, None, &ctx)
 }
 
 fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
@@ -358,8 +370,8 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     let anchors = match anchors_from_params(p)? {
         Some(anchors) => anchors,
         None => {
-            let analysis = lightweight(s, all_layers)?;
-            anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other(NO_FACE.into()))?
+            let found = lightweight(s, all_layers)?;
+            anchors_from_analysis(&found.analysis, found.hairline).ok_or_else(|| EngineError::Other(NO_FACE.into()))?
         }
     };
     let (field, report) =
@@ -469,7 +481,7 @@ mod tests {
         for &(i, x, y) in &[(10usize, 256.0, 96.0), (152, 256.0, 392.0), (454, 376.0, 248.0), (234, 136.0, 248.0)] {
             pts[i] = [x as f32, y as f32, 0.0];
         }
-        FaceAnchors { doc: [512.0, 512.0], pts }
+        FaceAnchors { doc: [512.0, 512.0], pts, hairline: None }
     }
 
     /// The same four named points on a full canonical mesh: the FACE_OVAL, eye and lip rings
@@ -491,7 +503,7 @@ mod tests {
         for &(i, x, y) in &[(10usize, 256.0f32, 96.0f32), (152, 256.0, 392.0), (454, 376.0, 248.0), (234, 136.0, 248.0)] {
             pts[i] = [x, y, 0.0];
         }
-        FaceAnchors { doc: [512.0, 512.0], pts }
+        FaceAnchors { doc: [512.0, 512.0], pts, hairline: None }
     }
 
     fn pixels(s: &Session, w: i32, h: i32) -> Vec<f32> {
@@ -580,6 +592,72 @@ mod tests {
         assert!(to_old > to_reply, "the old place {p0:?} is closer to the warped dot than the reply's: {to_old} vs {to_reply}");
     }
 
+    /// A traced hairline rides the params into the field, and Apply's reply carries it where
+    /// the warp put it — the panel's next preview band follows the line the pixels now show.
+    #[test]
+    fn the_reply_moves_the_traced_hairline_with_the_pixels() {
+        let mut anchors = full_face();
+        let curve: Vec<[f32; 2]> = (0..33)
+            .map(|k| {
+                let x = 150.0 + 212.0 * k as f32 / 32.0;
+                let s = (x - 256.0) / 106.0;
+                [x, 120.0 + 50.0 * s * s]
+            })
+            .collect();
+        anchors.hairline = Some(curve.clone());
+        let mut s = patterned(512, 512);
+        let r = s.execute(FACE_SCULPT, json!({"hairline": 100.0, "anchors": serde_json::to_value(&anchors).unwrap()})).unwrap();
+        assert_eq!(r["changed"], json!(true));
+        let moved: FaceAnchors = serde_json::from_value(r["anchors"].clone()).unwrap();
+        let out = moved.hairline.expect("the reply keeps the traced curve");
+        assert_eq!(out.len(), curve.len());
+        let mid = curve.len() / 2;
+        assert!(out[mid][1] < curve[mid][1] - 5.0, "the line's middle rose: {} -> {}", curve[mid][1], out[mid][1]);
+        assert!((out[mid][0] - curve[mid][0]).abs() < 1.5, "the line rises along the face's own axis: {} -> {}", curve[mid][0], out[mid][0]);
+        let side = 3;
+        assert!(out[side][1] < curve[side][1], "the traced side rides the warp too: {} -> {}", curve[side][1], out[side][1]);
+        // And the same params rebuild the same curved field on replay.
+        let bounds = Rect::new(0, 0, 512, 512);
+        let params = json!({"hairline": 100.0, "anchors": serde_json::to_value(&anchors).unwrap(), "meshSize": 4});
+        let (spec, cell) = stored_spec(&params, bounds).unwrap();
+        assert_eq!(spec.anchors, anchors, "the traced curve survives the params round-trip");
+        let f1 = face_field(&spec, bounds, cell).0;
+        assert!(!f1.is_identity());
+        assert_eq!(f1, field_for(&params, bounds).unwrap().0, "the replay and the preview must build the same curved field");
+    }
+
+    /// Filters stored before the hairline trace existed carry only `doc` and `pts`, and
+    /// scripts may too: absent is the landmark band, which applies and is reported as the
+    /// estimate it is.
+    #[test]
+    fn anchors_stored_without_a_hairline_still_apply() {
+        let a = anchors_on();
+        let old = json!({"doc": a.doc, "pts": a.pts});
+        let mut s = patterned(512, 512);
+        let before = pixels(&s, 512, 512);
+        let r = s.execute(FACE_SCULPT, json!({"hairline": 50.0, "anchors": old})).unwrap();
+        assert_eq!(r["changed"], json!(true));
+        assert_ne!(before, pixels(&s, 512, 512), "the fallback band must move pixels");
+        let approx = r["parts"]["approximate"].as_array().cloned().unwrap_or_default();
+        assert!(approx.iter().any(|v| v["part"] == "hairline"), "the landmark fallback is reported approximate: {r}");
+    }
+
+    /// A hairline that is not a curve is refused by name, like a short mesh: nothing is
+    /// warped from garbage, and the document keeps its history.
+    #[test]
+    fn a_malformed_hairline_is_refused() {
+        let mut s = patterned(64, 64);
+        let steps = s.active().unwrap().history.past_len();
+        let mut anchors = serde_json::to_value(anchors_on()).unwrap();
+        anchors["hairline"] = json!([[256.0, 100.0]]);
+        let err = s.execute(FACE_SCULPT, json!({"hairline": 30.0, "anchors": anchors.clone()})).unwrap_err().to_string();
+        assert!(err.contains("hairline"), "{err}");
+        anchors["hairline"] = json!(vec![[256.0f32, 100.0]; 200]);
+        let err = s.execute(FACE_SCULPT, json!({"hairline": 30.0, "anchors": anchors})).unwrap_err().to_string();
+        assert!(err.contains("hairline"), "{err}");
+        assert_eq!(s.active().unwrap().history.past_len(), steps, "a refused run edits nothing");
+    }
+
     #[test]
     fn malformed_anchors_are_refused_not_analysed() {
         let mut s = patterned(64, 64);
@@ -645,16 +723,38 @@ mod tests {
                 photocraft_io::import_file(&name, std::path::Path::new(&photo), &photocraft_io::ImportOptions::default(), &photocraft_raster::Interrupt::NONE)
                     .map_err(|e| EngineError::Other(format!("import: {e}")))?;
             s.open_document(imported.document, None);
-            let (canvas, analysis, layer) = {
+            let (canvas, analysis, hairline, layer) = {
                 let d = s.active().ok_or(EngineError::NoDocument)?;
                 let target = d.active_layer.filter(|l| d.doc.layer(*l).and_then(photocraft_doc::Layer::surface).is_some());
                 let ctx = crate::jobs::JobCtx::new();
-                let analysis = crate::portrait_cmds::analyze_person(&d.doc, target, false, None, &ctx)?;
+                // The production path: the lightweight analysis, hairline trace included.
+                let found = crate::portrait_cmds::analyze_sculpt(&d.doc, target, false, crate::portrait_cmds::SculptKind::Face, None, &ctx)?;
                 let layer =
                     target.and_then(|l| d.doc.layer(l)).and_then(|l| l.surface()).cloned().ok_or_else(|| EngineError::Other("no pixel layer".into()))?;
-                (d.doc.bounds(), analysis, layer)
+                (d.doc.bounds(), found.analysis, found.hairline, layer)
             };
-            let anchors = anchors_from_analysis(&analysis).ok_or_else(|| EngineError::Other("no face mesh in the photo".into()))?;
+            let face_w = (analysis.landmarks[454][0] - analysis.landmarks[234][0]).abs();
+            let face_h = (analysis.landmarks[152][1] - analysis.landmarks[10][1]).abs();
+            eprintln!(
+                "document {}x{}, face {face_w:.0}x{face_h:.0}, forehead top y {:.0}, brow mid y {:.0}",
+                analysis.width,
+                analysis.height,
+                analysis.landmarks[10][1],
+                (analysis.landmarks[334][1] + analysis.landmarks[105][1]) * 0.5,
+            );
+            match &hairline {
+                Some(c) => eprintln!(
+                    "hairline: {} points, x {:.0}..{:.0} (span {:.2} of the face width), y {:.0}..{:.0}",
+                    c.len(),
+                    c.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min),
+                    c.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max),
+                    (c.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max) - c.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min)) / face_w.max(1.0),
+                    c.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min),
+                    c.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max),
+                ),
+                None => eprintln!("hairline: no trace (no face-parsing model, or no forehead skin)"),
+            }
+            let anchors = anchors_from_analysis(&analysis, hairline).ok_or_else(|| EngineError::Other("no face mesh in the photo".into()))?;
             let cell = auto_cell(canvas);
             let one = |name: &str, v: f32| {
                 eprintln!(

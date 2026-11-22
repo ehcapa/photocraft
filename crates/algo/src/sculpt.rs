@@ -534,6 +534,14 @@ pub(crate) enum Shape {
     /// plateau-plus-feather like a ramp's (the core rides whole), longitudinally the
     /// smoothstep window over `band`. The inverse-map displacement points against `dir`.
     Shift { a: [f64; 2], b: [f64; 2], dir: [f64; 2], band: (f64, f64), width: f64, gain: f64 },
+    /// Translate a band that follows a curve: `pts` is the boundary in document pixels,
+    /// `dir` the ride direction, `above`/`below` the distances at which the displacement
+    /// has fully faded on either side of the curve, and `end_fade` the lateral fade at the
+    /// curve's ends. `delta` is the full-slider displacement in pixels (scaled by `k` when
+    /// written). The inverse-map displacement points against `dir`. The straight `Shift`
+    /// cannot follow a hairline that dips at the temples; this one spends its strength on
+    /// the line itself instead of a rectangle around a landmark.
+    ShiftCurve { pts: Vec<[f64; 2]>, dir: [f64; 2], above: f64, below: f64, end_fade: f64, delta: f64 },
 }
 
 /// One row of the parts table: the report name, the slider it answers to, the joints that
@@ -884,13 +892,13 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
         let k = match &shape {
             Shape::Contract { .. } | Shape::Radial { .. } | Shape::Profile { .. } => k * shape_scale,
             Shape::Ramp { .. } => k * ramp_scale,
-            Shape::Shift { .. } => k,
+            Shape::Shift { .. } | Shape::ShiftCurve { .. } => k,
         };
         if let Some(why) = approximate {
             report.approximate.push((part.name, why));
         }
         match shape {
-            Shape::Ramp { .. } | Shape::Shift { .. } => write_shape(&mut field, &shape, k, None),
+            Shape::Ramp { .. } | Shape::Shift { .. } | Shape::ShiftCurve { .. } => write_shape(&mut field, &shape, k, None),
             _ => write_shape(&mut shaping, &shape, k, None),
         }
         report.applied.push(part.name);
@@ -1067,6 +1075,7 @@ pub(crate) fn write_shape(field: &mut LiquifyField, shape: &Shape, k: f64, weigh
         Shape::Radial { c, radius, gain } => write_radial(&mut write, c, radius, gain, k),
         Shape::Ramp { a, b, band, width, gain } => write_ramp(&mut write, a, b, band, width, gain, k),
         Shape::Shift { a, b, dir, band, width, gain } => write_shift(&mut write, a, b, dir, band, width, gain * k),
+        Shape::ShiftCurve { ref pts, dir, above, below, end_fade, delta } => write_shift_curve(&mut write, pts, dir, above, below, end_fade, delta * k),
     }
 }
 
@@ -1313,6 +1322,94 @@ fn write_shift(write: &mut Write<'_, '_>, a: [f64; 2], b: [f64; 2], dir: [f64; 2
                 continue;
             }
             let lat = 1.0 - smoothstep(0.6, 1.0, rho / width);
+            let mag = delta * long * lat * w;
+            let idx = j * field.w + i;
+            field.d[idx][0] -= (dir[0] * mag) as f32;
+            field.d[idx][1] -= (dir[1] * mag) as f32;
+        }
+    }
+}
+
+/// A curve-following band translate ([`Shape::ShiftCurve`]): the same plateau-plus-feather
+/// as [`write_shift`], but the band's centre is the curve itself. For a node, the curve
+/// gives a height at the node's lateral station `s`; the longitudinal window is measured
+/// from that height, so the band rises and dips with the visible boundary instead of
+/// staying level. The ends feather over `end_fade`, so the band dissolves at the temples.
+fn write_shift_curve(write: &mut Write<'_, '_>, pts: &[[f64; 2]], dir: [f64; 2], above: f64, below: f64, end_fade: f64, delta: f64) {
+    let weight = write.weight;
+    let field = &mut *write.field;
+    let dir_len = norm(dir);
+    if pts.len() < 2
+        || !dir_len.is_finite()
+        || dir_len <= 1e-9
+        || !above.is_finite()
+        || !below.is_finite()
+        || above <= 0.0
+        || below <= 0.0
+        || !delta.is_finite()
+    {
+        return;
+    }
+    if pts.iter().flatten().any(|v| !v.is_finite()) {
+        return;
+    }
+    let dir = scale(dir, 1.0 / dir_len);
+    let left = [-dir[1], dir[0]];
+    let Some(origin) = pts.first().copied() else { return };
+    let mut su: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|p| {
+            let d = sub(*p, origin);
+            (dot(d, left), dot(d, dir))
+        })
+        .collect();
+    su.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Near-duplicate lateral stations would divide by zero in the interpolation.
+    su.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
+    let (Some(&(s0, _)), Some(&(s1, _))) = (su.first(), su.last()) else { return };
+    let span_s = s1 - s0;
+    if span_s < 4.0 {
+        return;
+    }
+    let end_fade = if end_fade.is_finite() { end_fade.clamp(0.5, span_s * 0.5) } else { span_s * 0.08 };
+    let (core_up, core_down) = (above * 0.25, below * 0.25);
+    let margin = above.max(below) + 2.0;
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in pts {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    let Some((i0, j0, i1, j1)) = span(field, x0 - margin, y0 - margin, x1 + margin, y1 + margin) else { return };
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let w = weight_at(weight, i, j);
+            if w <= 0.0 {
+                continue;
+            }
+            let p = field.node_pos(i, j);
+            let d = sub(p, origin);
+            let s = dot(d, left);
+            if !(s > s0 && s < s1) {
+                continue;
+            }
+            // The curve's height at this station, linear between its neighbours. The
+            // strict bounds above keep both neighbours in the table.
+            let k = su.partition_point(|&(sk, _)| sk <= s);
+            let (Some(&(sa, ua)), Some(&(sb, ub))) = (k.checked_sub(1).and_then(|i| su.get(i)), su.get(k)) else {
+                continue;
+            };
+            let t = if (sb - sa).abs() < 1e-9 { 0.0 } else { ((s - sa) / (sb - sa)).clamp(0.0, 1.0) };
+            let du = dot(d, dir) - (ua + (ub - ua) * t);
+            let long = if du >= 0.0 { 1.0 - smoothstep(core_up, above, du) } else { smoothstep(-below, -core_down, du) };
+            if long <= 0.0 {
+                continue;
+            }
+            let lat = smoothstep(s0, s0 + end_fade, s) * (1.0 - smoothstep(s1 - end_fade, s1, s));
+            if lat <= 0.0 {
+                continue;
+            }
             let mag = delta * long * lat * w;
             let idx = j * field.w + i;
             field.d[idx][0] -= (dir[0] * mag) as f32;

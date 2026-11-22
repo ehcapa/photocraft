@@ -231,6 +231,13 @@ pub struct FaceAnchors {
     /// The 478 mesh points as `x, y, z` document pixels — z is FaceMesh's own depth,
     /// kept because 3D塑颜's rotation reads it; everything else ignores it.
     pub pts: Vec<[f32; 3]>,
+    /// The visible forehead–hair boundary, left to right in document pixels: what
+    /// `portrait.analyze` traced from the face parser's skin plane when the optional model
+    /// was present. Absent on installs without the model and in filters stored before the
+    /// trace existed; the Hairline row then falls back to the landmark band and reports
+    /// itself approximate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hairline: Option<Vec<[f32; 2]>>,
 }
 
 /// The sliders plus the anchors they shape.
@@ -387,6 +394,9 @@ struct FaceFrame {
     face_c: [f64; 2],
     face_w: f64,
     face_h: f64,
+    /// The traced visible hairline, when the anchors carry one; `None` selects the
+    /// landmark band and an approximate report.
+    hairline: Option<Vec<[f64; 2]>>,
 }
 
 #[inline]
@@ -408,10 +418,21 @@ impl FaceFrame {
     /// `None` when the mesh is absent or degenerate (FaceMesh's no-face fallback parks
     /// every point at the image centre, which this catches by the face's width).
     fn new(a: &FaceAnchors) -> Option<FaceFrame> {
-        if a.pts.len() != MESH_COUNT || !a.doc.iter().all(|v| v.is_finite()) || a.pts.iter().flatten().any(|v| !v.is_finite()) {
+        if !a.doc.iter().all(|v| v.is_finite()) {
             return None;
         }
-        let p: Vec<[f64; 2]> = a.pts.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
+        let mut frame = FaceFrame::from_points(&a.pts)?;
+        frame.hairline = a.hairline.as_deref().and_then(|c| frame.checked_hairline(c));
+        Some(frame)
+    }
+
+    /// The frame from mesh points alone: shared by the stored anchors and the analysis'
+    /// trace, which runs before any `FaceAnchors` exists.
+    fn from_points(pts: &[[f32; 3]]) -> Option<FaceFrame> {
+        if pts.len() != MESH_COUNT || pts.iter().flatten().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let p: Vec<[f64; 2]> = pts.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
         let at = |i: usize| p[i];
         let face_w = at(mesh::FACE_SIDE_L)[0] - at(mesh::FACE_SIDE_R)[0];
         if face_w < 8.0 {
@@ -419,7 +440,60 @@ impl FaceFrame {
         }
         let face_h = at(mesh::FOREHEAD_TOP)[1] - at(mesh::CHIN)[1];
         let face_c = [(at(mesh::FACE_SIDE_L)[0] + at(mesh::FACE_SIDE_R)[0]) * 0.5, (at(mesh::FOREHEAD_TOP)[1] + at(mesh::CHIN)[1]) * 0.5];
-        Some(FaceFrame { p, face_c, face_w: face_w.abs(), face_h: face_h.abs() })
+        Some(FaceFrame { p, face_c, face_w: face_w.abs(), face_h: face_h.abs(), hairline: None })
+    }
+
+    /// A stored hairline curve, when it is a usable one: finite points, a bounded count,
+    /// and a span wide enough to be a forehead rather than a speck. Anything else is
+    /// treated as absent, so a malformed stored filter falls back instead of warping.
+    fn checked_hairline(&self, c: &[[f32; 2]]) -> Option<Vec<[f64; 2]>> {
+        if !(2..=128).contains(&c.len()) || c.iter().flatten().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let pts: Vec<[f64; 2]> = c.iter().map(|q| [f64::from(q[0]), f64::from(q[1])]).collect();
+        (self.lateral_span(&pts) >= self.face_w * 0.2).then_some(pts)
+    }
+
+    fn hairline(&self) -> Option<&[[f64; 2]]> {
+        self.hairline.as_deref()
+    }
+
+    /// How wide a curve is along the face's left–right axis.
+    fn lateral_span(&self, curve: &[[f64; 2]]) -> f64 {
+        let left = self.left();
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in curve {
+            let s = p[0] * left[0] + p[1] * left[1];
+            lo = lo.min(s);
+            hi = hi.max(s);
+        }
+        if lo.is_finite() && hi.is_finite() { (hi - lo).max(0.0) } else { 0.0 }
+    }
+
+    /// The smallest downward distance from the curve to the brow line, along the face's
+    /// own up axis. The Hairline row's lower fade is capped by it so the band cannot drag
+    /// the brows; the curve's ends beyond the brow segment take its nearest end's height.
+    fn brow_drop(&self, curve: &[[f64; 2]]) -> f64 {
+        let Some(o) = curve.first().copied() else { return 0.0 };
+        let up = self.up();
+        let left = [-up[1], up[0]];
+        let proj = |p: [f64; 2]| {
+            let d = [p[0] - o[0], p[1] - o[1]];
+            (d[0] * left[0] + d[1] * left[1], d[0] * up[0] + d[1] * up[1])
+        };
+        let (mut s0, mut u0) = proj(self.pt(mesh::BROW_MID_R));
+        let (mut s1, mut u1) = proj(self.pt(mesh::BROW_MID_L));
+        if s0 > s1 {
+            std::mem::swap(&mut s0, &mut s1);
+            std::mem::swap(&mut u0, &mut u1);
+        }
+        let mut min_drop = f64::INFINITY;
+        for q in curve {
+            let (s, u) = proj(*q);
+            let t = if (s1 - s0).abs() < 1e-9 { 0.0 } else { ((s - s0) / (s1 - s0)).clamp(0.0, 1.0) };
+            min_drop = min_drop.min(u - (u0 + (u1 - u0) * t));
+        }
+        if min_drop.is_finite() { min_drop.max(0.0) } else { 0.0 }
     }
 
     fn pt(&self, i: usize) -> [f64; 2] {
@@ -498,6 +572,131 @@ impl FaceFrame {
     fn mouth_w(&self) -> f64 {
         (self.pt(mesh::MOUTH_CORNER_L)[0] - self.pt(mesh::MOUTH_CORNER_R)[0]).abs().max(6.0)
     }
+}
+
+/// The visible hairline traced from a face-parsing skin plane: for each of 65 columns
+/// across the forehead (between the temples), the top of the skin run that reaches the
+/// brow line. `skin` is the parser's class-1 probability over `area` (row-major `w × h`,
+/// document pixels); `pts` is the FaceMesh. The answer is 33 points left to right in
+/// document pixels, or `None` when the plane carries no forehead skin to follow (no model,
+/// bangs down to the brows, a turned-away face).
+///
+/// Starting at the brow and walking *up* the skin run is what rejects a skin-coloured
+/// patch in the hair: that patch is not connected to the forehead, so a column's run ends
+/// below it. A median pass then smooths the fringe's own flecks.
+pub fn trace_hairline(skin: &[f32], w: usize, h: usize, area: Rect, pts: &[[f32; 3]]) -> Option<Vec<[f32; 2]>> {
+    const COLUMNS: usize = 65;
+    const KEEP: usize = 33;
+    let frame = FaceFrame::from_points(pts)?;
+    let len = w.checked_mul(h)?;
+    let (aw, ah) = (area.width(), area.height());
+    if w == 0 || h == 0 || skin.len() != len || aw < 8 || ah < 8 {
+        return None;
+    }
+    let (ax0, ay0) = (f64::from(area.x0), f64::from(area.y0));
+    let to_col = |x: f64| -> Option<usize> {
+        let i = ((x - ax0) / f64::from(aw) * w as f64).floor();
+        (i >= 0.0 && i < w as f64).then_some(i as usize)
+    };
+    let to_row = |y: f64| -> Option<usize> {
+        let j = ((y - ay0) / f64::from(ah) * h as f64).floor();
+        (j >= 0.0 && j < h as f64).then_some(j as usize)
+    };
+    let skin_at = |i: usize, j: usize| skin.get(j * w + i).copied().unwrap_or(0.0);
+    let (bl, br) = (frame.pt(mesh::BROW_MID_L), frame.pt(mesh::BROW_MID_R));
+    let (bx0, bx1, by0, by1) = if bl[0] <= br[0] { (bl[0], br[0], bl[1], br[1]) } else { (br[0], bl[0], br[1], bl[1]) };
+    let brow_y = |x: f64| -> f64 {
+        let span = bx1 - bx0;
+        if span.abs() < 1e-9 {
+            return (by0 + by1) * 0.5;
+        }
+        by0 + (by1 - by0) * ((x - bx0) / span).clamp(0.0, 1.0)
+    };
+    let centre = frame.mid(mesh::FACE_SIDE_R, mesh::FACE_SIDE_L);
+    let left = frame.left();
+    let half = frame.face_w * 0.44;
+    let min_run = (frame.face_h * 0.02).max(2.0);
+    let brow_margin = frame.face_h * 0.005;
+    let search = (((frame.face_h * 0.03).max(1.0)) / f64::from(ah) * h as f64).ceil().max(1.0) as usize;
+    let mut found: Vec<[f64; 2]> = Vec::with_capacity(COLUMNS);
+    for k in 0..COLUMNS {
+        let s = -half + 2.0 * half * k as f64 / (COLUMNS - 1) as f64;
+        let x = centre[0] + left[0] * s;
+        let Some(col) = to_col(x) else { continue };
+        let y_brow = brow_y(x);
+        let Some(j_brow) = to_row(y_brow) else { continue };
+        // Find skin near the brow first (the forehead run's bottom), searching a small
+        // band so an eyebrow drawn as non-skin does not hide the run above it.
+        let mut start = None;
+        for d in 0..=search {
+            if let Some(j) = j_brow.checked_sub(d).filter(|j| skin_at(col, *j) > 0.5) {
+                start = Some(j);
+                break;
+            }
+            if let Some(j) = j_brow.checked_add(d).filter(|j| *j < h && skin_at(col, *j) > 0.5) {
+                start = Some(j);
+                break;
+            }
+        }
+        let Some(start) = start else { continue };
+        // The top of that run: walk up while skin continues; the boundary lies between
+        // the first non-skin row and the last skin row.
+        let mut top = start;
+        while top > 0 && skin_at(col, top - 1) > 0.5 {
+            top -= 1;
+        }
+        if top == 0 {
+            continue; // the run reaches the crop's top: no boundary in view
+        }
+        let y_top = ay0 + (top as f64 + 1.0) * f64::from(ah) / h as f64;
+        let run = y_brow - y_top;
+        if run < min_run || y_top > y_brow - brow_margin {
+            continue;
+        }
+        found.push([x, y_top]);
+    }
+    // Columns run along the face's left axis, which a mirrored mesh can put image-left;
+    // the stored curve and its interpolation are in document x order.
+    found.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    if found.len() < COLUMNS / 3 {
+        return None;
+    }
+    let first = *found.first()?;
+    let last = *found.last()?;
+    if last[0] - first[0] < frame.face_w * 0.3 {
+        return None;
+    }
+    // A 5-point median smooths the fringe's flecks; then resample evenly for a compact
+    // stored curve, interpolating across columns the trace could not read.
+    let xs: Vec<f64> = found.iter().map(|p| p[0]).collect();
+    let raw: Vec<f64> = found.iter().map(|p| p[1]).collect();
+    let mut ys = raw.clone();
+    for i in 0..ys.len() {
+        let lo = i.saturating_sub(2);
+        let hi = (i + 2).min(ys.len() - 1);
+        let mut win = raw.get(lo..=hi)?.to_vec();
+        win.sort_by(f64::total_cmp);
+        ys[i] = win.get(win.len() / 2).copied().unwrap_or(raw[i]);
+    }
+    let mut out: Vec<[f32; 2]> = Vec::with_capacity(KEEP);
+    for k in 0..KEEP {
+        let x = first[0] + (last[0] - first[0]) * k as f64 / (KEEP - 1) as f64;
+        let at = xs.partition_point(|v| *v <= x);
+        let y = if at == 0 {
+            *ys.first()?
+        } else if at >= xs.len() {
+            *ys.last()?
+        } else {
+            let (xa, ya, xb, yb) = (*xs.get(at - 1)?, *ys.get(at - 1)?, *xs.get(at)?, *ys.get(at)?);
+            let t = if (xb - xa).abs() < 1e-9 { 0.0 } else { ((x - xa) / (xb - xa)).clamp(0.0, 1.0) };
+            ya + (yb - ya) * t
+        };
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        out.push([x as f32, y as f32]);
+    }
+    Some(out)
 }
 
 /// A convex hull (monotone chain, counter-clockwise) of a landmark ring. The rings are
@@ -826,6 +1025,18 @@ struct FacePart {
     shape: fn(&FaceFrame) -> Option<Shape>,
 }
 
+/// The straight hairline band's ride: 0.09 of its 0.41·face_h axis. The traced band keeps
+/// the same full-slider travel, so the slider's strength and the presets do not change.
+const HAIRLINE_RIDE: f64 = 0.09 * 0.41;
+
+/// Why the Hairline row is approximate when no traced curve rides the anchors.
+const HAIRLINE_ESTIMATE_REASON: &str = "no face-parsing model traced the visible hairline; the landmark band is an estimate";
+
+/// Why a traced curve that covers only the middle of the forehead is still partial: the
+/// parser saw no forehead skin at the ends (hair falls over the temples), so the row cannot
+/// follow the line there and fades out instead.
+const HAIRLINE_PARTIAL_REASON: &str = "the visible hairline was traced only across the middle of the forehead; its ends fade out";
+
 /// The parts. Table order = build order (determinism, as the body table's).
 const FACE_PARTS: &[FacePart] = &[
     // ---------- the outline ----------
@@ -890,15 +1101,33 @@ const FACE_PARTS: &[FacePart] = &[
         slider: |s| s.face_width,
         shape: |f| f.contract_v(f.pt(mesh::FOREHEAD_TOP), f.pt(mesh::CHIN), (0.05, 0.95), f.face_w * 0.70, -0.24),
     },
-    // The band is centred on the hairline itself: its axis starts above the line, in the
-    // hair, and ends short of the brows, so the landmark sits in the plateau. The old band
-    // started at the landmark and ran down past the brows, which by the time it reached the
-    // middle of its window was moving the eyebrows and leaving the hairline where it was.
+    // The visible hairline when the analysis traced one: the band follows the curve, full
+    // strength on the line, fading into the hair above and stopping well short of the
+    // brows below. The landmark band is the fallback — it cannot know that the real line
+    // dips at the temples or rises with the fringe, so it moves a rectangle of hair and
+    // upper forehead instead; the report marks it approximate.
     FacePart {
         name: "hairline",
         slider: |s| s.hairline,
-        shape: |f| {
-            f.shift_band(f.along_down(mesh::FOREHEAD_TOP, -0.25), f.along_down(mesh::FOREHEAD_TOP, 0.16), v(f.up(), 1.0), (0.0, 1.0), f.face_w * 0.55, 0.09)
+        shape: |f| match f.hairline() {
+            Some(curve) => {
+                let drop = f.brow_drop(curve);
+                Some(Shape::ShiftCurve {
+                    pts: curve.to_vec(),
+                    dir: v(f.up(), 1.0),
+                    above: f.face_h * 0.20,
+                    below: (f.face_h * 0.06).min(drop * 0.45).max(1.0),
+                    end_fade: f.lateral_span(curve) * 0.08,
+                    delta: f.face_h * HAIRLINE_RIDE,
+                })
+            }
+            // The old band started at the landmark and ran down past the brows, which by
+            // the time it reached the middle of its window was moving the eyebrows and
+            // leaving the hairline where it was. This one starts above the landmark and
+            // ends short of the brows, so the landmark sits in the plateau.
+            None => {
+                f.shift_band(f.along_down(mesh::FOREHEAD_TOP, -0.25), f.along_down(mesh::FOREHEAD_TOP, 0.16), v(f.up(), 1.0), (0.0, 1.0), f.face_w * 0.55, 0.09)
+            }
         },
     },
     FacePart {
@@ -1260,6 +1489,7 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
         .iter()
         .map(|&(_, k, ref s)| match s {
             Shape::Ramp { a, b, gain, .. } | Shape::Shift { a, b, gain, .. } => gain.abs() * k.abs() * len_of(down(*b, *a)),
+            Shape::ShiftCurve { delta, .. } => delta.abs() * k.abs(),
             _ => 0.0,
         })
         .sum();
@@ -1269,8 +1499,18 @@ pub fn face_field(spec: &FaceSpec, bounds: Rect, cell: f64) -> (LiquifyField, Fa
     );
     let scale_of = |shape: &Shape, k: f64| match shape {
         Shape::Contract { .. } | Shape::Profile { .. } | Shape::Radial { .. } => k * c_scale,
-        Shape::Ramp { .. } | Shape::Shift { .. } => k * r_scale,
+        Shape::Ramp { .. } | Shape::Shift { .. } | Shape::ShiftCurve { .. } => k * r_scale,
     };
+    // The row's subject is the visible forehead–hair boundary; without the traced curve
+    // its landmark band is only an estimate, and a curve that ends where the hair covers
+    // the temples covers only the middle. The reply must not present either as exact.
+    if asked.iter().any(|(part, ..)| part.name == "hairline") {
+        match frame.hairline() {
+            None => report.approximate.push(("hairline", HAIRLINE_ESTIMATE_REASON)),
+            Some(curve) if frame.lateral_span(curve) < frame.face_w * 0.6 => report.approximate.push(("hairline", HAIRLINE_PARTIAL_REASON)),
+            Some(_) => {}
+        }
+    }
     // The head-coupled rows are shaped as one family in their own field: their participation
     // weight decays over a length set by the family's largest displacement, and the mask's
     // window must reach as far as that weight does. The mask is built after them, then every
@@ -1429,7 +1669,7 @@ mod tests {
         set(mesh::UPPER_LIP_LOW, 256.0, 338.0);
         set(mesh::LOWER_LIP_TOP, 256.0, 348.0);
         set(mesh::LOWER_LIP_LOW, 256.0, 356.0);
-        FaceAnchors { doc: [512.0, 512.0], pts }
+        FaceAnchors { doc: [512.0, 512.0], pts, hairline: None }
     }
 
     fn build(sliders: FaceSliders) -> (LiquifyField, FaceReport) {
@@ -1747,12 +1987,141 @@ mod tests {
     /// the old band's plateau sat on the brows and moved them while the hairline stayed.
     #[test]
     fn the_hairline_moves_the_hairline_not_the_brows() {
-        let (field, _) = build(FaceSliders { hairline: 100.0, ..Default::default() });
+        let (field, report) = build(FaceSliders { hairline: 100.0, ..Default::default() });
         let hairline = field.sample(256.0, 96.0);
         let brow = field.sample(256.0, 186.0);
         let brow_mag = brow[0].hypot(brow[1]);
         assert!(hairline[1] > 2.0, "the hairline rises (the inverse map points down): {hairline:?}");
         assert!(brow_mag < 0.5, "the brows stay: {brow:?}");
+        // Without a traced curve the band is only an estimate and says so.
+        assert!(report.approximate.iter().any(|(part, _)| *part == "hairline"), "the landmark fallback is approximate: {report:?}");
+    }
+
+    /// A fringe that dips at the temples, as the parser's skin plane shows it: 1 from the
+    /// fringe down to the brows across the face, 0 in the hair above. The fringe line is
+    /// `120 + 50·(s / 105.6)²` document y, s the offset from the face's centre.
+    fn fringe_plane(w: usize, h: usize, area: Rect) -> Vec<f32> {
+        let fringe = |x: f64| {
+            let s = ((x - 256.0) / 105.6).clamp(-1.0, 1.0);
+            120.0 + 50.0 * s * s
+        };
+        let (sx, sy) = (f64::from(area.width()) / w as f64, f64::from(area.height()) / h as f64);
+        let mut skin = vec![0.0f32; w * h];
+        for j in 0..h {
+            let top = f64::from(area.y0) + j as f64 * sy;
+            if top + sy > 186.0 {
+                continue; // below the brow line: not the forehead's run
+            }
+            for i in 0..w {
+                let x = f64::from(area.x0) + (i as f64 + 0.5) * sx;
+                if top + sy > fringe(x) {
+                    skin[j * w + i] = 1.0;
+                }
+            }
+        }
+        skin
+    }
+
+    /// The traced line at `x`, nearest sample.
+    fn at(curve: &[[f32; 2]], x: f32) -> [f32; 2] {
+        curve.iter().copied().min_by(|a, b| (a[0] - x).abs().total_cmp(&(b[0] - x).abs())).unwrap()
+    }
+
+    /// The trace follows the skin–hair boundary where it actually runs: low over the middle
+    /// of the forehead and clearly lower at the temples, which the landmark band could not
+    /// know. A skin-coloured patch floating in the hair is not connected to the forehead's
+    /// run, so a column under it stops at the forehead's own line instead of the patch.
+    #[test]
+    fn the_trace_follows_the_visible_fringe_and_ignores_detached_skin() {
+        let area = Rect::new(0, 0, 512, 512);
+        let mut skin = fringe_plane(128, 128, area);
+        // A patch in the hair, image right of centre, rows the hair separates from the run.
+        for j in 20..=29 {
+            for i in 78..=81 {
+                skin[j * 128 + i] = 1.0;
+            }
+        }
+        let curve = trace_hairline(&skin, 128, 128, area, &face().pts).expect("a fringe the trace follows");
+        assert_eq!(curve.len(), 33, "a compact stored curve");
+        assert!(curve.windows(2).all(|w| w[0][0] <= w[1][0]), "left to right");
+        let centre = at(&curve, 256.0)[1];
+        let left = at(&curve, 170.0)[1];
+        let right = at(&curve, 342.0)[1];
+        assert!(centre < 140.0, "the forehead's middle line: {centre}");
+        assert!(left > centre + 25.0 && right > centre + 25.0, "the temples' dip is followed (centre {centre}, left {left}, right {right})");
+        let under_patch = at(&curve, 322.0)[1];
+        assert!(under_patch > 128.0 && under_patch < 152.0, "the floating patch is not the hairline: {under_patch}");
+    }
+
+    /// No forehead skin to follow is no curve at all — an empty plane, or skin only in the
+    /// hair with none reaching the brow — and the row keeps its landmark fallback.
+    #[test]
+    fn a_plane_without_forehead_skin_traces_nothing() {
+        let area = Rect::new(0, 0, 512, 512);
+        let empty = vec![0.0f32; 128 * 128];
+        assert!(trace_hairline(&empty, 128, 128, area, &face().pts).is_none());
+        let mut blob = vec![0.0f32; 128 * 128];
+        for j in 10..40 {
+            for i in 20..108 {
+                blob[j * 128 + i] = 1.0;
+            }
+        }
+        assert!(trace_hairline(&blob, 128, 128, area, &face().pts).is_none(), "a patch with no run to the brow is not a hairline");
+    }
+
+    /// With a traced curve the band rides the line itself, at the temples as in the middle,
+    /// and stops above the brows: what the row is for. Without one the landmark band is the
+    /// fallback, and the report says it is only an estimate.
+    #[test]
+    fn the_traced_curve_drives_the_band_and_the_sides() {
+        let area = Rect::new(0, 0, 512, 512);
+        let curve = trace_hairline(&fringe_plane(128, 128, area), 128, 128, area, &face().pts).unwrap();
+        let mut anchors = face();
+        anchors.hairline = Some(curve);
+        let field_of = |v: f32| {
+            let (field, report) =
+                face_field(&FaceSpec { sliders: FaceSliders { hairline: v, ..Default::default() }, anchors: anchors.clone() }, bounds(), CELL);
+            (field, report)
+        };
+        let (up, report) = field_of(100.0);
+        let mag = |x: f64, y: f64| {
+            let d = up.sample(x, y);
+            d[0].hypot(d[1])
+        };
+        let traced = anchors.hairline.as_ref().unwrap();
+        let line = at(traced, 256.0);
+        let middle = up.sample(256.0, f64::from(line[1]));
+        assert!(middle[1] > 2.0, "the line itself rises: {middle:?}");
+        let side = up.sample(170.0, f64::from(at(traced, 170.0)[1]));
+        assert!(side[1] > 2.0, "the temple end of the line rises too: {side:?}");
+        assert!(mag(256.0, 186.0) < 0.5, "the brows stay: {}", mag(256.0, 186.0));
+        assert!(mag(256.0, 160.0) < 0.5, "the skin between the line and the brows stays: {}", mag(256.0, 160.0));
+        assert!(report.approximate.is_empty(), "a traced line is not an estimate: {report:?}");
+        let (down, _) = field_of(-100.0);
+        let middle = down.sample(256.0, f64::from(line[1]));
+        assert!(middle[1] < -2.0, "the other stop lowers the line: {middle:?}");
+        // A curve too narrow to be a forehead is treated as absent: the fallback band, and
+        // the approximate report, stand rather than warping a speck.
+        let mut speck = face();
+        speck.hairline = Some(vec![[250.0, 120.0], [258.0, 122.0]]);
+        let (field, report) = face_field(&FaceSpec { sliders: FaceSliders { hairline: 100.0, ..Default::default() }, anchors: speck }, bounds(), CELL);
+        assert!(!field.is_identity());
+        assert!(report.approximate.iter().any(|(part, _)| *part == "hairline"), "a speck is no trace: {report:?}");
+        // A real trace that ends where the hair covers the temples covers only the middle:
+        // it drives the band, and the report says it is partial rather than complete.
+        let mut middle = face();
+        middle.hairline = Some(
+            (0..33)
+                .map(|k| {
+                    let x = 196.0 + 120.0 * k as f32 / 32.0;
+                    let s = (x - 256.0) / 60.0;
+                    [x, 120.0 + 20.0 * s * s]
+                })
+                .collect(),
+        );
+        let (field, report) = face_field(&FaceSpec { sliders: FaceSliders { hairline: 100.0, ..Default::default() }, anchors: middle }, bounds(), CELL);
+        assert!(!field.is_identity(), "a partial trace still drives the band where it runs");
+        assert!(report.approximate.iter().any(|(part, why)| *part == "hairline" && *why == HAIRLINE_PARTIAL_REASON), "a partial trace is reported: {report:?}");
     }
 
     /// Forehead Height is a stretch from the brow line up: the hairline and the crown above

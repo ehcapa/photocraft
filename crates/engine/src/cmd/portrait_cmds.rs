@@ -800,6 +800,10 @@ impl FaceSource {
 pub(crate) struct SculptAnalysis {
     pub analysis: Arc<photocraft_portrait::Analysis>,
     pub face: FaceSource,
+    /// The visible forehead–hair boundary, document pixels, when the optional face parser
+    /// traced one. The Face anchors carry it into the field; `None` leaves the Hairline
+    /// row on its landmark fallback.
+    pub hairline: Option<Vec<[f32; 2]>>,
 }
 
 /// The lightweight analysis a sculpt command needs — no Smart Portrait parsing, body or
@@ -835,8 +839,12 @@ pub(crate) fn analyze_sculpt(
         (false, true) => FaceSource::Detected,
         (false, false) => FaceSource::WholeDocument,
     };
+    let mut face_ring = None;
     analysis.landmarks = match boxed {
-        Some((pts, _)) => pts,
+        Some((pts, ring)) => {
+            face_ring = Some(ring);
+            pts
+        }
         None => {
             // The whole-document mesh is the no-detector fallback, and the embedded model has no
             // presence output: on anything without a face it answers an average-face template
@@ -858,7 +866,55 @@ pub(crate) fn analyze_sculpt(
             })
             .unwrap_or_default();
     }
-    Ok(SculptAnalysis { analysis: Arc::new(analysis), face })
+    // The Hairline row's subject is the visible forehead–hair boundary, and the mesh cannot
+    // give it: landmark 10 sits in the hair or on the forehead depending on the photo, and
+    // the boundary itself dips and rises between the temples. The face parser's Skin plane
+    // traces that boundary (the same model the portrait pipeline trusts as hairline-level);
+    // it is optional, so without it the row keeps the landmark band and reports itself
+    // approximate. Face only: Body never uses the curve.
+    let hairline = if kind == SculptKind::Face {
+        let ring = face_ring.or_else(|| oval_box(&analysis.landmarks).map(|r| expanded(r, doc.size.width, doc.size.height, RING_MARGIN)));
+        ring.and_then(|ring| hairline_curve(doc, target, sample_all, ring, &analysis.landmarks, ctx))
+    } else {
+        None
+    };
+    Ok(SculptAnalysis { analysis: Arc::new(analysis), face, hairline })
+}
+
+/// The visible hairline over a face crop, from the optional face parser: its class-1 Skin
+/// plane, traced into document pixels by `photocraft_algo::face_sculpt::trace_hairline`.
+/// `None` without a usable model, or when the crop has no forehead skin to follow (bangs
+/// down to the brows, a turned-away face); the Hairline row then stays approximate.
+///
+/// The crop is the same ring the second mesh pass used, so the parser sees the face the
+/// landmarks describe. No person gate: the forehead's own skin plane needs no matte, and
+/// the Face path deliberately has no person stage.
+fn hairline_curve(
+    doc: &Arc<Document>,
+    target: Option<photocraft_doc::LayerId>,
+    sample_all: bool,
+    ring: photocraft_geom::Rect,
+    landmarks: &[[f32; 3]],
+    ctx: &crate::jobs::JobCtx,
+) -> Option<Vec<[f32; 2]>> {
+    ctx.stage(0.75, 0.85, "Tracing the hairline", |_| {
+        with_doc_sampler(doc, target, sample_all, |smp, d| {
+            let area = ring.intersect(&d.bounds());
+            if area.is_empty() {
+                return None;
+            }
+            let step = photocraft_algo::segment::scale_for(area, photocraft_ml::PARSING_SIDE * photocraft_ml::PARSING_SIDE);
+            let img = smp.rgb_scaled(area, step);
+            let probs = photocraft_ml::parsing_probs(&img.px, img.w, img.h)?;
+            let skin = photocraft_portrait::parsing::region_planes(&probs.planes, probs.w, probs.h)
+                .into_iter()
+                .find_map(|(region, mask)| (region == photocraft_portrait::Region::Skin).then_some(mask))?;
+            if skin.iter().fold(0.0f32, |m, v| m.max(*v)) < 0.5 {
+                return None;
+            }
+            photocraft_algo::face_sculpt::trace_hairline(&skin, probs.w, probs.h, area, landmarks)
+        })
+    })
 }
 
 /// `portrait.analyze`'s answer: the anchors in the sculpt commands' stored shape, the Body
@@ -911,8 +967,8 @@ pub fn analyze_anchors(
             })
         }
         SculptKind::Face => {
-            let anchors =
-                crate::face_sculpt_cmds::anchors_from_analysis(analysis).ok_or_else(|| EngineError::Other(crate::face_sculpt_cmds::NO_FACE.into()))?;
+            let anchors = crate::face_sculpt_cmds::anchors_from_analysis(analysis, found.hairline)
+                .ok_or_else(|| EngineError::Other(crate::face_sculpt_cmds::NO_FACE.into()))?;
             Ok(AnchorsReply {
                 anchors: serde_json::to_value(&anchors).map_err(|e| EngineError::Other(format!("the anchors would not serialise: {e}")))?,
                 fit: None,
