@@ -38,6 +38,12 @@ mod worker;
 /// milliseconds; the proxy is rebuilt only when the document's pixels change.
 const PROXY_SIDE: usize = 1600;
 
+/// The face crop's longest side. The whole-document proxy is sharp at fit zoom, where a photo's
+/// face is small; zoomed into the face it is not — a 6000-px photo's proxy has one pixel per
+/// four. The face's own rectangle, drawn over it, is near one pixel per document pixel below
+/// this cap, so moving a feature melts pixels, not blocks.
+const CROP_SIDE: usize = 2048;
+
 /// The preview's share of the canvas display keys: `distort_ui` uses 1 << 42, Free Transform
 /// 1 << 40.
 const DISPLAY_KEY: u64 = 1 << 43;
@@ -99,6 +105,8 @@ pub struct Live {
 /// A published frame: the texture the canvas draws and the document it hides the layer in.
 struct Preview {
     textures: PreviewTextures,
+    /// Face Sculpt's near-1:1 crop over the whole-document picture, and its document rectangle.
+    crop: Option<CropPreview>,
     /// The document with the target layer hidden.
     without: Arc<Document>,
     /// The layer's opacity times its fill.
@@ -106,18 +114,42 @@ struct Preview {
     size: [u32; 2],
 }
 
+/// The crop's texture and the document rectangle its quad covers.
+struct CropPreview {
+    textures: PreviewTextures,
+    bounds: Rect,
+}
+
 /// The proxy of the target layer at one document revision, with the selection's coverage at its
-/// pixels. Rebuilt only when the revision moves.
+/// pixels. Rebuilt only when the revision moves, or the anchors (the crop follows the mesh).
 #[cfg(not(target_arch = "wasm32"))]
 struct CachedProxy {
     revision: u64,
     proxy: Arc<ProxyImage>,
     selection: Option<Arc<Vec<f32>>>,
+    /// The face's own rectangle at near 1:1: Face Sculpt only, `None` when the anchors name no
+    /// usable box.
+    crop: Option<CachedCrop>,
 }
 
-/// What a job warps: the proxy and the selection's per-pixel coverage, if one limits the effect.
 #[cfg(not(target_arch = "wasm32"))]
-type PreviewSource = (Arc<ProxyImage>, Option<Arc<Vec<f32>>>);
+struct CachedCrop {
+    proxy: Arc<ProxyImage>,
+    selection: Option<Arc<Vec<f32>>>,
+}
+
+/// A proxy and the selection's per-pixel coverage at its pixels.
+#[cfg(not(target_arch = "wasm32"))]
+type ProxySource = (Arc<ProxyImage>, Option<Arc<Vec<f32>>>);
+
+/// What a job warps: the whole-document proxy, the selection's per-pixel coverage if one limits
+/// the effect, and the face crop when the panel is Face Sculpt's.
+#[cfg(not(target_arch = "wasm32"))]
+struct ProxySet {
+    proxy: Arc<ProxyImage>,
+    selection: Option<Arc<Vec<f32>>>,
+    crop: Option<ProxySource>,
+}
 
 impl Live {
     /// The panel's runtime: one lightweight analysis at the active layer, started in the
@@ -242,7 +274,15 @@ impl Live {
         {
             self.analysis_pending = None;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let anchors_changed = self.anchors != anchors;
         self.anchors = anchors;
+        #[cfg(not(target_arch = "wasm32"))]
+        if anchors_changed {
+            // The face crop follows the mesh: a re-analysis at the same revision must not
+            // keep the old crop around the old landmarks.
+            self.proxy = None;
+        }
         self.fit = fit;
         self.contour = contour;
         self.quality = quality;
@@ -544,7 +584,7 @@ impl Live {
     /// cannot be previewed; why is then in `preview_error`.
     #[cfg(not(target_arch = "wasm32"))]
     fn job(&mut self, app: &mut PhotocraftApp, params: &Value) -> Option<worker::Job> {
-        let (proxy, selection) = match self.proxy_for(app) {
+        let found = match self.proxy_for(app) {
             Ok(found) => found,
             Err(why) => {
                 self.preview_error = Some(why.to_owned());
@@ -552,7 +592,15 @@ impl Live {
                 return None;
             }
         };
-        Some(worker::Job { params: self.merged_params(params), canvas: self.canvas(), face: self.command == super::FACE, proxy, selection })
+        let crop = found.crop.map(|(proxy, selection)| worker::CropJob { proxy, selection });
+        Some(worker::Job {
+            params: self.merged_params(params),
+            canvas: self.canvas(),
+            face: self.command == super::FACE,
+            proxy: found.proxy,
+            selection: found.selection,
+            crop,
+        })
     }
 
     /// `params` with the analysed anchors, the body fit, the person contour and the bound
@@ -575,14 +623,19 @@ impl Live {
     }
 
     /// The target layer's proxy at the current revision and the selection's coverage at its
-    /// pixels, cached until the revision moves.
+    /// pixels, cached until the revision moves (or the anchors do). Face Sculpt also gets its
+    /// own crop of the face at near 1:1.
     #[cfg(not(target_arch = "wasm32"))]
-    fn proxy_for(&mut self, app: &mut PhotocraftApp) -> Result<PreviewSource, &'static str> {
+    fn proxy_for(&mut self, app: &mut PhotocraftApp) -> Result<ProxySet, &'static str> {
         let Some(st) = app.session.active() else { return Err("there is no document to preview") };
         if let Some(cached) = &self.proxy
             && cached.revision == st.revision
         {
-            return Ok((Arc::clone(&cached.proxy), cached.selection.clone()));
+            return Ok(ProxySet {
+                proxy: Arc::clone(&cached.proxy),
+                selection: cached.selection.clone(),
+                crop: cached.crop.as_ref().map(|c| (Arc::clone(&c.proxy), c.selection.clone())),
+            });
         }
         let Ok((layer, surface, _)) = crate::distort_ui::active_pixels(app) else {
             return Err("The target layer has no pixels of its own to preview");
@@ -592,8 +645,48 @@ impl Live {
         }
         let proxy = Arc::new(ProxyImage::new(&surface, st.doc.bounds(), PROXY_SIDE));
         let selection = st.doc.selection.as_ref().map(|sel| Arc::new(coverage(sel, &proxy)));
-        self.proxy = Some(CachedProxy { revision: st.revision, proxy: Arc::clone(&proxy), selection: selection.clone() });
-        Ok((proxy, selection))
+        // Two stacked quads composite a translucent layer twice, so the crop only rides over
+        // an opaque target; below full opacity the whole-document proxy is the whole picture.
+        let opaque = st.doc.layer(layer).is_some_and(|l| l.opacity * l.fill_opacity >= 1.0);
+        let crop = match (self.command == super::FACE, opaque) {
+            (true, true) => self.crop_bounds().map(|bounds| {
+                let proxy = Arc::new(ProxyImage::new(&surface, bounds, CROP_SIDE));
+                let selection = st.doc.selection.as_ref().map(|sel| Arc::new(coverage(sel, &proxy)));
+                CachedCrop { proxy, selection }
+            }),
+            _ => None,
+        };
+        let found =
+            ProxySet { proxy: Arc::clone(&proxy), selection: selection.clone(), crop: crop.as_ref().map(|c| (Arc::clone(&c.proxy), c.selection.clone())) };
+        self.proxy = Some(CachedProxy { revision: st.revision, proxy, selection, crop });
+        Ok(found)
+    }
+
+    /// The face's crop box: the landmarks' bounding box, inflated by 30% of its longer side.
+    /// The field is near zero that far outside the mesh, so the crop's edge meets the
+    /// whole-document proxy without a visible seam; the box is clamped to the document.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn crop_bounds(&self) -> Option<Rect> {
+        let pts = self.anchors.get("pts")?.as_array()?;
+        let (mut lo, mut hi, mut count) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2], 0usize);
+        for p in pts {
+            let (Some(x), Some(y)) = (p.get(0).and_then(Value::as_f64), p.get(1).and_then(Value::as_f64)) else { continue };
+            if !x.is_finite() || !y.is_finite() {
+                continue;
+            }
+            lo = [lo[0].min(x), lo[1].min(y)];
+            hi = [hi[0].max(x), hi[1].max(y)];
+            count += 1;
+        }
+        if count < 3 {
+            return None;
+        }
+        let margin = 0.30 * (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1.0);
+        let x0 = (lo[0] - margin).floor().max(0.0).min(f64::from(self.size[0])) as i32;
+        let y0 = (lo[1] - margin).floor().max(0.0).min(f64::from(self.size[1])) as i32;
+        let x1 = (hi[0] + margin).ceil().clamp(0.0, f64::from(self.size[0])) as i32;
+        let y1 = (hi[1] + margin).ceil().clamp(0.0, f64::from(self.size[1])) as i32;
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
     }
 
     /// Shows `frame`: the layer hidden from the canvas composite and the warped proxy drawn in
@@ -609,7 +702,11 @@ impl Live {
         let opacity = (l.opacity * l.fill_opacity).clamp(0.0, 1.0);
         let without = crate::distort_ui::without_layer(&st.doc, layer);
         let textures = PreviewTextures::new(format!("sculpt-{}", self.serial), PreviewPixels::new(frame.image, [1.0, 1.0]));
-        self.preview = Some(Preview { textures, without, opacity, size: self.size });
+        let crop = frame.crop.map(|c| CropPreview {
+            textures: PreviewTextures::new(format!("sculpt-crop-{}", self.serial), PreviewPixels::new(c.image, [1.0, 1.0])),
+            bounds: c.bounds,
+        });
+        self.preview = Some(Preview { textures, crop, without, opacity, size: self.size });
     }
 }
 
@@ -785,6 +882,18 @@ pub(crate) fn show_in_canvas(app: &PhotocraftApp, ui: &mut egui::Ui, rect: egui:
             .opacity(preview.opacity)
             .clip(preview.size)
             .show_at(ui, rect);
+        // The face's own crop over the whole-document picture: the closer look where the
+        // sliders act, at one texture pixel per document pixel (or the next power of two up).
+        if let Some(crop) = &preview.crop {
+            let b = crop.bounds;
+            let (x0, y0, x1, y1) = (f64::from(b.x0), f64::from(b.y0), f64::from(b.x1), f64::from(b.y1));
+            let quad = [Point::new(x0, y0), Point::new(x1, y0), Point::new(x1, y1), Point::new(x0, y1)];
+            TransformPreview::new(tl!("Sculpt preview detail"), &crop.textures)
+                .map(PreviewMap::quad(quad))
+                .opacity(preview.opacity)
+                .clip(preview.size)
+                .show_at(ui, rect);
+        }
     }
     if live.command != super::BODY {
         return;

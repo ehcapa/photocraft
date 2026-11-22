@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use egui::ColorImage;
-use photocraft_algo::liquify::ProxyImage;
+use photocraft_algo::liquify::{LiquifyField, ProxyImage};
 use photocraft_engine::jobs::JobCtx;
 use photocraft_geom::Rect;
 use serde_json::Value;
@@ -31,9 +31,24 @@ pub(crate) const SUPERSEDED: &str = "the preview was superseded";
 /// until the slider stopped.
 pub(crate) const SETTLE_MS: f64 = 150.0;
 
-/// The pixels one request renders, premultiplied.
+/// The pixels one request renders, premultiplied: the whole document's proxy and, for the
+/// face panel, the face's own near-1:1 crop drawn over it.
 pub(crate) struct Frame {
     pub image: ColorImage,
+    pub crop: Option<CropFrame>,
+}
+
+/// The face's crop: the proxy pixels and the document rectangle they quad covers.
+pub(crate) struct CropFrame {
+    pub image: ColorImage,
+    pub bounds: Rect,
+}
+
+/// What the crop warps: a proxy over the face's own rectangle, at one pixel per document pixel
+/// where the face allows, and the selection's coverage at its pixels.
+pub(crate) struct CropJob {
+    pub proxy: Arc<ProxyImage>,
+    pub selection: Option<Arc<Vec<f32>>>,
 }
 
 /// The panel's opening analysis: the anchors Apply will carry, the measured body fit (Body
@@ -64,32 +79,52 @@ pub(crate) struct Job {
     pub proxy: Arc<ProxyImage>,
     /// Coverage at each proxy pixel, row-major, when a selection limits the effect.
     pub selection: Option<Arc<Vec<f32>>>,
+    /// Face Sculpt's near-1:1 crop, drawn over the whole-document proxy.
+    pub crop: Option<CropJob>,
 }
 
-/// The proxy pixels through `job`'s field and selection, as the texture shows them.
+/// The proxy pixels through `job`'s field and selection, as the texture shows them. The field
+/// is built once and sampled at each proxy's own document coordinates, so the crop and the
+/// whole-document proxy show the same warp at different resolutions.
 pub(crate) fn render(job: &Job, ctx: &JobCtx) -> Result<Output, String> {
     let field = if job.face {
         photocraft_engine::face_sculpt_cmds::field_for(&job.params, job.canvas).map_err(|e| e.to_string())?.0
     } else {
         photocraft_engine::sculpt_cmds::field_for(&job.params, job.canvas).map_err(|e| e.to_string())?.0
     };
-    ctx.check().map_err(|_| SUPERSEDED.to_string())?;
-    let (w, h) = (job.proxy.w, job.proxy.h);
+    let image = pixels(render_proxy(&job.proxy, job.selection.as_deref(), &field, ctx)?, job.proxy.w, job.proxy.h);
+    let crop = match &job.crop {
+        Some(c) => {
+            ctx.check().map_err(|_| SUPERSEDED.to_string())?;
+            Some(CropFrame { image: pixels(render_proxy(&c.proxy, c.selection.as_deref(), &field, ctx)?, c.proxy.w, c.proxy.h), bounds: c.proxy.bounds })
+        }
+        None => None,
+    };
+    Ok(Output::Frame(Frame { image, crop }))
+}
+
+/// One proxy through `field`, in row strips so a superseded job stops between them.
+fn render_proxy(proxy: &ProxyImage, selection: Option<&Vec<f32>>, field: &LiquifyField, ctx: &JobCtx) -> Result<Vec<[u8; 4]>, String> {
+    let (w, h) = (proxy.w, proxy.h);
     let mut out = vec![[0u8; 4]; w * h];
     let mut y = 0;
     while y < h {
         let y1 = (y + STRIP_ROWS).min(h);
-        job.proxy.render(&field, [0, y, w, y1], &mut out);
+        proxy.render(field, [0, y, w, y1], &mut out);
         y = y1;
         ctx.check().map_err(|_| SUPERSEDED.to_string())?;
     }
-    if let Some(cov) = &job.selection {
-        for ((px, old), &c) in out.iter_mut().zip(&job.proxy.px).zip(cov.iter()) {
+    if let Some(cov) = selection {
+        for ((px, old), &c) in out.iter_mut().zip(&proxy.px).zip(cov.iter()) {
             *px = mix(*px, *old, c);
         }
     }
+    Ok(out)
+}
+
+fn pixels(out: Vec<[u8; 4]>, w: usize, h: usize) -> ColorImage {
     let pixels = out.iter().map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3])).collect();
-    Ok(Output::Frame(Frame { image: ColorImage::new([w, h], pixels) }))
+    ColorImage::new([w, h], pixels)
 }
 
 /// One opening analysis: the document to read, the layer Apply will warp, which landmarks and
@@ -209,7 +244,7 @@ mod tests {
     use super::*;
 
     fn frame() -> Output {
-        Output::Frame(Frame { image: ColorImage::new([1, 1], vec![egui::Color32::BLACK]) })
+        Output::Frame(Frame { image: ColorImage::new([1, 1], vec![egui::Color32::BLACK]), crop: None })
     }
 
     fn finish(worker: &mut Worker) -> (u64, Result<Output, String>) {

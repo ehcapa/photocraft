@@ -37,6 +37,56 @@ fn patterned(w: u32, h: u32) -> photocraft_engine::Session {
     s
 }
 
+/// A one-pixel checker: a proxy that downsamples by two averages it to flat grey, while one
+/// pixel per document pixel keeps every block.
+fn fine_checker(w: u32, h: u32) -> photocraft_engine::Session {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": w, "height": h})).unwrap();
+    s.edit("paint", |doc, _| {
+        let bg = doc.layers[0].surface_mut().unwrap();
+        let n = bg.channels();
+        let mut data = Vec::with_capacity((w * h) as usize * n);
+        for y in 0..h {
+            for x in 0..w {
+                let t = ((x + y) % 2) as f32;
+                data.extend_from_slice(&[t, t, t][..n.min(3)]);
+                if n == 4 {
+                    data.push(1.0);
+                }
+            }
+        }
+        bg.write_region(Rect::new(0, 0, w as i32, h as i32), &data);
+        Ok(())
+    })
+    .unwrap();
+    s
+}
+
+/// `face_anchors` on a `side`-pixel document, the 512-pixel layout scaled uniformly.
+fn scaled_face_anchors(side: f32) -> Value {
+    let k = f64::from(side) / 512.0;
+    let mut a = face_anchors();
+    if let Some(pts) = a["pts"].as_array_mut() {
+        for p in pts {
+            let x = p[0].as_f64().unwrap_or(256.0) * k;
+            let y = p[1].as_f64().unwrap_or(240.0) * k;
+            *p = json!([x, y, 0.0]);
+        }
+    }
+    a["doc"] = json!([side, side]);
+    a
+}
+
+/// The red channel's spread: how much detail an image still carries.
+fn contrast(image: &egui::ColorImage) -> u8 {
+    let (mut lo, mut hi) = (255u8, 0u8);
+    for p in &image.pixels {
+        lo = lo.min(p.r());
+        hi = hi.max(p.r());
+    }
+    hi - lo
+}
+
 /// A blank document: no person and no face for an analysis to find.
 fn blank(w: u32, h: u32) -> photocraft_engine::Session {
     let mut s = photocraft_engine::Session::new();
@@ -320,6 +370,52 @@ fn the_face_panel_previews_through_the_face_field() {
         warped.pixels.iter().zip(&identity.pixels).any(|(a, b)| a.to_array().iter().zip(b.to_array()).any(|(x, y)| x.abs_diff(y) > 1)),
         "the face field warps the proxy"
     );
+}
+
+/// Face Sculpt draws the face's own crop over the whole-document proxy: on a 2000-pixel photo
+/// the proxy has one pixel per two and a one-pixel checker dissolves to flat grey, while the
+/// crop at one pixel per document pixel keeps it — the edge a moved feature is judged by. The
+/// crop's quad covers the mesh and stops well inside the document.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_face_crop_previews_near_one_to_one_over_the_face() {
+    let mut app = app(fine_checker(2000, 2000));
+    let anchors = scaled_face_anchors(2000.0);
+    let mut live = Live::test(&mut app, FACE, anchors.clone());
+    let p = panel(FACE);
+    let job = live.job(&mut app, &p.params()).expect("a face preview job");
+    let frame = match super::worker::render(&job, &photocraft_engine::jobs::JobCtx::new()).expect("a frame") {
+        super::worker::Output::Frame(frame) => frame,
+        super::worker::Output::Analysis(_) => panic!("a preview job renders a frame"),
+    };
+    let crop = frame.crop.expect("Face Sculpt previews the face's own crop");
+    let base = contrast(&frame.image);
+    let fine = contrast(&crop.image);
+    assert!(fine > 32, "the crop keeps the detail: contrast {fine}");
+    assert!(fine > 8 * base.max(1), "the crop is sharper than the whole-document proxy: {fine} vs {base}");
+    for (i, point) in anchors["pts"].as_array().expect("pts").iter().enumerate() {
+        let (x, y) = (point[0].as_f64().unwrap_or(0.0), point[1].as_f64().unwrap_or(0.0));
+        assert!(
+            x >= f64::from(crop.bounds.x0) && x <= f64::from(crop.bounds.x1) && y >= f64::from(crop.bounds.y0) && y <= f64::from(crop.bounds.y1),
+            "landmark {i} at ({x}, {y}) outside the crop {:?}",
+            crop.bounds
+        );
+    }
+    assert!(crop.bounds.width() < 2000 && crop.bounds.height() < 2000, "the crop is the face, not the whole document: {:?}", crop.bounds);
+}
+
+/// A translucent target previews through the whole-document proxy only: two stacked quads
+/// would composite the layer's pixels twice and draw it darker than the commit.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_translucent_layer_previews_without_the_crop() {
+    let mut session = fine_checker(2000, 2000);
+    session.execute("layer.setProps", json!({"opacity": 0.5})).unwrap();
+    let mut app = app(session);
+    let mut live = Live::test(&mut app, FACE, scaled_face_anchors(2000.0));
+    let p = panel(FACE);
+    let job = live.job(&mut app, &p.params()).expect("a face preview job");
+    assert!(job.crop.is_none(), "a half-opacity layer must not stack two semi-transparent quads");
 }
 
 /// A slider change after the anchors are in previews through the worker: `tick` starts the
