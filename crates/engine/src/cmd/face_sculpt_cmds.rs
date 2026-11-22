@@ -294,6 +294,39 @@ pub fn field_for(p: &Value, canvas: Rect) -> Result<(LiquifyField, FaceReport)> 
     Ok(field_with(FaceSpec { sliders: values, anchors }, contour_of(p).as_deref(), symmetry_of(p), smooth_of(p), angles(p), canvas, cell))
 }
 
+/// Where a source point lands once `field` warps the pixels. The field is the inverse map —
+/// output `q` reads source `q + d(q)` — so the output that shows source `p` solves
+/// `q = p − d(q)`; two fixed-point passes land a landmark within a fraction of a pixel of its
+/// new place. The panel adopts the moved mesh after Apply so the next sliders preview marks
+/// the features the pixels now show instead of their pre-warp positions.
+fn warped_point(field: &LiquifyField, p: [f64; 2]) -> [f32; 2] {
+    let mut q = p;
+    for _ in 0..2 {
+        let d = field.sample(q[0], q[1]);
+        let (x, y) = (p[0] - d[0], p[1] - d[1]);
+        if !x.is_finite() || !y.is_finite() {
+            break;
+        }
+        q = [x, y];
+    }
+    [q[0] as f32, q[1] as f32]
+}
+
+/// `anchors` at `field`'s destination: what the panel should carry into the next preview.
+fn warped_anchors(field: &LiquifyField, anchors: &FaceAnchors) -> FaceAnchors {
+    FaceAnchors {
+        doc: anchors.doc,
+        pts: anchors
+            .pts
+            .iter()
+            .map(|p| {
+                let w = warped_point(field, [f64::from(p[0]), f64::from(p[1])]);
+                [w[0], w[1], p[2]]
+            })
+            .collect(),
+    }
+}
+
 /// The one lightweight analysis a run without anchors needs: SCRFD's box when a detector
 /// model is placed, the FaceMesh landmarks either way, no parsing. A detected box needs no
 /// person stage; the no-detector fallback asks the subject line only for presence.
@@ -362,6 +395,10 @@ fn face_sculpt(s: &mut Session, p: &Value) -> Result<Value> {
     r["ms"] = json!(t0.ms());
     r["maxDisplacement"] = json!(field.max_displacement());
     r["parts"] = parts(&report);
+    // The stored params keep the request's anchors so a smart-filter replay rebuilds the
+    // exact field; the reply's are where those landmarks sit after the warp, for the panel's
+    // next preview only.
+    r["anchors"] = serde_json::to_value(warped_anchors(&field, &anchors)).map_err(|e| bad(format!("the warped anchors would not serialise: {e}")))?;
     Ok(r)
 }
 
@@ -435,6 +472,28 @@ mod tests {
         FaceAnchors { doc: [512.0, 512.0], pts }
     }
 
+    /// The same four named points on a full canonical mesh: the FACE_OVAL, eye and lip rings
+    /// are laid on their ellipses so the mask has real polygons (the degenerate rings of
+    /// `anchors_on` collapse the clip and leave the local rows nearly still).
+    fn full_face() -> FaceAnchors {
+        let mut pts = vec![[256.0f32, 240.0f32, 0.0f32]; photocraft_algo::face_sculpt::MESH_COUNT];
+        let ring = |ids: &[usize], cx: f64, cy: f64, rx: f64, ry: f64, pts: &mut Vec<[f32; 3]>| {
+            for (k, &i) in ids.iter().enumerate() {
+                let t = -std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * k as f64 / ids.len() as f64;
+                pts[i] = [(cx + rx * t.cos()) as f32, (cy + ry * t.sin()) as f32, 0.0];
+            }
+        };
+        use photocraft_portrait::face::{FACE_OVAL, LEFT_EYE_RING, LIPS_RING, RIGHT_EYE_RING};
+        ring(FACE_OVAL, 256.0, 244.0, 120.0, 148.0, &mut pts);
+        ring(LEFT_EYE_RING, 206.0, 232.0, 24.0, 12.0, &mut pts);
+        ring(RIGHT_EYE_RING, 306.0, 232.0, 24.0, 12.0, &mut pts);
+        ring(LIPS_RING, 256.0, 316.0, 34.0, 16.0, &mut pts);
+        for &(i, x, y) in &[(10usize, 256.0f32, 96.0f32), (152, 256.0, 392.0), (454, 376.0, 248.0), (234, 136.0, 248.0)] {
+            pts[i] = [x, y, 0.0];
+        }
+        FaceAnchors { doc: [512.0, 512.0], pts }
+    }
+
     fn pixels(s: &Session, w: i32, h: i32) -> Vec<f32> {
         s.active().unwrap().doc.layers[0].surface().unwrap().read_region(Rect::new(0, 0, w, h))
     }
@@ -451,6 +510,74 @@ mod tests {
         assert!(r["maxDisplacement"].as_f64().unwrap_or_default() > 0.0);
         assert_ne!(before, pixels(&s, 512, 512), "the warp must move pixels");
         assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "one history step");
+    }
+
+    /// The reply's anchors are where the warp put the pixels: a dot painted at the landmark
+    /// that moves most lands at the replied point, not at its old place. The panel relies on
+    /// this for the *next* preview, which would otherwise mark features the warp has left.
+    #[test]
+    fn the_reply_moves_the_anchors_with_the_pixels() {
+        let anchors = full_face();
+        let params = json!({"jaw": 100.0, "anchors": serde_json::to_value(&anchors).unwrap()});
+        // The landmark with the largest displacement, from the same field Apply builds.
+        let mut probe = patterned(512, 512);
+        let first = probe.execute(FACE_SCULPT, params.clone()).unwrap();
+        let moved: FaceAnchors = serde_json::from_value(first["anchors"].clone()).unwrap();
+        assert_eq!(moved.pts.len(), photocraft_algo::face_sculpt::MESH_COUNT);
+        let (i, p0, travel) = anchors
+            .pts
+            .iter()
+            .zip(&moved.pts)
+            .enumerate()
+            .map(|(i, (a, b))| (i, [f64::from(a[0]), f64::from(a[1])], f64::from(b[0] - a[0]).hypot(f64::from(b[1] - a[1]))))
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+            .unwrap();
+        assert!(travel > 3.0, "the chosen landmark must move visibly: {travel}");
+        // A white document with a black dot at that landmark's source position.
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 512, "height": 512, "background": "white"})).unwrap();
+        s.edit("paint", |doc, _| {
+            let surf = doc.layers[0].surface_mut().unwrap();
+            let n = surf.channels();
+            let mut data = Vec::with_capacity(512 * 512 * n);
+            for y in 0..512 {
+                for x in 0..512 {
+                    let in_dot = (f64::from(x) - p0[0]).powi(2) + (f64::from(y) - p0[1]).powi(2) <= 1.5;
+                    let v = if in_dot { 0.0 } else { 1.0 };
+                    data.extend_from_slice(&[v, v, v][..n.min(3)]);
+                    if n == 4 {
+                        data.push(1.0);
+                    }
+                }
+            }
+            surf.write_region(Rect::new(0, 0, 512, 512), &data);
+            Ok(())
+        })
+        .unwrap();
+        let out = s.execute(FACE_SCULPT, params).unwrap();
+        assert_eq!(out["changed"], json!(true));
+        // The dot's centroid in the output, weighted by darkness on the white field.
+        let data = pixels(&s, 512, 512);
+        let n = s.active().unwrap().doc.layers[0].surface().unwrap().channels();
+        let (mut sw, mut sx, mut sy) = (0.0f64, 0.0f64, 0.0f64);
+        for y in 0..512 {
+            for x in 0..512 {
+                let o = (y * 512 + x) as usize * n;
+                let w = f64::from(1.0 - (data[o] + data[o + 1] + data[o + 2]) / 3.0);
+                if w > 0.05 {
+                    sw += w;
+                    sx += w * x as f64;
+                    sy += w * y as f64;
+                }
+            }
+        }
+        assert!(sw > 0.5, "the dot must survive the warp");
+        let landed = [sx / sw, sy / sw];
+        let reply = [f64::from(moved.pts[i][0]), f64::from(moved.pts[i][1])];
+        let to_reply = (reply[0] - landed[0]).hypot(reply[1] - landed[1]);
+        let to_old = (p0[0] - landed[0]).hypot(p0[1] - landed[1]);
+        assert!(to_reply < 2.0, "the reply's anchor {reply:?} must sit on the dot's new place {landed:?}: {to_reply} px off");
+        assert!(to_old > to_reply, "the old place {p0:?} is closer to the warped dot than the reply's: {to_old} vs {to_reply}");
     }
 
     #[test]

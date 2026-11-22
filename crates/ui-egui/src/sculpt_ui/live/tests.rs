@@ -225,6 +225,35 @@ fn an_applied_panel_does_not_preview_the_same_values_again() {
     app.sculpt_live = Some(live);
 }
 
+/// Apply leaves the panel's anchors where the warp put the pixels: the next slider move
+/// previews over the features the pixels now show, not over their pre-warp positions. The
+/// engine's dot-marker test holds the reply to the pixels; here the panel must adopt it.
+#[test]
+fn apply_adopts_the_warped_anchors_for_the_next_preview() {
+    let mut app = app(patterned(512, 512));
+    let before = face_anchors();
+    let mut p = panel(FACE);
+    p.values.insert("faceSize".into(), 100.0);
+    let live = Live::test(&mut app, FACE, before.clone());
+    app.sculpt_live = Some(live);
+    super::apply(&mut app, &p);
+    let live = app.sculpt_live.as_ref().expect("Apply keeps the runtime");
+    assert!(live.ready(), "the adopted anchors still enable the next Apply");
+    assert_ne!(live.anchors, before, "the reply's anchors replace the analysed ones");
+    let old = before["pts"].as_array().expect("pts");
+    let new = live.anchors["pts"].as_array().expect("pts");
+    let travel = old
+        .iter()
+        .zip(new)
+        .map(|(a, b)| {
+            (a[0].as_f64().unwrap_or_default() - b[0].as_f64().unwrap_or_default()).hypot(a[1].as_f64().unwrap_or_default() - b[1].as_f64().unwrap_or_default())
+        })
+        .fold(0.0f64, f64::max);
+    assert!(travel > 1.0, "the adopted mesh must follow a visible move: {travel}");
+    let merged = live.merged_params(&p.params());
+    assert_eq!(merged.get("anchors"), Some(&live.anchors), "the next preview and Apply carry the adopted anchors");
+}
+
 /// The canvas shows the document without the target layer while the proxy is drawn over it;
 /// the session's document is untouched, and closing the runtime brings the layer back.
 #[test]

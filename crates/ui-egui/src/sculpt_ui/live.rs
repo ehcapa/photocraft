@@ -708,6 +708,11 @@ pub(crate) fn apply(app: &mut PhotocraftApp, panel: &Panel) {
             // A part the pose could not place is not a success to hide: the reply names it,
             // and the panel says so inline (the CLI and automation read `parts` themselves).
             live.notice = parts_notice(&reply);
+            // The face command answers where its anchors sit after the warp: the next
+            // preview must mark the features the pixels now show, not their old places.
+            if let Some(moved) = reply.get("anchors").filter(|a| a.is_object()) {
+                live.anchors = moved.clone();
+            }
             // Unchanged values never re-preview: the canvas already shows the committed warp.
             live.last_requested = Some(values);
             #[cfg(not(target_arch = "wasm32"))]
