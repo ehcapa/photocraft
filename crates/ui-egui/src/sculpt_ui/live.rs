@@ -338,7 +338,8 @@ impl Live {
     /// Paired rows are compared per side, because the engine's side overrides are absolute:
     /// the difference goes as the base when both sides moved together and as the two sides
     /// when they did not. The preset row is a one-shot bundle (its chip clears on Apply), so
-    /// a chosen preset passes through whole.
+    /// a chosen preset passes through whole. Body Sculpt's placement lines say where the
+    /// difference lands, not how far it moves, so they ride every request whole.
     fn request_params(&self, current: &Value) -> Value {
         let Some((applied, _)) = &self.applied else { return current.clone() };
         let mut out = serde_json::Map::new();
@@ -348,6 +349,14 @@ impl Live {
             out.insert("preset".to_owned(), json!(preset));
             if let Some(v) = current.get("presetStrength") {
                 out.insert("presetStrength".to_owned(), v.clone());
+            }
+        }
+        // A difference from a zero line is the line itself (the engine's default is auto), and
+        // the difference field must be built on the row the user placed, not the fitted one.
+        let carried: &[&str] = if self.command == super::BODY { &["waistLine", "bellyLine"] } else { &[] };
+        for key in carried {
+            if let Some(v) = current.get(*key) {
+                out.insert((*key).to_owned(), v.clone());
             }
         }
         let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
@@ -382,7 +391,13 @@ impl Live {
         for v in [current, applied] {
             if let Value::Object(m) = v {
                 for key in m.keys() {
-                    if key != "preset" && key != "presetStrength" && !pairs.contains(key) && !key.ends_with("Left") && !key.ends_with("Right") {
+                    if key != "preset"
+                        && key != "presetStrength"
+                        && !carried.contains(&key.as_str())
+                        && !pairs.contains(key)
+                        && !key.ends_with("Left")
+                        && !key.ends_with("Right")
+                    {
                         scalars.insert(key.clone());
                     }
                 }

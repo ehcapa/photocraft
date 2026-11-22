@@ -346,6 +346,25 @@ fn after_an_apply_the_next_request_is_only_the_change() {
     assert_eq!(delta, json!({"jaw": 5.0}), "only the moved slider is requested: {}", p.params());
 }
 
+/// Body Sculpt's placement lines position the warp instead of measuring it: after Apply they
+/// must ride the difference request, or the next tweak would build its field on the fitted
+/// rows while the user's waistband sits somewhere else.
+#[test]
+fn a_body_pass_after_apply_keeps_its_placement_lines() {
+    let mut app = app(patterned(256, 384));
+    let mut p = panel(BODY);
+    p.values.insert("waist".into(), 50.0);
+    p.values.insert("waistLine".into(), -120.0);
+    p.values.insert("bellyLine".into(), 40.0);
+    app.sculpt_live = Some(Live::test(&mut app, BODY, body_anchors(256.0, 384.0)));
+    super::apply(&mut app, &mut p);
+    let live = app.sculpt_live.as_ref().expect("Apply keeps the runtime");
+    assert_eq!(live.request_params(&p.params()), json!({"waistLine": -120.0, "bellyLine": 40.0}), "placement lines ride every pass whole");
+    p.values.insert("waist".into(), 55.0);
+    let delta = live.request_params(&p.params());
+    assert_eq!(delta, json!({"waist": 5.0, "waistLine": -120.0, "bellyLine": 40.0}), "the tweak lands on the placed rows: {}", p.params());
+}
+
 /// A paired row is compared per side, because the engine's side overrides are absolute: a
 /// pair that moved together is sent as one base difference, a side that moved alone as its
 /// two sides — the form that makes each side land where the panel shows it.
