@@ -93,10 +93,10 @@ fn main() -> Result<(), String> {
     // The screen-landmarks output: the [1,195] tensor.
     let mut screen: Option<Vec<f32>> = None;
     for (i, out) in outputs.iter().enumerate() {
-        let shape: Vec<usize> = out.shape().iter().copied().collect();
+        let shape: Vec<usize> = out.shape().to_vec();
         println!("out[{i}] {shape:?}");
         if out.len() == COUNT * STRIDE {
-            screen = Some(out.to_plain_array_view::<f32>().map_err(|e| e.to_string())?.iter().copied().collect());
+            screen = Some(out.to_plain_array_view::<f32>().map_err(|e| e.to_string())?.as_slice().ok_or("non-contiguous output")?.to_vec());
         }
     }
     let Some(screen) = screen else {
