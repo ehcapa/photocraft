@@ -89,13 +89,16 @@ const COUPLING_LENGTH: f64 = 2.0;
 /// instead of a hard clip.
 const COUPLING_MIN: f64 = 8.0;
 
-/// The twenty-two shaping sliders, each −100..100. A slider's positive direction is its
+/// The twenty-three shaping sliders, each −100..100. A slider's positive direction is its
 /// label's action: `waist` narrows, `hips` rounds, `leg_length` lengthens; zero leaves the
 /// part out. `arms` shapes the upper arm; `forearms` the lower arm from the elbow through
-/// the palm and fingers.
+/// the palm and fingers. The two slim rows split the old single one: `slim_upper` narrows
+/// the torso above the waist as one envelope, `slim_full` the whole body — torso, legs and
+/// arms — in one coordinated pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SculptSliders {
-    pub slim_body: f32,
+    pub slim_upper: f32,
+    pub slim_full: f32,
     pub waist: f32,
     pub belly: f32,
     pub arms: f32,
@@ -133,7 +136,7 @@ impl SculptSliders {
         let blend = |own: f32, extra: f32| (own + extra).clamp(-100.0, 100.0);
         let (ai, swan) = (self.ai_sculpt, self.swan_neck);
         Self {
-            slim_body: blend(self.slim_body, ai * 0.60),
+            slim_full: blend(self.slim_full, ai * 0.60),
             waist: blend(self.waist, ai * 0.50),
             belly: blend(self.belly, ai * 0.40),
             arms: blend(self.arms, ai * 0.50),
@@ -505,7 +508,7 @@ pub(crate) enum Kernel {
     /// ribs and the hips.
     Bump { centre: f64, half: f64 },
     /// Smoothstep up over `ease`, full between `lo + ease` and `hi - ease`, smoothstep down.
-    /// The whole-torso rows (slim body) use it: a broad plateau, not a band.
+    /// The whole-torso rows (both slim rows) use it: a broad plateau, not a band.
     Plateau { lo: f64, hi: f64, ease: f64 },
 }
 
@@ -601,35 +604,63 @@ impl Part {
 /// approximate when there is none: the torso width profile and the hip and bust radials.
 /// Limb and shoulder rows are joint geometry in either case.
 fn fit_placed(name: &str) -> bool {
-    matches!(name, "slim body" | "waist" | "belly" | "left hip" | "right hip" | "left bust" | "right bust")
+    matches!(name, "slim upper body" | "slim full body" | "waist" | "belly" | "left hip" | "right hip" | "left bust" | "right bust")
 }
 
 /// Whether a row shapes the hand: the pose has no hand landmarks, so the palm and fingers
 /// follow the forearm's direction — the row is reported approximate even when its forearm is
-/// measured.
+/// measured. The slim-full lower-arm rows shape the hand the same way.
 fn hand_shaped(name: &str) -> bool {
-    matches!(name, "left lower arm" | "right lower arm")
+    name.ends_with(" lower arm")
 }
 
 /// The parts, table order = build order (the superposition is order-stable, which is part of
 /// the determinism the smart filter relies on).
 const PARTS: &[Part] = &[
     Part {
-        name: "slim body",
-        slider: |s| s.slim_body,
-        // The torso only: the limbs have their own rows, and a contract about the torso axis
-        // would pull both legs toward the centre instead of slimming each. The old row also
-        // needed the ankles, so a cropped or skirt-hidden pair killed the whole slider.
+        name: "slim upper body",
+        slider: |s| s.slim_upper,
+        // The torso above the waist only: the hips and the legs stay out, so the row reads as
+        // the upper body narrowing together rather than a squeeze the whole figure feels.
         needs: &[11, 12, 23, 24],
         shape: |f| {
-            // One continuous envelope down the whole torso, its width following the measured
-            // contour at every level and its strength a broad plateau: the slim slider reads
-            // as the silhouette narrowing, not as bands that end in seams.
+            // One continuous envelope from the shoulders to the waist, its width following
+            // the measured contour at every level and its strength full the whole way down:
+            // the chest, the ribs and the waist narrow as one, easing out below the waist so
+            // the hips do not follow. Without a fit the anatomical waist (0.70) stands in.
+            let waist = f.fit.map_or(0.70, |fit| f64::from(fit.waist.t));
             let levels = f.torso_levels();
             let gain = if f.fit.is_some() { 0.14 } else { 0.10 };
-            f.profile(f.shoulder_mid(), f.hip_mid(), levels, Kernel::Plateau { lo: 0.0, hi: 1.05, ease: 0.25 }, gain)
+            f.profile(f.shoulder_mid(), f.hip_mid(), levels, Kernel::Plateau { lo: -0.20, hi: waist + 0.20, ease: 0.20 }, gain)
         },
     },
+    Part {
+        name: "slim full body",
+        slider: |s| s.slim_full,
+        // The whole body's own row is the torso; the legs and arms below ride the same
+        // slider through their own rows (each about its own bone, so two legs narrow each
+        // on itself instead of being dragged toward the centre axis).
+        needs: &[11, 12, 23, 24],
+        shape: |f| {
+            // Full from the shoulders through the hips and easing out just below them, where
+            // the thigh rows take over: the torso reads as one coordinated narrowing, not a
+            // band that stops at the waistband while the middle of the body stays still.
+            let levels = f.torso_levels();
+            let gain = if f.fit.is_some() { 0.14 } else { 0.10 };
+            f.profile(f.shoulder_mid(), f.hip_mid(), levels, Kernel::Plateau { lo: -0.20, hi: 1.20, ease: 0.20 }, gain)
+        },
+    },
+    // The slim-full rows over the limbs: gentler than the parts' own sliders (the whole-body
+    // row is a coordinated pass, not a reshape of one part), each limb narrowing about its
+    // own bone so the silhouette stays continuous from the torso into the legs and arms.
+    Part { name: "slim full body left thigh", slider: |s| s.slim_full, needs: &[23, 25], shape: |f| limb(f, 23, 25, 0.42, 0.20) },
+    Part { name: "slim full body right thigh", slider: |s| s.slim_full, needs: &[24, 26], shape: |f| limb(f, 24, 26, 0.42, 0.20) },
+    Part { name: "slim full body left calf", slider: |s| s.slim_full, needs: &[25, 27], shape: |f| limb(f, 25, 27, 0.32, 0.18) },
+    Part { name: "slim full body right calf", slider: |s| s.slim_full, needs: &[26, 28], shape: |f| limb(f, 26, 28, 0.32, 0.18) },
+    Part { name: "slim full body left upper arm", slider: |s| s.slim_full, needs: &[11, 13], shape: |f| arm(f, 11, 13, 0.18) },
+    Part { name: "slim full body right upper arm", slider: |s| s.slim_full, needs: &[12, 14], shape: |f| arm(f, 12, 14, 0.18) },
+    Part { name: "slim full body left lower arm", slider: |s| s.slim_full, needs: &[13, 15], shape: |f| forearm(f, 13, 15, 0.16) },
+    Part { name: "slim full body right lower arm", slider: |s| s.slim_full, needs: &[14, 16], shape: |f| forearm(f, 14, 16, 0.16) },
     Part {
         name: "waist",
         slider: |s| s.waist,
@@ -935,15 +966,15 @@ pub fn sculpt_field(spec: &SculptSpec, bounds: Rect, cell: f64) -> (LiquifyField
     }
     // The fit measured no crease (waist) or no bump (belly) and placed that row from the
     // body's own proportions instead: the rows it feeds are approximate, and the report says
-    // so rather than showing them as measured. Slim Body reads the whole torso profile, so
-    // either prior makes it approximate.
+    // so rather than showing them as measured. Both slim rows read the whole torso profile,
+    // so either prior makes either approximate.
     if let Some(fit) = spec.fit.as_ref() {
         for (part, ..) in &asked {
             match part.name {
                 "waist" if fit.waist_prior => report.approximate.push((part.name, WAIST_PRIOR_REASON)),
                 "belly" if fit.belly_prior => report.approximate.push((part.name, BELLY_PRIOR_REASON)),
-                "slim body" if fit.waist_prior || fit.belly_prior => {
-                    report.approximate.push((part.name, if fit.waist_prior { WAIST_PRIOR_REASON } else { BELLY_PRIOR_REASON }));
+                n @ ("slim upper body" | "slim full body") if fit.waist_prior || fit.belly_prior => {
+                    report.approximate.push((n, if fit.waist_prior { WAIST_PRIOR_REASON } else { BELLY_PRIOR_REASON }));
                 }
                 _ => {}
             }
@@ -1670,7 +1701,8 @@ mod tests {
     #[test]
     fn every_slider_alone_moves_the_field() {
         for sliders in [
-            SculptSliders { slim_body: 100.0, ..SculptSliders::default() },
+            SculptSliders { slim_upper: 100.0, ..SculptSliders::default() },
+            SculptSliders { slim_full: 100.0, ..SculptSliders::default() },
             SculptSliders { waist: 100.0, ..SculptSliders::default() },
             SculptSliders { belly: 100.0, ..SculptSliders::default() },
             SculptSliders { arms: 100.0, ..SculptSliders::default() },
@@ -1935,18 +1967,64 @@ mod tests {
         assert!(leg[0] < -1.0, "the thigh's own rim must pull toward its bone: {leg:?}");
     }
 
+    /// The slim torso rows need no ankles — a cropped or skirt-hidden pair must not kill
+    /// them. Slim Full Body's calf rows ride ankles the silhouette still contains, so they
+    /// run at reduced strength and the report says the position is inferred rather than
+    /// presenting a guess as measured.
     #[test]
-    fn the_fitted_slim_body_needs_no_ankles() {
+    fn unseen_ankles_slow_the_calves_but_not_the_torso_slim() {
         let mut anchors = standing();
         for i in [27usize, 28] {
             anchors.pose[i][2] = 0.0;
         }
-        let spec = SculptSpec { sliders: SculptSliders { slim_body: 100.0, ..SculptSliders::default() }, anchors, fit: Some(fitted()) };
+        let spec = SculptSpec { sliders: SculptSliders { slim_upper: 100.0, slim_full: 100.0, ..SculptSliders::default() }, anchors, fit: Some(fitted()) };
         let (field, report) = sculpt_field(&spec, bounds(), CELL);
-        assert!(report.applied.contains(&"slim body"), "{report:?}");
         assert!(report.skipped.is_empty(), "{report:?}");
+        for part in ["slim upper body", "slim full body", "slim full body left thigh", "slim full body left calf"] {
+            assert!(report.applied.contains(&part), "{part} missing: {report:?}");
+        }
+        assert!(
+            report.approximate.iter().any(|(n, why)| *n == "slim full body left calf" && why.contains("inferred")),
+            "the calf rows say their ankles are inferred: {report:?}"
+        );
         let rim = field.sample(320.0, 300.0);
-        assert!(rim[0] > 1.0, "the fitted slim body must pull the torso contour in: {rim:?}");
+        assert!(rim[0] > 1.0, "the fitted slim rows must pull the torso contour in: {rim:?}");
+    }
+
+    /// 瘦上身 narrows the upper body as one: the chest and the waist both pull, and the pull
+    /// has eased away by the hips so the lower body does not follow. The rim points sit on
+    /// the silhouette rows the fit measured (the couple keeps the field inside them).
+    #[test]
+    fn slim_upper_narrows_above_the_waist_and_leaves_the_hips_still() {
+        let (field, report) = sculpt_field(&fitted_spec(SculptSliders { slim_upper: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        assert!(report.applied.contains(&"slim upper body"), "{report:?}");
+        let chest = field.sample(324.0, 246.0)[0].abs(); // the row rim at t ≈ 0.30
+        let waist = field.sample(327.0, 295.0)[0].abs(); // the row rim at t ≈ 0.52
+        let hip = field.sample(334.0, 400.0)[0].abs(); // the row rim at t = 1.0
+        assert!(chest > 1.0 && waist > 1.0, "the chest and the waist narrow together: {chest:.2}, {waist:.2}");
+        assert!(waist > chest * 0.5, "the pull is coordinated, not a band at the chest: {waist:.2} vs {chest:.2}");
+        assert!(hip < waist * 0.25, "the hips stay still below the fade: {hip:.2} vs {waist:.2}");
+    }
+
+    /// 瘦全身 moves the whole body in one pass: the torso pulls through the hips, the thigh
+    /// and the arm follow on their own bones, and the interior moves too — a proportional
+    /// narrowing, not a squeeze on the silhouette's sides with the middle left standing.
+    #[test]
+    fn slim_full_moves_the_whole_body_and_its_interior() {
+        let (field, report) = sculpt_field(&fitted_spec(SculptSliders { slim_full: 100.0, ..SculptSliders::default() }), bounds(), CELL);
+        for part in ["slim full body", "slim full body left thigh", "slim full body left upper arm", "slim full body left lower arm"] {
+            assert!(report.applied.contains(&part), "{part} missing: {report:?}");
+        }
+        let hip = field.sample(334.0, 400.0)[0].abs(); // the row rim at the hip joints, t = 1.0
+        assert!(hip > 1.0, "the torso pull carries through the hips: {hip:.2}");
+        let thigh = field.sample(184.0, 470.0)[0]; // the left thigh's outer rim
+        assert!(thigh < -0.5, "the thigh narrows about its own bone: {thigh:.2}");
+        let arm = field.sample(176.0, 228.0)[0]; // the left upper arm's outer rim
+        assert!(arm < -0.5, "the arm follows the whole-body pass: {arm:.2}");
+        // A third of the way from the axis to the rim at the waist: the body's middle moves
+        // with the rim, proportionally — the slider is a narrowing, not a side pinch.
+        let interior = field.sample(281.0, 295.0)[0].abs();
+        assert!(interior > 0.3, "the interior follows the rim: {interior:.2}");
     }
 
     #[test]
@@ -2004,7 +2082,8 @@ mod tests {
     #[test]
     fn the_fitted_slimming_stack_does_not_fold() {
         let sliders = SculptSliders {
-            slim_body: 100.0,
+            slim_upper: 100.0,
+            slim_full: 100.0,
             waist: 100.0,
             belly: 100.0,
             arms: 100.0,
@@ -2119,7 +2198,8 @@ mod tests {
     fn every_slider_at_full_superposes_smoothly() {
         for sign in [1.0f32, -1.0f32] {
             let sliders = SculptSliders {
-                slim_body: 100.0 * sign,
+                slim_upper: 100.0 * sign,
+                slim_full: 100.0 * sign,
                 waist: 100.0 * sign,
                 belly: 100.0 * sign,
                 arms: 100.0 * sign,
@@ -2177,7 +2257,7 @@ mod tests {
         let near = |a: f32, b: f32| (a - b).abs() < 0.01;
         // AI塑形 alone moves the slim family and leaves the rounder zones alone.
         let c = SculptSliders { ai_sculpt: 100.0, ..SculptSliders::default() }.composed();
-        assert!(near(c.waist, 50.0) && near(c.slim_body, 60.0));
+        assert!(near(c.waist, 50.0) && near(c.slim_full, 60.0));
         assert!(near(c.hips, 0.0) && near(c.bust, 0.0), "the silhouette slider does not round the zones");
         // It stacks with a manual slider and clamps at the stop.
         let c = SculptSliders { ai_sculpt: 100.0, waist: 70.0, ..SculptSliders::default() }.composed();

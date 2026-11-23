@@ -1,4 +1,4 @@
-//! Filter › Body Sculpt: whole-body shaping from the body-pose foundation — twenty-two
+//! Filter › Body Sculpt: whole-body shaping from the body-pose foundation — twenty-three
 //! bidirectional shaping sliders (PixCake's 全身美型 panel in this fork's terms) whose warp
 //! [`photocraft_algo::sculpt`] writes analytically over Liquify's own field, so the pixel
 //! work, the selection limit and the smart-filter replay are all the distortion family's.
@@ -40,8 +40,9 @@ fn bad(msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: SCULPT.into(), msg: msg.into() }
 }
 
-/// One slider out of params: absent is zero (the dialog sends all twenty-two, a script the few
-/// it means), a non-number is refused, the range clamps like the dialog's own slider stops.
+/// One slider out of params: absent is zero (the dialog sends all twenty-three, a script the
+/// few it means), a non-number is refused, and the range clamps as a backstop — the schema
+/// gate has already refused out-of-range numbers by the time this runs.
 fn slider(p: &Value, key: &str) -> Result<f32> {
     let raw = match p.get(key) {
         None => 0.0,
@@ -52,7 +53,8 @@ fn slider(p: &Value, key: &str) -> Result<f32> {
 
 fn sliders(p: &Value) -> Result<SculptSliders> {
     Ok(SculptSliders {
-        slim_body: slider(p, "slimBody")?,
+        slim_upper: slider(p, "slimUpper")?,
+        slim_full: slider(p, "slimFull")?,
         waist: slider(p, "waist")?,
         belly: slider(p, "belly")?,
         arms: slider(p, "arms")?,
@@ -110,21 +112,22 @@ fn fit_of(p: &Value) -> Option<BodyFit> {
 }
 
 /// The user's placement lines, in torso units. `waistLine` and `bellyLine` are percentages of
-/// the shoulder-mid → hip-mid span: ±100 moves the row ±0.30 and ±300 (±0.90, the whole torso
-/// either way) is the stop; 0 leaves the measured or prior row. Their stop is wider than the
-/// shaping sliders' because a waistband can sit far from the anatomical row, and a line that
-/// stops short places the row where the user did not ask. Out-of-range values are refused
-/// rather than clamped: a script that mistypes one should hear about it instead of getting a
-/// silently different line.
+/// the shoulder-mid → hip-mid span: ±100 moves the row ±0.30 and ±500 (±1.50, past the hip
+/// joints into the thighs) is the stop; 0 leaves the measured or prior row. Their stop is far
+/// wider than the shaping sliders' because a waistband or a belly can sit well below the
+/// anatomical row — a low-slung waistband reads at the hip joints, a fuller belly below them —
+/// and a line that stops short places the row where the user did not ask. Out-of-range values
+/// are refused rather than clamped: a script that mistypes one should hear about it instead of
+/// getting a silently different line.
 fn line_offsets(p: &Value) -> Result<(f64, f64)> {
     let one = |key: &str| -> Result<f64> {
         match p.get(key) {
             None | Some(Value::Null) => Ok(0.0),
             Some(v) => {
                 let v =
-                    v.as_f64().ok_or_else(|| bad(format!("`{key}` is a percentage of the shoulder→hip-joint span (-300..300; 0 leaves the measured row)")))?;
-                if !(-300.0..=300.0).contains(&v) {
-                    return Err(bad(format!("`{key}` must be -300..300")));
+                    v.as_f64().ok_or_else(|| bad(format!("`{key}` is a percentage of the shoulder→hip-joint span (-500..500; 0 leaves the measured row)")))?;
+                if !(-500.0..=500.0).contains(&v) {
+                    return Err(bad(format!("`{key}` must be -500..500")));
                 }
                 Ok(v / 100.0 * 0.30)
             }
@@ -151,7 +154,9 @@ fn line_level(fit: &BodyFit, anchors: &SculptAnchors, level: LevelFit, offset: f
     if ab[1].abs() <= 1e-6 || !ab.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let target = (f64::from(level.t) + offset).clamp(0.04, 1.20);
+    // The clamp admits the thighs (t past 1.0): a low waistband or a fuller belly sits below
+    // the hip joints, and stopping the line at the hips put it above where the user drew it.
+    let target = (f64::from(level.t) + offset).clamp(0.02, 1.60);
     let target_y = s[1] + target * ab[1];
     // The stored rows are document pixels ordered by y, and t is the fraction of the way down
     // the shoulder→hip-joint line, so the nearest row in y is the nearest row in t. Rows whose
@@ -951,7 +956,7 @@ pub(crate) fn apply_to_surface(params: &Value, surf: &Surface, canvas: Rect) -> 
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"slimBody":-100..100=0,"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"forearms":-100..100=0 (the lower arm from the elbow past the wrist through the palm and fingers; the pose has no hand landmarks, so the hand follows the forearm's direction and the report marks it approximate),"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"waistLine":-300..300=0 (placement: moves the fitted waist row by 30% of the shoulder→hip-joint span per 100, up to 90% either way at ±300, positive downward; 0 leaves the measured or prior row. Set it on a visible waistband the outline's crease test missed; the row's own silhouette width follows),"bellyLine":-300..300=0 (placement: the same for the belly row, so a front-on belly the side outline cannot confirm still gets a line the user trusts),"symmetry":0..100=0 (对称液化·上半身: the paired joints align toward each other's mirror about the torso axis),"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action — Waist narrows, Hips rounds, Leg Length lengthens; with `anchors` the analysis never runs on Apply),"anchors":{…}? (`portrait.analyze`'s document-pixel anchors — the panel supplies them so Apply is a field build and a warp; without them one lightweight pose analysis runs. Stored with the smart filter so re-renders replay exactly; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const P: &str = r##"{"slimUpper":-100..100=0 (瘦身上身: the torso above the waist narrows as one coordinated envelope — shoulders, chest and waist together, easing out below the waist so the hips and legs stay still),"slimFull":-100..100=0 (瘦身全身: the whole body narrows in one coordinated pass — the torso through the hips, the legs and the arms each about their own bones, so the silhouette reads as a whole-body slim rather than a squeeze on the torso's sides),"waist":-100..100=0,"belly":-100..100=0,"arms":-100..100=0,"forearms":-100..100=0 (the lower arm from the elbow past the wrist through the palm and fingers; the pose has no hand landmarks, so the hand follows the forearm's direction and the report marks it approximate),"thighs":-100..100=0,"calves":-100..100=0,"shoulders":-100..100=0,"hips":-100..100=0,"bust":-100..100=0,"headSize":-100..100=0,"neck":-100..100=0,"height":-100..100=0,"legLength":-100..100=0,"waistLength":-100..100=0,"torsoLength":-100..100=0,"neckLength":-100..100=0,"aiSculpt":-100..100=0 (composition: a gentle whole-body slim layered over the shaping sliders),"swanNeck":-100..100=0 (composition: slim + lengthen + square the shoulders),"straightShoulders":-100..100=0,"bustLift":-100..100=0,"doubleChin":-100..100=0,"waistLine":-500..500=0 (placement: moves the fitted waist row by 30% of the shoulder→hip-joint span per 100, up to 150% either way at ±500 — past the hip joints into the thighs, positive downward; 0 leaves the measured or prior row. Set it on a visible waistband the outline's crease test missed; the row's own silhouette width follows),"bellyLine":-500..500=0 (placement: the same for the belly row, so a front-on belly the side outline cannot confirm still gets a line the user trusts),"symmetry":0..100=0 (对称液化·上半身: the paired joints align toward each other's mirror about the torso axis),"smooth":0..100=0 (身型流畅: the silhouette contour, low-passed and relaxed — bumps like a trapezius slope or an arm bulge flatten to their base; the contour is embedded from the person mask at apply time, like the anchors) (each slider's positive direction is its label's action — Waist narrows, Hips rounds, Leg Length lengthens; with `anchors` the analysis never runs on Apply),"anchors":{…}? (`portrait.analyze`'s document-pixel anchors — the panel supplies them so Apply is a field build and a warp; without them one lightweight pose analysis runs. Stored with the smart filter so re-renders replay exactly; never typed),"fit":{…}? (the body fit measured off the person mask — the fitted rows the slimming sliders and the placement lines act on; stored beside the anchors so re-renders replay exactly; never typed),"contour":[[x,y]…] (身型流畅's person contour as document-pixel points, embedded at apply time like the anchors; never typed),"meshSize":px? (field resolution, px per node),"sampleAllLayers":bool=false,"layer":id?} — a selection limits the effect; on a smart object it becomes a smart filter"##;
     vec![CommandSpec {
         id: SCULPT,
         label: "Body Sculpt…",
@@ -1206,8 +1211,8 @@ mod tests {
         assert!(!moved.belly_prior, "a placed belly is not the prior any more");
     }
 
-    /// The stop is wide enough to cross the whole torso: the belly line at the new ±300 stop
-    /// reaches rows the old ±100 stop could not, so a waistband far from the anatomical row is
+    /// The stop is wide enough to cross the whole torso: the belly line at the ±300 stop
+    /// reaches rows a ±100 stop could not, so a waistband far from the anatomical row is
     /// still placeable. The line lands on the nearest measurable row, not the exact target.
     #[test]
     fn a_placement_line_reaches_further_than_the_shaping_sliders() {
@@ -1224,14 +1229,51 @@ mod tests {
         assert!(far < fit.waist.t, "the far line is above the waist row: {far:.2} vs {:.2}", fit.waist.t);
     }
 
+    /// The same person in a pencil skirt: the legs read as one run down to the hem, so the
+    /// silhouette's measurable rows continue below the hip joints — where a low waistband or
+    /// a fuller belly actually sits.
+    fn skirted_mask() -> Surface {
+        let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        m.fill_rect(Rect::new(0, 0, 256, 384), &[0.0]);
+        for (x0, x1, y0, y1) in [
+            (110, 146, 40, 85),  // head
+            (90, 166, 90, 110),  // shoulders
+            (94, 162, 110, 150), // chest
+            (92, 164, 150, 180), // waist
+            (88, 168, 180, 210), // hips
+            (94, 162, 210, 345), // the skirt: one run through the legs to the hem
+            (72, 88, 90, 170),   // left arm
+            (168, 184, 90, 170), // right arm
+        ] {
+            m.fill_rect(Rect::new(x0, y0, x1, y1), &[1.0]);
+        }
+        m
+    }
+
+    /// A line has to reach below the hip joints: a low-slung waistband or a fuller belly sits
+    /// past them, and the old stop both refused the offset beyond ±300 and clamped the row
+    /// at t = 1.20 — the line stuck above where the user drew it. The wider stop admits the
+    /// offset and the row lands in the skirt.
+    #[test]
+    fn a_placement_line_reaches_below_the_hip_joints() {
+        let anchors = body_anchors();
+        let fit = body_fit(&anchors, &skirted_mask()).expect("the synthetic person fits");
+        let (waist, belly) = line_offsets(&json!({"waistLine": 500, "bellyLine": -500})).unwrap();
+        assert!((waist - 1.50).abs() < 1e-9 && (belly + 1.50).abs() < 1e-9, "±500 is ±150% of the span: {waist}, {belly}");
+        let mut moved = fit.clone();
+        assert!(apply_lines(&mut moved, &anchors, line_offsets(&json!({"bellyLine": 300})).unwrap()).is_empty());
+        assert!(moved.belly.t > 1.25, "the line lands below the hip joints, past the old 1.20 clamp: {:.2}", moved.belly.t);
+        assert!(!moved.belly_prior, "a placed belly is not the prior any more");
+    }
+
     #[test]
     fn placement_lines_refuse_values_outside_the_span() {
-        assert!(line_offsets(&json!({"waistLine": 301})).is_err());
-        assert!(line_offsets(&json!({"bellyLine": -301})).is_err());
+        assert!(line_offsets(&json!({"waistLine": 501})).is_err());
+        assert!(line_offsets(&json!({"bellyLine": -501})).is_err());
         assert!(line_offsets(&json!({"waistLine": "low"})).is_err());
         assert_eq!(line_offsets(&json!({"waistLine": 100, "bellyLine": -100})).unwrap(), (0.30, -0.30));
-        let (waist, belly) = line_offsets(&json!({"waistLine": 300, "bellyLine": -300})).unwrap();
-        assert!((waist - 0.90).abs() < 1e-9 && (belly + 0.90).abs() < 1e-9, "±300 is ±90% of the span: {waist}, {belly}");
+        let (waist, belly) = line_offsets(&json!({"waistLine": 500, "bellyLine": -500})).unwrap();
+        assert!((waist - 1.50).abs() < 1e-9 && (belly + 1.50).abs() < 1e-9, "±500 is ±150% of the span: {waist}, {belly}");
     }
 
     /// The panel draws the rows the field acts on: the moved waist line sits on the hip row and
@@ -1455,10 +1497,10 @@ mod tests {
     fn sliders_clamp_and_bad_ones_are_refused() {
         let mut s = crate::session();
         s.execute("file.new", json!({"width": 32, "height": 32, "background": "white"})).unwrap();
-        // 250 clamps to 100 (a number in range is accepted), which then asks for a person
-        // the plain image cannot give — the clamp passed, the analysis answered.
+        // A mistyped 250 is an error naming the range (the schema gate), not a silently
+        // clamped warp; a non-number is refused the same way.
         let err = s.execute(SCULPT, json!({"waist": 250.0})).unwrap_err().to_string();
-        assert!(err.contains("no person"), "{err}");
+        assert!(err.contains("-100..100"), "{err}");
         assert!(s.execute(SCULPT, json!({"waist": "slim"})).is_err());
     }
 
@@ -1608,7 +1650,8 @@ mod tests {
             // The calibration table: every slider alone at +100.
             type Single = (&'static str, fn(f32) -> SculptSliders);
             let singles: Vec<Single> = vec![
-                ("slimBody", |v| SculptSliders { slim_body: v, ..SculptSliders::default() }),
+                ("slimUpper", |v| SculptSliders { slim_upper: v, ..SculptSliders::default() }),
+                ("slimFull", |v| SculptSliders { slim_full: v, ..SculptSliders::default() }),
                 ("waist", |v| SculptSliders { waist: v, ..SculptSliders::default() }),
                 ("belly", |v| SculptSliders { belly: v, ..SculptSliders::default() }),
                 ("arms", |v| SculptSliders { arms: v, ..SculptSliders::default() }),
@@ -1712,7 +1755,7 @@ mod tests {
             // A realistic slimming stack, exported for the eyeball pass: the smart-filter
             // export below proves replay, this one shows what a user sees.
             if let Some(path) = std::env::var_os("PHOTOCRAFT_SCULPT_SLIM_OUT") {
-                let stack = json!({"slimBody": 40, "waist": 70, "belly": 60, "arms": 60, "thighs": 60, "calves": 50, "hips": 40, "bust": 30});
+                let stack = json!({"slimFull": 40, "waist": 70, "belly": 60, "arms": 60, "thighs": 60, "calves": 50, "hips": 40, "bust": 30});
                 let r = s.execute(SCULPT, stack)?;
                 assert_eq!(r["changed"], json!(true), "{r}");
                 s.execute("layer.quickExportAsPng", json!({"path": path.to_string_lossy().into_owned()}))?;

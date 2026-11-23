@@ -519,7 +519,7 @@ mod tests {
         }
         // A params-carrying invocation is a replay, not an opener: the engine runs it.
         app.sculpt = None;
-        assert!(menu(&mut app, &ctx, crate::sculpt_ui::BODY, &json!({"slimBody": 10})).is_none());
+        assert!(menu(&mut app, &ctx, crate::sculpt_ui::BODY, &json!({"slimFull": 10})).is_none());
         assert!(app.sculpt.is_none());
     }
 }

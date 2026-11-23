@@ -71,7 +71,7 @@ fn each_slider_is_named_after_its_row_label() {
     h.run_steps(3);
     let named: Vec<String> =
         h.query_all_by_role(egui::accesskit::Role::Slider).filter_map(|node| node.accesskit_node().labelled_by().find_map(|label| label.value())).collect();
-    for row in ["Slim Body", "Waist", "Belly"] {
+    for row in ["Slim Upper Body", "Slim Full Body", "Waist", "Belly"] {
         assert!(named.iter().any(|name| name == row), "a slider is named {row}: {named:?}");
     }
 }
@@ -92,7 +92,8 @@ fn the_placement_rows_carry_the_line_offsets() {
         assert!(named.iter().any(|name| name == row), "a slider is named {row}: {named:?}");
     }
     // The placement rows take the wider stop: their slider reaches beyond the shaping sliders'
-    // ±100, so a waistband far from the anatomical row is still reachable.
+    // ±100 and past the hip joints, so a waistband or a belly below the anatomical row is
+    // still reachable.
     let (lo, hi) = {
         let node = h
             .query_all_by_role(egui::accesskit::Role::Slider)
@@ -101,7 +102,7 @@ fn the_placement_rows_carry_the_line_offsets() {
         let a11y = node.accesskit_node();
         (a11y.min_numeric_value(), a11y.max_numeric_value())
     };
-    assert_eq!((lo, hi), (Some(-300.0), Some(300.0)), "the placement line reaches the whole torso, not only ±100");
+    assert_eq!((lo, hi), (Some(-500.0), Some(500.0)), "the placement line reaches past the hips, not only ±100");
     let panel = h.state_mut().sculpt.as_mut().expect("panel open");
     assert!(panel.params().get("waistLine").is_none() && panel.params().get("bellyLine").is_none(), "zero is auto and sends nothing: {}", panel.params());
     panel.set("waistLine", 40.0);
