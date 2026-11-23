@@ -382,3 +382,29 @@ dialogs::run 每帧泵)。左侧分区导航(身体:塑形/组合/长度/精修;
 给了它控件);应用后面板保持打开(PixCake 工作流),底部 应用/重置/关闭。
 词条 ~86 条进 craft-i18n(两简繁,`c62bb43`)。通用 schema 对话框仍可经脚本/
 Actions 使用(命令参数未变);预览仍退出(与对话框无关的分析成本问题)。
+
+## 2026-11-23: 并入 upstream engine 拆分(step 3-4)
+
+upstream main 把 engine 源码迁到新 crate `photocraft-engine-core`,facade
+`photocraft-engine` 只剩 `src/facade.rs` 再导出(photocraft#15710)。合并
+(`8509fd121`)的三类适配:
+
+- **命令文件搬家**:分支新增的 sculpt_cmds / face_sculpt_cmds / portrait_cmds 随目录
+  改名进 `crates/engine-core/src/cmd/`;engine-core 补 `photocraft-ml`、
+  `photocraft-portrait` 依赖与 `ort` 特性(命令直接用它们,session 的
+  `portrait_cache` 也是)。layers 表:portrait L4、engine-core L5。
+- **ort 转发多一跳**:app → engine → engine-core → photocraft-ml。app 层用法不变
+  (`cargo build -p photocraft --features ort`);engine 侧 ort 档入口从
+  `-p photocraft-engine --features photocraft-ml/ort` 变为
+  `-p photocraft-engine-core --features ort`(facade 不再直接依赖 ml)。
+- **测试入口约定**:engine-core 的测试拿 session 用 `crate::session()`(装好本 crate
+  的命令),不能用 `Session::new()`——后者不再安装命令(facade 的 `Session::new()`
+  才装)。陷阱:全量跑时字母序靠前的模块先 install,过滤跑会 `NotInstalled`,
+  而全量绿是"蹭"出来的假绿(本次实测:过滤跑 sculpt_ 14 失败、全量跑 0 失败)。
+  分支 23 处已改;**以后在 engine-core 写新测试一律 `crate::session()`**。
+
+facade 的 dev-dependencies 留 `photocraft-ml` 与 `tract-onnx`:4 个 probe 示例
+(class_probe / fashion_probe / pose_probe / portrait_diag)仍在
+`crates/engine/examples/` 直接调 ml 与 tract,示例入口 `-p photocraft-engine`
+不变(ort 档加 facade 自己的 `--features ort`)。operational 配方同步更新在
+[`new-machine.md`](new-machine.md)、[`models.md`](models.md)、[`macos-dev.md`](macos-dev.md)。

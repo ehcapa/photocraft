@@ -76,14 +76,17 @@ canonical,误判为越界。upstream CI 无 macOS,盲区。
 - `cargo test -p photocraft-ui-egui` 与 `--exclude` 变体都不可用(分别踩坑 1 的两面)。
 - 回馈 upstream 后更新本文件与 [`README.md`](README.md) 索引。
 
-## 4. engine 的 allocation.rs 非 UTF-8 路径测试失败(2026-11-19 发现)
+## 4. engine 的 allocation.rs 非 UTF-8 路径测试失败(2026-11-19 发现,2026-11-23 复验)
 
-**现象。** `cargo test -p photocraft-engine --lib` 全量跑时
+**现象。** `cargo test -p photocraft-engine-core --lib` 全量跑时
 `allocation::tests::read_file_within_reads_a_path_that_is_not_utf8` 失败:
 `Os { code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`。
 
-**根因。** macOS 对非 UTF-8 文件名的系统调用语义与 Linux 不同(EILCASE 一族),
-干净树同样失败(stash 验证过),与本地改动无关。upstream CI 无 macOS,盲区。
+**根因。** macOS(APFS)对非 UTF-8 文件名的系统调用语义与 Linux 不同(EILSEQ 一族,
+ext4 接受任意字节,APFS 拒绝),干净树同样失败(stash 验证过),与本地改动无关。
+2026-11-23 合并 upstream engine 拆分后该文件随目录改名到
+`crates/engine-core/src/allocation.rs`,与 main 逐字节一致,失败照旧。upstream CI
+无 macOS,盲区。
 
 **现状。** 环境既有问题,本地验证时忽略;待回馈 upstream。
 
@@ -102,7 +105,8 @@ rmeta。`--workspace` 与 `-p` 选中的单元不同,不是代码问题。
 `cargo check --workspace -v 2>&1 | grep 'extern photocraft_ml='` 看 engine 实际
 消费的 rmeta 路径,再对 `ls -la target/debug/build/photocraft-ml/` 的日期。
 方向性口诀:**与坑 1(feature 统一)相反**——坑 1 是 `-p` 失败 `--workspace`
-通过,本坑是 `--workspace` 失败 `-p` 通过,先分清再动手。
+通过,本坑是 `--workspace` 失败 `-p` 通过,先分清再动手。(2026-11-23 engine 拆分
+后单元测试搬进 engine-core,对照检查用 `-p photocraft-engine-core`。)
 
 ## 6. ui-egui 的 kittest 无头测试在 macOS 找不到菜单节点(2026-11-20 发现)
 

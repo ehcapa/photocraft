@@ -55,8 +55,9 @@ export ORT_DYLIB_PATH=~/Project/Rust/onnxruntime/lib/libonnxruntime.so   # Linux
 ```sh
 cargo build -p photocraft                                   # 纯 Rust 默认档
 cargo build -p photocraft --features ort                    # + ort 档(feynobg)
-#   app 的 ort 是转发 feature(engine → photocraft-ml/ort);`--features photocraft-ml/ort`
-#   只在直接依赖 ml 的包上合法(如 -p photocraft-engine),从 app 传会报 does not contain this feature
+#   app 的 ort 是转发 feature(engine → engine-core → photocraft-ml/ort,2026-11-23
+#   engine 拆分后多一跳);`--features photocraft-ml/ort` 只在直接依赖 ml 的包上合法
+#   (如 -p photocraft-engine-core),从 app 传会报 does not contain this feature
 ```
 
 **Linux 坑(Ubuntu 22.04,glibc 2.35)**:pyke 预编译的 onnxruntime 静态库要 glibc ≥ 2.38 +
@@ -83,11 +84,11 @@ nm -D libonnxruntime.so | grep OrtGetApiBase    # 验证入口存在
 ```sh
 # 单元测试必须 workspace 级入口(单包 -p 会踩 egui/serde 统一坑):
 cargo test --workspace --lib -- portrait
-# 带模型两态:
-PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models cargo test -p photocraft-engine --lib portrait
+# 带模型两态(2026-11-23 engine 拆分后单元测试都在 engine-core):
+PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models cargo test -p photocraft-engine-core --lib portrait
 # 带 ort(三态,全套 ~2 分钟,每个 create 真跑 10s matte):
 PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models \
-  cargo test -p photocraft-engine --lib --features photocraft-ml/ort portrait
+  cargo test -p photocraft-engine-core --lib --features ort portrait
 # 全量回归里 automation 的 trusted-root 失败是 macOS 已知预存问题,忽略
 ```
 
@@ -97,13 +98,13 @@ PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models \
 PHOTOCRAFT_PORTRAIT_PHOTO=/任意/人像.jpg \
 PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models \
 PHOTOCRAFT_PORTRAIT_OUT=/tmp/out.png \
-  cargo test -p photocraft-engine --lib -- real_photo
+  cargo test -p photocraft-engine-core --lib -- real_photo
 # → 全开管线(修复+磨皮+发色+唇色+提亮+追色)→ 压平导出 PNG,计时打在 stderr
 # 类语义诊断(如需重验映射):
 PHOTOCRAFT_PORTRAIT_PHOTO=/任意/脸部裁剪.jpg PHOTOCRAFT_MODELS_DIR=... \
   cargo run -p photocraft-engine --example class_probe
 # 逐层排障(哪个层/哪个蒙版出问题):每层 solo 合成 + 蒙版 PGM 转储到 /tmp/diag/,
-# 第二参数可选 params JSON(缺省 = 对话框默认配方;要 ort 档加 --features photocraft-ml/ort):
+# 第二参数可选 params JSON(缺省 = 对话框默认配方;要 ort 档加 --features ort):
 PHOTOCRAFT_MODELS_DIR=~/Project/Rust/models \
   cargo run -p photocraft-engine --example portrait_diag -- /任意/人像.jpg
 ```

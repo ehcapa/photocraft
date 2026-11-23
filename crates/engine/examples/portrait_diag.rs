@@ -4,7 +4,7 @@
 //! retouch looks wrong, this names the guilty layer in one run instead of guessing.
 //!
 //! Run: PHOTOCRAFT_MODELS_DIR=<dir> [ORT_DYLIB_PATH=<lib>]
-//!      cargo run -p photocraft-engine --example portrait_diag [--features photocraft-ml/ort] \
+//!      cargo run -p photocraft-engine --example portrait_diag [--features ort] \
 //!          -- <photo> [params JSON, default: the dialog's recipe]
 
 use serde_json::{Value, json};

@@ -53,3 +53,6 @@ ehcapa/photocraft（方向：像素蛋糕式 AI 修图）的 **fork 级**文档�
   (mesh z 旋转投影;`sin_cos` 顺序坑)、AI 面部流畅、面部 gain 校准 + 家族化折叠预算
 - [2026-11-20: 塑形面板的定制 UI](decisions.md) —— 分区面板窗口 + 预设一键行 +
   L/R 链锁控件 + 应用不关面板;词条 86×2 入 craft-i18n;实时预览的修复路径记录待做
+- [2026-11-23: 并入 upstream engine 拆分（step 3-4）](decisions.md) —— 命令文件搬
+  engine-core、ort 转发多一跳（engine-core 侧入口变 `-p photocraft-engine-core
+  --features ort`）、engine-core 测试的 `crate::session()` 约定（过滤跑假绿陷阱）
