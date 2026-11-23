@@ -18,7 +18,7 @@ use crate::PhotocraftApp;
 mod live;
 
 pub use live::Live;
-pub(crate) use live::{apply, display_doc, show_in_canvas};
+pub(crate) use live::{AppliedMap, adopt_committed, apply, display_doc, show_in_canvas};
 
 pub const BODY: &str = "filter.bodySculpt";
 pub const FACE: &str = "filter.faceSculpt";
@@ -41,17 +41,18 @@ const fn r(key: &'static str, label: &'static str) -> Row {
 }
 
 /// A row's slider span. The placement lines move a row up or down the body, and a waistband
-/// can sit far from the anatomical row: their ±300 is ±90% of the shoulder→hip-joint span,
-/// where the shaping sliders' ±100 is the shape's own strength.
+/// or a fuller belly can sit below the hip joints: their ±500 is ±150% of the
+/// shoulder→hip-joint span, where the shaping sliders' ±100 is the shape's own strength.
 fn row_range(key: &str) -> std::ops::RangeInclusive<f32> {
-    if matches!(key, "waistLine" | "bellyLine") { -300.0..=300.0 } else { -100.0..=100.0 }
+    if matches!(key, "waistLine" | "bellyLine") { -500.0..=500.0 } else { -100.0..=100.0 }
 }
 
 const BODY_SECTIONS: &[Section] = &[
     Section {
         name: "Shaping",
         rows: &[
-            r("slimBody", "Slim Body"),
+            r("slimUpper", "Slim Upper Body"),
+            r("slimFull", "Slim Full Body"),
             r("waist", "Waist"),
             r("belly", "Belly"),
             r("arms", "Arms"),
@@ -250,10 +251,15 @@ pub fn dialog_id() -> craft::ui::dialog::DialogId {
 }
 
 /// Opens the panel for `command` (fresh values, every lock linked, no preset chosen), running
-/// its one `portrait.analyze` for the anchors Apply will carry.
+/// its one `portrait.analyze` for the anchors Apply will carry. A target whose pixels already
+/// carry a remembered sculpt reopens at those values: the sliders continue from the committed
+/// warp instead of reading as zero and stacking a full pass on it.
 pub fn open(app: &mut PhotocraftApp, command: &'static str) {
-    app.sculpt = Some(Panel { command, preset: "none".into(), ..Panel::default() });
-    app.sculpt_live = Some(Live::open(app, command));
+    let mut panel = Panel { command, preset: "none".into(), ..Panel::default() };
+    let mut live = Live::open(app, command);
+    adopt_committed(app, &mut live, Some(&mut panel));
+    app.sculpt = Some(panel);
+    app.sculpt_live = Some(live);
 }
 
 /// The panel's status line — the analysis's progress or its refusal — inline above the rows so

@@ -427,6 +427,50 @@ fn a_clear_history_keeps_the_committed_baseline() {
     app.sculpt_live = Some(live);
 }
 
+/// A panel closed and reopened continues from the committed warp: its sliders sit at the
+/// applied values, an untouched reopen requests nothing, and the next drag asks for the
+/// change only. Without the remembered state the fresh panel read its sliders as zero, so
+/// every reopened pass stacked a full warp on the already-sculpted pixels — the image
+/// deformed a little more with each open.
+#[test]
+fn a_reopened_panel_continues_from_the_committed_warp() {
+    let mut app = app(patterned(256, 384));
+    let mut p = panel(BODY);
+    p.values.insert("waist".into(), 50.0);
+    app.sculpt_live = Some(Live::test(&mut app, BODY, body_anchors(256.0, 384.0)));
+    super::apply(&mut app, &mut p);
+    // Close and reopen, as the menu does: a fresh panel and runtime over the same pixels.
+    let mut reopened = panel(BODY);
+    let mut live = Live::test(&mut app, BODY, body_anchors(256.0, 384.0));
+    super::adopt_committed(&app, &mut live, Some(&mut reopened));
+    assert_eq!(reopened.value("waist"), 50.0, "the sliders sit at the committed values");
+    assert_eq!(live.request_params(&reopened.params()), json!({}), "an untouched reopen requests nothing");
+    reopened.values.insert("waist".into(), 60.0);
+    assert_eq!(live.request_params(&reopened.params()), json!({"waist": 10.0}), "the next drag asks for the change only, not a second full warp");
+    app.sculpt_live = Some(live);
+}
+
+/// An undo takes the warp out of the pixels: the reopened panel must not adopt the stale
+/// baseline, or its untouched sliders would read as committed while the image is back to
+/// its old self.
+#[test]
+fn a_reopened_panel_after_an_undo_starts_from_zero() {
+    let mut app = app(patterned(256, 384));
+    let mut p = panel(BODY);
+    p.values.insert("waist".into(), 50.0);
+    app.sculpt_live = Some(Live::test(&mut app, BODY, body_anchors(256.0, 384.0)));
+    super::apply(&mut app, &mut p);
+    assert!(app.session.undo(), "the committed warp is undone");
+    let mut reopened = panel(BODY);
+    let mut live = Live::test(&mut app, BODY, body_anchors(256.0, 384.0));
+    super::adopt_committed(&app, &mut live, Some(&mut reopened));
+    assert_eq!(reopened.value("waist"), 0.0, "no baseline is adopted off the redo branch");
+    assert_eq!(live.request_params(&reopened.params()), json!({}), "the untouched panel requests nothing");
+    reopened.values.insert("waist".into(), 50.0);
+    assert_eq!(live.request_params(&reopened.params()), json!({"waist": 50.0}), "the whole request is the slider's own, from the undone pixels");
+    app.sculpt_live = Some(live);
+}
+
 /// The canvas shows the document without the target layer while the proxy is drawn over it;
 /// the session's document is untouched, and closing the runtime brings the layer back.
 #[test]

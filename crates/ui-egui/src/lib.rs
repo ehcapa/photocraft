@@ -313,6 +313,9 @@ pub struct PhotocraftApp {
     pub sculpt: Option<sculpt_ui::Panel>,
     /// The open panel's one portrait analysis and its live canvas preview (sculpt_ui::live).
     pub sculpt_live: Option<sculpt_ui::Live>,
+    /// The Sculpt panels' last Apply per target (sculpt_ui::live): what a panel closed and
+    /// reopened continues from, so a fresh pass cannot stack a full warp on sculpted pixels.
+    pub(crate) sculpt_applied: sculpt_ui::AppliedMap,
     pub services: Services,
     /// Canvas caches per (document, display): CPU textures hold monitor values; the GPU
     /// canvas state is shared (`canvas::GPU_OUTPUT`).

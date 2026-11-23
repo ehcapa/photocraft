@@ -34,6 +34,47 @@ use super::Panel;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
 
+/// The last Apply's panel state for one sculpt target. The pixels carry the warp, but a
+/// closed panel forgets its sliders — and a fresh panel reads them as zero, so every new
+/// pass stacked a full warp on the already-sculpted pixels, deforming the image a little
+/// more with each open. Remembered on the app (not the panel), so closing and reopening
+/// continues from the committed warp: the sliders sit at the applied values and the next
+/// request is the change from them.
+pub(crate) struct Applied {
+    /// The panel's params at the last Apply, the form [`Live::applied`] holds: the baseline
+    /// the next request diffs from.
+    pub params: Value,
+    /// The panel's own slider values and lock states at the last Apply: what a reopened
+    /// panel's rows show (the resolved `params` alone cannot place a linked pair's sides).
+    pub values: std::collections::BTreeMap<String, f32>,
+    pub locks: std::collections::BTreeMap<String, bool>,
+    /// The history state the warp was committed in: the baseline stands only while that
+    /// state is an ancestor of the current one (or is it).
+    pub state: u64,
+}
+
+/// One remembered [`Applied`] per (document, layer, command).
+pub(crate) type AppliedMap = std::collections::HashMap<(photocraft_doc::DocId, photocraft_doc::LayerId, &'static str), Applied>;
+
+/// Adopts the remembered Apply state for `live`'s target, when there is one and its warp is
+/// still in the pixels. `panel` is `Some` on a fresh open — its sliders are placed at the
+/// committed values; a rebind keeps the panel's own values and adopts only the baseline.
+pub(crate) fn adopt_committed(app: &PhotocraftApp, live: &mut Live, panel: Option<&mut Panel>) {
+    let Some((doc, layer)) = live.doc.zip(live.layer) else { return };
+    let Some(remembered) = app.sculpt_applied.get(&(doc, layer, live.command)) else { return };
+    // The warp the baseline describes must still be in the pixels: an undo that left its
+    // state in the redo branch took it out, and the sliders describe the whole request again.
+    let stands = app.session.active().is_some_and(|st| st.doc.id == doc && st.history.row_of(remembered.state).is_some_and(|row| row <= st.history.past_len()));
+    if !stands {
+        return;
+    }
+    if let Some(panel) = panel {
+        panel.values = remembered.values.clone();
+        panel.locks = remembered.locks.clone();
+    }
+    live.applied = Some((remembered.params.clone(), remembered.state));
+}
+
 /// The proxy's longest side. It is sharp at fit zoom and one render costs a few tens of
 /// milliseconds; the proxy is rebuilt only when the document's pixels change.
 const PROXY_SIDE: usize = 1600;
@@ -510,6 +551,7 @@ impl Live {
             // Opened before a document existed: this one is the target now.
             let command = self.command;
             *self = Live::open(app, command);
+            adopt_committed(app, self, None);
             self.last_requested = None;
             return;
         }
@@ -521,20 +563,27 @@ impl Live {
         // An undo of the committed warp leaves its state only in the redo branch: the pixels no
         // longer carry it, and the sliders describe the whole request again. A later edit, or
         // Clear History, keeps that state an ancestor of the current one — the warp is still
-        // baked, so the difference stands.
+        // baked, so the difference stands. The remembered state goes with it, or a reopened
+        // panel would adopt a baseline whose warp an undo took out of the pixels.
         if let Some((_, id)) = &self.applied
             && !st.history.row_of(*id).is_some_and(|row| row <= st.history.past_len())
         {
             self.applied = None;
+            if let (Some(doc), Some(layer)) = (self.doc, self.layer) {
+                app.sculpt_applied.remove(&(doc, layer, self.command));
+            }
         }
         let size = [st.doc.size.width, st.doc.size.height];
         let revision = st.revision;
         let active_layer = st.active_layer;
         // A resized document moves every anchor, and another active layer has its own pose or
-        // face: analyse again, keeping the panel's slider values and locks.
+        // face: analyse again, keeping the panel's slider values and locks. The new target's
+        // own remembered baseline is adopted, so the carried sliders diff against what its
+        // pixels already carry.
         if size != self.size || active_layer != self.layer {
             let command = self.command;
             *self = Live::open(app, command);
+            adopt_committed(app, self, None);
             self.last_requested = None;
             return;
         }
@@ -916,8 +965,14 @@ pub(crate) fn apply(app: &mut PhotocraftApp, panel: &mut Panel) {
                 // The state the run left current holds the warp: as long as it stays an
                 // ancestor of the current state, the pixels carry these values.
                 let state = app.session.active().and_then(|st| st.history.row_id(st.history.past_len())).unwrap_or_default();
-                live.applied = Some((values, state));
+                live.applied = Some((values.clone(), state));
                 panel.preset = "none".into();
+                // Remember the commit for a panel closed and reopened on this target, so the
+                // next pass continues from the warp instead of stacking a fresh full one.
+                if let (Some(doc), Some(layer)) = (live.doc, live.layer) {
+                    app.sculpt_applied
+                        .insert((doc, layer, live.command), Applied { params: values, values: panel.values.clone(), locks: panel.locks.clone(), state });
+                }
             }
             // Unchanged values never re-preview: the canvas already shows the committed warp.
             live.last_requested = Some(live.request_params(&panel.params()));
