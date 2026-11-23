@@ -1315,7 +1315,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Smart Portrait…",
             menu: &["Layer", "New Adjustment Layer"],
             shortcut: None,
-            params: r##"{"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none,"skinRadius":1..100=10,"skinThreshold":2..255=18,"enhanceFace":bool=false,"hairHue":-180..180=0,"hairSaturation":-100..100=0,"lipHue":0..360=330,"lipSaturation":0..100=30,"eyeBrighten":0..50=12,"blushHue":0..360=350,"blushSaturation":0..100=20,"shadowHue":0..360=30,"shadowSaturation":0..100=25,"hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions and the GFPGAN restoration — then adds a named group of standard adjustment layers masked to them: smoothing, hair and lip colour, eye brighten, the person grade; one history step. `roi` is the user-drawn face box (document pixels): the mesh and parsing stages run inside it — the face-dominant crop both models assume — and a box too small or whose clipped/degenerate mesh answer fails the gate errors with `no face found in the box`. Without `roi` the SCRFD detector (`facedetector.onnx` in the models dir) finds the largest face and boxes it the same way; no detector or no face leaves the whole-document analysis. The colour-match `reference` path and `referenceStats` are protocol-only, not dialog rows)"##,
+            params: r##"{"sampleAllLayers":bool=false,"roi":[x,y,w,h]=none,"skinRadius":1..100=10,"skinThreshold":2..255=18,"enhanceFace":bool=false,"hairHue":-180..180=0,"hairSaturation":-100..100=0,"lipHue":0..360=330,"lipSaturation":0..100=30,"eyeBrighten":0..50=12,"blushHue":0..360=350,"blushSaturation":0..100=20,"shadowHue":0..360=30,"shadowSaturation":0..100=25,"hue":-180..180=0,"saturation":-100..100=0,"lightness":-100..100=0,"reference":path?,"referenceStats":{…}? (追色 colour match: a reference image path, or its measured {mean,std} statistics — protocol-only, not dialog rows)} → {group} (analyzes the person — and, with PHOTOCRAFT_MODELS_DIR, the skin/hair/clothes regions and the GFPGAN restoration — then adds a named group of standard adjustment layers masked to them: smoothing, hair and lip colour, eye brighten, the person grade; one history step. `roi` is the user-drawn face box (document pixels): the mesh and parsing stages run inside it — the face-dominant crop both models assume — and a box too small or whose clipped/degenerate mesh answer fails the gate errors with `no face found in the box`. Without `roi` the SCRFD detector (`facedetector.onnx` in the models dir) finds the largest face and boxes it the same way; no detector or no face leaves the whole-document analysis)"##,
             enabled,
             run,
             journal: true,
@@ -1325,7 +1325,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Save Portrait Recipe…",
             menu: &[],
             shortcut: None,
-            params: r##"{"name":text,"…":any portrait.create params} → {action} (the recipe as a named action: the Actions panel lists it, Batch runs it over a folder)"##,
+            params: r##"{"name":text, …any portrait.create params} → {action} (the recipe as a named action: the Actions panel lists it, Batch runs it over a folder)"##,
             enabled: |_| Ok(()),
             run: save_recipe,
             journal: true,
@@ -1530,7 +1530,10 @@ mod tests {
         // success or not.
         let (mut s, _) = disc();
         s.execute(CMD, json!({"roi": [50, 40, 100, 80]})).unwrap();
-        assert!(s.slot_or_default::<photocraft_portrait::Cache>().get(&s.active().unwrap().doc, |_, _| true).is_none(), "a box run stored its box-scoped analysis");
+        assert!(
+            s.slot_or_default::<photocraft_portrait::Cache>().get(&s.active().unwrap().doc, |_, _| true).is_none(),
+            "a box run stored its box-scoped analysis"
+        );
     }
 
     /// The whole-body segmentation (`selfiemulticlass.onnx`) rides inside the parsing stage

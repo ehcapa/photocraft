@@ -307,6 +307,10 @@ pub(crate) fn params(app: &mut PhotocraftApp, command: &str, spec: &str) -> Vec<
                 command,
                 "edit.fade" | "edit.findAndReplaceText" | "edit.defineBrushPreset" | "edit.defineCustomShape" | "edit.autoAlignLayers" | "edit.autoBlendLayers"
             ) && matches!(p.key.as_str(), "reference" | "path"))
+                // Smart Portrait's colour-match reference is protocol-only too (an automation
+                // caller hands a path or measured statistics; the recipe dialog has no row
+                // for either).
+                && !(command == "portrait.create" && matches!(p.key.as_str(), "reference" | "referenceStats"))
                 // The sculpt commands' optional `meshSize` (`px?`) parses as an int defaulting
                 // to 0, which the engine refuses (1..64) — a smart-filter re-edit would error
                 // on OK. Absent, the engine resolves the canvas default, so the row stays out.
