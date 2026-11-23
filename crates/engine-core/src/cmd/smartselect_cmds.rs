@@ -374,6 +374,24 @@ pub fn find_object(doc: &Document, layer: Option<LayerId>, all_layers: bool, x: 
 /// Most objects remembered by [`ObjectFinderCache`].
 pub const OBJECT_FINDER_ENTRIES: usize = 12;
 
+/// Object Selection on a session: its Object Finder results (a session slot of this module).
+pub trait SmartSelectExt {
+    /// Object Selection's Object Finder results (#4087), shared by the hover preview and the
+    /// click that commits it; valid while the pixels are unchanged.
+    fn object_finder(&self) -> &ObjectFinderCache;
+    /// The Object Finder results, to change them.
+    fn object_finder_mut(&mut self) -> &mut ObjectFinderCache;
+}
+
+impl SmartSelectExt for Session {
+    fn object_finder(&self) -> &ObjectFinderCache {
+        self.slot_or_default::<ObjectFinderCache>()
+    }
+    fn object_finder_mut(&mut self) -> &mut ObjectFinderCache {
+        self.slot_or_default_mut::<ObjectFinderCache>()
+    }
+}
+
 /// Object Finder results for one document's pixels (#4087): hovering over an object already
 /// found, or clicking it, answers at once. Keyed like [`SubjectCache`] (valid while the pixels
 /// are the same, the document held weakly) plus the sampled layer; a lookup hits any cached
@@ -573,13 +591,13 @@ fn object_at_point(s: &mut Session, p: &Value, (x, y): (f32, f32)) -> Result<Val
     check_sampled_pixels(&d.doc, d.active_layer, all_layers, Rect::from_xywh(x.floor() as i32, y.floor() as i32, 1, 1))?;
     let target = sampled_target(&d.doc, d.active_layer, all_layers);
     let canvas = d.doc.bounds();
-    let region = match s.object_finder.lookup(&d.doc, target, x, y) {
+    let region = match s.object_finder().lookup(&d.doc, target, x, y) {
         Some(r) => Some(r),
         None => {
             let doc = std::sync::Arc::clone(&d.doc);
             let found = find_object(&doc, d.active_layer, all_layers, x, y).map(std::sync::Arc::new);
             if let Some(r) = &found {
-                s.object_finder.insert(&doc, target, std::sync::Arc::clone(r));
+                s.object_finder_mut().insert(&doc, target, std::sync::Arc::clone(r));
             }
             found
         }
@@ -589,7 +607,7 @@ fn object_at_point(s: &mut Session, p: &Value, (x, y): (f32, f32)) -> Result<Val
     let out = apply(s, "Object Selection", region.as_deref(), mode(p, "replace"))?;
     if let Some(d) = s.active() {
         let doc = std::sync::Arc::clone(&d.doc);
-        s.object_finder.follow(&doc);
+        s.object_finder_mut().follow(&doc);
     }
     Ok(out)
 }
@@ -731,7 +749,7 @@ fn select_subject(s: &mut Session, p: &Value) -> Result<Value> {
 /// The standard subject line over `target` (the cached seed + min-cut region), as one edit.
 fn standard_subject(s: &mut Session, target: Option<LayerId>, all_layers: bool, m: SelectionMode) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let c = &s.subject_cache;
+    let c = s.slot_or_default::<SubjectCache>();
     let hit = c.target == target && c.doc.upgrade().is_some_and(|old| crate::layer_multi_cmds::same_pixels(&old, &d.doc));
     let region = if hit {
         c.region.clone()
@@ -742,17 +760,19 @@ fn standard_subject(s: &mut Session, target: Option<LayerId>, all_layers: bool, 
             subject::select_subject_seeded_with(smp, doc.bounds(), seed.as_ref(), &photocraft_raster::Interrupt::NONE).unwrap_or_default()
         })
         .map(std::sync::Arc::new);
-        s.subject_cache = SubjectCache { doc: std::sync::Arc::downgrade(&doc), doc_id: Some(doc.id), target, region: region.clone() };
+        *s.slot_or_default_mut::<SubjectCache>() = SubjectCache { doc: std::sync::Arc::downgrade(&doc), doc_id: Some(doc.id), target, region: region.clone() };
         region
     };
     let out = apply(s, "Select Subject", region.as_deref(), m)?;
     // Follow the document past the selection edit just made (same pixels), so a short history
     // dropping the older state doesn't turn the next repeat into a miss.
-    if let Some(d) = s.active()
-        && s.subject_cache.doc_id == Some(d.doc.id)
-        && s.subject_cache.doc.upgrade().is_some_and(|old| crate::layer_multi_cmds::same_pixels(&old, &d.doc))
-    {
-        s.subject_cache.doc = std::sync::Arc::downgrade(&d.doc);
+    let cache = s.slot_or_default::<SubjectCache>();
+    let follow = s
+        .active()
+        .filter(|d| cache.doc_id == Some(d.doc.id) && cache.doc.upgrade().is_some_and(|old| crate::layer_multi_cmds::same_pixels(&old, &d.doc)))
+        .map(|d| std::sync::Arc::downgrade(&d.doc));
+    if let Some(doc) = follow {
+        s.slot_or_default_mut::<SubjectCache>().doc = doc;
     }
     Ok(out)
 }
@@ -790,7 +810,7 @@ fn select_region(s: &mut Session, p: &Value) -> Result<Value> {
     let (doc, analysis) = {
         let d = s.active().ok_or(EngineError::NoDocument)?;
         let target = d.active_layer.filter(|id| !all_layers && d.doc.layer(*id).and_then(Layer::surface).is_some());
-        match s.portrait_cache.get(&d.doc, crate::layer_multi_cmds::same_pixels) {
+        match s.slot_or_default::<photocraft_portrait::Cache>().get(&d.doc, crate::layer_multi_cmds::same_pixels) {
             Some(hit) => (std::sync::Arc::clone(&d.doc), hit),
             None => {
                 // A detached job context: the stages run, their progress goes nowhere —
@@ -801,7 +821,7 @@ fn select_region(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     };
-    s.portrait_cache.store(&doc, (*analysis).clone());
+    s.slot_or_default_mut::<photocraft_portrait::Cache>().store(&doc, (*analysis).clone());
     let mask = analysis.mask(region).ok_or_else(|| EngineError::Other(format!("no {name} region — no person found")))?;
     apply_surface(s, "Select Region", mask, mode(p, "replace"))
 }

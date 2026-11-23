@@ -12,6 +12,7 @@ use std::path::Path;
 
 use photocraft_doc::{Document, Layer, LayerContent, LayerMask};
 use photocraft_engine::Session;
+use photocraft_engine::color_cmds::ColorExt;
 
 fn write_ppm(path: &str, w: u32, h: u32, rgb: &[u8]) -> Result<(), String> {
     let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();

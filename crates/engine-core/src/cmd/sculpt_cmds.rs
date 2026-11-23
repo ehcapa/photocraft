@@ -970,6 +970,7 @@ mod tests {
 
     use super::*;
     use crate::Session;
+    use crate::color_cmds::ColorExt;
 
     /// A checkerboard the warp's resampling visibly changes (a flat fill would not).
     fn patterned(w: u32, h: u32) -> Session {

@@ -15,6 +15,9 @@ use photocraft_algo::segment::subject;
 use photocraft_doc::{Document, Layer, LayerContent, LayerMask};
 use serde_json::{Value, json};
 
+use crate::actions_cmds::ActionsExt;
+#[cfg(test)]
+use crate::color_cmds::ColorExt;
 use crate::commands::CommandSpec;
 use crate::smartselect_cmds::with_doc_sampler;
 use crate::{EngineError, Result, Session};
@@ -1119,7 +1122,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     // The box path never reads the pixel-keyed cache — a cached analysis is
     // whole-document (or another box's) — and stores nothing: the next unboxed run must not
     // inherit this box's crop.
-    let cached = if roi.is_none() { s.portrait_cache.get(&st.doc, crate::layer_multi_cmds::same_pixels) } else { None };
+    let cached = if roi.is_none() { s.slot_or_default::<photocraft_portrait::Cache>().get(&st.doc, crate::layer_multi_cmds::same_pixels) } else { None };
     let doc = Arc::clone(&st.doc);
     let target = st.active_layer;
     let reference = reference(p);
@@ -1178,7 +1181,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             if roi.is_none()
                 && let Some(doc) = s.active().map(|st| Arc::clone(&st.doc))
             {
-                s.portrait_cache.store(&doc, (*analysis).clone());
+                s.slot_or_default_mut::<photocraft_portrait::Cache>().store(&doc, (*analysis).clone());
             }
             Ok(json!({ "group": group.0 }))
         },
@@ -1252,7 +1255,7 @@ fn save_recipe(s: &mut Session, p: &Value) -> Result<Value> {
         o.remove("name");
     }
     let action = crate::actions_cmds::Action::new(name.to_owned(), vec![crate::actions_cmds::ActionStep::new(CMD, step)]);
-    s.actions.list.push(action).map_err(|e| EngineError::Other(format!("could not save the recipe: {e}")))?;
+    s.actions_mut().list.push(action).map_err(|e| EngineError::Other(format!("could not save the recipe: {e}")))?;
     Ok(json!({ "action": name }))
 }
 
@@ -1456,7 +1459,7 @@ mod tests {
         assert_ne!(first, second, "the second run adds its own group");
         // The store survived its own edit's cache reset (it runs after the edit), so the
         // session holds an entry for this document.
-        assert!(s.active().is_some() && s.portrait_cache.get(&s.active().unwrap().doc, |_, _| true).is_some());
+        assert!(s.active().is_some() && s.slot_or_default::<photocraft_portrait::Cache>().get(&s.active().unwrap().doc, |_, _| true).is_some());
     }
 
     #[test]
@@ -1515,7 +1518,7 @@ mod tests {
         assert_eq!(s.active().unwrap().history.past_len(), steps, "no history step");
         assert_eq!(s.active().unwrap().doc.layers.len(), 1, "no group added");
         // The failed box run must not poison the cache a later unboxed run reads.
-        assert!(s.portrait_cache.get(&s.active().unwrap().doc, |_, _| true).is_none());
+        assert!(s.slot_or_default::<photocraft_portrait::Cache>().get(&s.active().unwrap().doc, |_, _| true).is_none());
     }
 
     #[test]
@@ -1527,7 +1530,7 @@ mod tests {
         // success or not.
         let (mut s, _) = disc();
         s.execute(CMD, json!({"roi": [50, 40, 100, 80]})).unwrap();
-        assert!(s.portrait_cache.get(&s.active().unwrap().doc, |_, _| true).is_none(), "a box run stored its box-scoped analysis");
+        assert!(s.slot_or_default::<photocraft_portrait::Cache>().get(&s.active().unwrap().doc, |_, _| true).is_none(), "a box run stored its box-scoped analysis");
     }
 
     /// The whole-body segmentation (`selfiemulticlass.onnx`) rides inside the parsing stage
@@ -1560,7 +1563,7 @@ mod tests {
         let (mut s, _) = disc();
         let out = s.execute("select.region", json!({"region": "scarf"})).unwrap();
         assert_eq!(out["selected"], json!(false), "an empty region selects nothing");
-        let cached = s.portrait_cache.get(&s.active().unwrap().doc, crate::layer_multi_cmds::same_pixels);
+        let cached = s.slot_or_default::<photocraft_portrait::Cache>().get(&s.active().unwrap().doc, crate::layer_multi_cmds::same_pixels);
         assert!(cached.is_some(), "the analysis the fashion tier ran is cached");
         assert!(cached.unwrap().regions().any(|r| r == photocraft_portrait::Region::Scarf), "the fashion regions are in the cached analysis");
     }
@@ -1782,7 +1785,7 @@ mod tests {
         let (mut s, inside) = disc();
         s.execute(CMD, json!({})).unwrap();
         let doc = &s.active().unwrap().doc;
-        let cached = s.portrait_cache.get(doc, |_, _| true).expect("an analysis");
+        let cached = s.slot_or_default::<photocraft_portrait::Cache>().get(doc, |_, _| true).expect("an analysis");
         assert_eq!(cached.landmarks.len(), photocraft_ml::LANDMARK_COUNT);
         let face = cached.mask(photocraft_portrait::Region::Face).expect("a face-hull region");
         // Gated by the person: every face pixel sits inside the disc.
@@ -2234,7 +2237,7 @@ mod tests {
         let r = s.execute("portrait.analyze", json!({"kind": "face"})).unwrap();
         assert_eq!(r["anchors"]["pts"].as_array().map(Vec::len), Some(478));
         let doc = std::sync::Arc::clone(&s.active().unwrap().doc);
-        assert!(s.portrait_cache.get(&doc, |_, _| true).is_none(), "a partial analysis was stored");
+        assert!(s.slot_or_default::<photocraft_portrait::Cache>().get(&doc, |_, _| true).is_none(), "a partial analysis was stored");
     }
 
     #[test]
